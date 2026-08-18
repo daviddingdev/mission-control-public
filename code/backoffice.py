@@ -480,6 +480,12 @@ def audit(c=None):
     # 11. the public mirrors — the resume layer. Two ways they go wrong: they go stale,
     #     or they start leaking. The second is the one that matters.
     pub = c.get("public", {})
+    q = load(os.path.join(STATE, "publish_refresh.json"), {}).get("quarantined", [])
+    if q:
+        _finding(f, "public-quarantine", "high",
+                 f"{len(q)} published file(s) started leaking and were pulled",
+                 "; ".join(f"{x['file']} [{x['why']}]" for x in q[:3])[:200]
+                 + " — the daily refresh removed them rather than republishing", "maintenance")
     if pub.get("leaks"):
         _finding(f, "public-leak", "high", "a public repo would leak private content",
                  "publish.py scan: " + "; ".join(pub["leaks"][:3])[:200], "maintenance")
