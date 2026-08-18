@@ -22,6 +22,48 @@ week had no entry in the dashboard at all, two nightly jobs were absent from the
 that is supposed to document every job, and the roster's status text was four days stale.
 None of that was a bug in any project. It was a written layer with no owner.
 
+```mermaid
+flowchart TB
+  subgraph Projects["Projects on the box"]
+    P1["investing engine"]:::proj
+    P2["poker study system"]:::proj
+    P3["client ERP twin"]:::proj
+    P4["mobile app"]:::proj
+  end
+
+  subgraph MC["Mission Control — the back office"]
+    direction TB
+    V["Dashboard :8900<br/>the 30,000 ft view"]:::view
+    subgraph S["Shared services"]
+      direction LR
+      M["model role registry"]:::svc
+      G["GPU admission control"]:::svc
+      B["backup declaration"]:::svc
+      N["notifications"]:::svc
+      X["memo bus"]:::svc
+    end
+    J["The janitor — daily<br/>census · audit · repair"]:::jan
+  end
+
+  GPU[["one GPU<br/>local LLM server"]]:::hw
+  PHONE["phone push"]:::out
+
+  P1 & P2 & P3 & P4 --> S
+  G --> GPU
+  J -->|audits| Projects
+  J -->|repairs its own files| MC
+  J --> V
+  N --> PHONE
+  V --> PHONE
+
+  classDef proj fill:#1f3a5c,stroke:#3987e5,color:#e8f0fb
+  classDef svc fill:#123f46,stroke:#2ba8b8,color:#dff5f8
+  classDef jan fill:#3b2a5c,stroke:#9d7be8,color:#f0eafd
+  classDef view fill:#1f4a1f,stroke:#0ca30c,color:#e3f7e3
+  classDef hw fill:#5c4a1f,stroke:#fab219,color:#fdf3d9
+  classDef out fill:#2e2e2c,stroke:#8a897f,color:#c3c2b7
+```
+
 ## Three faculties
 
 **1 — The view.** One surface answering *what is this box doing, what changed, and what
@@ -68,6 +110,31 @@ more than the ordering itself:
 - **A dead holder cannot wedge it** — the lease carries a pid and a TTL, reclaimed by the
   next waiter.
 
+Every caller asks for a slot; the queue decides who goes next:
+
+```mermaid
+flowchart TB
+  A["job wants one inference"] --> B["write a ticket:<br/>project · job · model · timestamp"]
+  B --> C{"is the card free?"}
+  C -->|"no"| D["poll — the holder finishes<br/>its single call"]
+  D --> C
+  C -->|"yes"| E["score every waiter<br/><b>tier − ageing − affinity</b>"]
+  E --> F{"am I the best?"}
+  F -->|"no"| D
+  F -->|"yes"| G["take the lease<br/>pid + TTL"]
+  G --> H["issue the call"]
+  H --> I["release · log wait and hold"]
+  C -->|"holder dead or expired"| R["reclaim the lease"] --> E
+  B -.->|"error, or waited too long"| Z["<b>fail open</b><br/>proceed anyway, log a bypass"]
+
+  classDef d fill:#3b2a5c,stroke:#9d7be8,color:#f0eafd
+  classDef s fill:#1f3a5c,stroke:#3987e5,color:#e8f0fb
+  classDef w fill:#5c4a1f,stroke:#fab219,color:#fdf3d9
+  class C,F d
+  class E,G,H,I,R s
+  class Z w
+```
+
 Ordering is asserted by a self-test, because the ordering *is* the product:
 
 ```
@@ -106,6 +173,32 @@ census → audit → fix → memo → brief → push-if-changed
   sentences for its card. It annotates; it never gates. Every finding above comes from a
   coded rule, so a model outage costs the narrative and nothing else.
 
+```mermaid
+flowchart LR
+  C["census<br/><small>projects · jobs · logs<br/>ports · models · backups</small>"]:::c
+  D[("what is<br/>written down")]:::d
+  A["audit<br/><small>coded rules</small>"]:::c
+  F[("findings<br/><small>fingerprinted<br/>open → fixed</small>")]:::d
+  X["auto-repair<br/><small>our own files, committed</small>"]:::f
+  M["memo to the<br/>owning project"]:::f
+  B["local-model brief<br/><small>what changed today</small>"]:::ai
+  P["push — only if<br/>something changed"]:::o
+
+  C --> A
+  D --> A
+  A --> F
+  F -->|"mechanical"| X
+  F -->|"someone else's code"| M
+  F --> P
+  C --> B --> P
+
+  classDef c fill:#1f3a5c,stroke:#3987e5,color:#e8f0fb
+  classDef d fill:#2e2e2c,stroke:#8a897f,color:#c3c2b7
+  classDef f fill:#1f4a1f,stroke:#0ca30c,color:#e3f7e3
+  classDef ai fill:#3b2a5c,stroke:#9d7be8,color:#f0eafd
+  classDef o fill:#5c4a1f,stroke:#fab219,color:#fdf3d9
+```
+
 Findings are fingerprinted and carry state (`open` → `fixed` / `resolved`), which is what
 makes "new" a real event worth a notification, and lets an accepted deviation be muted
 with a written reason instead of nagging forever.
@@ -117,6 +210,12 @@ Design rules the whole thing obeys:
 2. **The local model never gates.** Rules produce findings; the model writes prose.
 3. **Fix what we own, file what we don't.**
 4. **Fail open, everywhere.** Nothing here may be able to stop the work it supervises.
+
+## The code
+
+Nine of the platform's components are in [`code/`](code/) — the scheduler, the model
+registry, the janitor, the backup service and four of the local-model jobs. See
+[`code/README.md`](code/README.md) for what each one demonstrates.
 
 ## Stack
 
