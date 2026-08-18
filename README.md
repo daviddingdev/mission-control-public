@@ -217,6 +217,53 @@ Nine of the platform's components are in [`code/`](code/) — the scheduler, the
 registry, the janitor, the backup service and four of the local-model jobs. See
 [`code/README.md`](code/README.md) for what each one demonstrates.
 
+## Keeping the public mirrors honest
+
+These public repos are themselves maintained by the platform, because a repo that
+describes last month's system is worse for its purpose than no repo:
+
+```mermaid
+flowchart TB
+  P[("private repos<br/><small>changing daily</small>")]:::priv
+  A["allowlist<br/><small>config: which files may go</small>"]:::cfg
+  C["copy verbatim<br/><small>never transformed on the way out</small>"]:::c
+  SC{"leak scan<br/><small>built from the box's live secrets</small>"}:::gate
+  PUB["push to the public repo"]:::ok
+  Q["<b>quarantine</b><br/><small>pull the file, raise a finding</small>"]:::bad
+  CAND["candidates report<br/><small>files that would pass, not yet included</small>"]:::prop
+  H["a human decides"]:::human
+  PR["authored prose<br/><small>README · method docs</small>"]:::prose
+  ST["staleness flag<br/><small>project has moved ahead of its overview</small>"]:::prop
+
+  P --> A --> C --> SC
+  SC -->|"clean"| PUB
+  SC -->|"hit"| Q
+  P --> CAND --> H --> A
+  PR --> SC
+  P -.-> ST -.-> H
+
+  classDef priv fill:#2e2e2c,stroke:#8a897f,color:#c3c2b7
+  classDef cfg fill:#123f46,stroke:#2ba8b8,color:#dff5f8
+  classDef c fill:#1f3a5c,stroke:#3987e5,color:#e8f0fb
+  classDef gate fill:#5c4a1f,stroke:#fab219,color:#fdf3d9
+  classDef ok fill:#1f4a1f,stroke:#0ca30c,color:#e3f7e3
+  classDef bad fill:#5c1f1f,stroke:#e53987,color:#fbe8f0
+  classDef prop fill:#3b2a5c,stroke:#9d7be8,color:#f0eafd
+  classDef human fill:#5c4a1f,stroke:#fab219,color:#fdf3d9
+```
+
+Three different things get three different treatments, which is the whole design:
+
+| | How it stays current | Why |
+|---|---|---|
+| **Code** | re-copied verbatim and republished daily, automatically | it is mechanical, and the scanner is a real gate |
+| **A file that starts leaking** | **quarantined** — pulled from the public repo, never published, raises a high-severity finding | private content can arrive in an already-published file long after anyone thought about publishing it. The daily scan is the tripwire, not the initial review |
+| **New publishable code** | *proposed*, never auto-added | passing the scanner means a file carries no known secret. It does not mean the file is worth showing, and that is not a robot's call |
+| **Prose** | never auto-written; flagged as stale once the project has moved far enough ahead | an authored description is the thing that cannot leak what it never contained |
+
+Verified the way everything else here is: a real secret was planted in a published file
+and the pipeline pulled it rather than pushing it.
+
 ## Stack
 
 Python standard library only — no dependencies to rot — over cron, systemd, a local
