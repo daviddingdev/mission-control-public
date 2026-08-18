@@ -16,4 +16,13 @@ this layer on purpose, so nothing here can rot out from under a cron job.
 | [`memo-triage.py`](memo-triage.py) | 45 | Staleness nudge for the cross-project memo bus. |
 | [`build-journal.py`](build-journal.py) | 42 | Weekly "what got built" journal across every repo on the box — derived from what is on disk, not from a maintained list. |
 
+| [`dashboard/server.py`](dashboard/server.py) | 1065 | **The dashboard itself** — stdlib HTTP server, no framework. Aggregates crontab, logs, git state, ports, notification history, token usage and model health into one JSON payload, with per-probe TTL caching so a phone refresh never waits on a slow check. |
+| [`dashboard/usage.py`](dashboard/usage.py) | 169 | Parses agent-session transcripts into per-job token accounting — the basis of the load figures shown next to each scheduled job. |
+| [`sentinel.py`](sentinel.py) | 95 | Hourly log-anomaly pass. Its rule is the interesting part: **state files outrank log tails**, because a log tail is the last thing that happened and a state file is what is true now. Alerts on new issues only, with a cooldown. |
+| [`evening-digest.py`](evening-digest.py) | 42 | The day's rollup to a phone, written by the local model from structured job state. |
+| [`sweep-brief.py`](sweep-brief.py) | 66 | Compresses a month of activity into a brief the expensive monthly review reads instead of re-deriving the box. |
+| [`publish.py`](publish.py) | 419 | **The pipeline that produced this repo.** Authored prose plus an allowlist of code, a pseudonym pass, a leak scanner built from the machine's live secrets, quarantine for a published file that starts leaking, and pruning for one that leaves the allowlist. Its own scanner rules are visible here — masked, which is itself the demonstration. |
+| [`healthcheck.sh`](healthcheck.sh) | 50 | The 15-minute watchdog: ports, disk, service state, model roles, backup freshness — alerting only on state change. |
+| [`notify.sh`](notify.sh) | 16 | Sixteen lines, but every push on the machine goes through it, which is why the permanent history exists at all. |
+
 _Read `gpu.py` first if you only read one._
