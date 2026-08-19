@@ -96,7 +96,13 @@ def denylist(repo=None):
     for word, spec in cfg().get("deny", {}).items():
         why = spec if isinstance(spec, str) else spec.get("why", "")
         exc = () if isinstance(spec, str) else tuple(spec.get("except_repos", []))
-        add(re.escape(word) if word.isalnum() else word, why, exc)
+        # Same word-boundary rule the pseudonymiser uses for short/all-digit keys. Without
+        # it the two halves disagree: "ERP-A" inside AU8x is (correctly) left unmasked and then
+        # flagged as a leak, so a file is quarantined for a token nobody would recognise.
+        body = re.escape(word) if word.isalnum() else word
+        if word.isalnum() and (len(word) <= 4 or word.isdigit()):
+            body = r"\b" + body + r"\b"
+        add(body, why, exc)
     # tickers actually researched or held — naming them exposes the book
     try:
         held = sorted({d.split("-")[-1] for d in os.listdir(os.path.join(HOME, "Stocks"))
@@ -381,6 +387,34 @@ def candidates(limit=40):
     return out[:limit]
 
 
+def selftest():
+    """Lock in the behaviours that decide what leaves this machine.
+
+    The corpus lives in publish_fixtures.py, which is NOT published: the cases have to look
+    exactly like the things being hidden — an account balance, a share-of-book figure — so
+    keeping them here made this file quarantine itself. That is the rules working, not
+    failing. Every case below caught a real bug while this was being built.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import publish_fixtures as fx
+    cases = []
+
+    def check(name, got, want):
+        cases.append((name, got == want, got))
+
+    for src, want in fx.MASK_CASES:
+        check(f"mask: {src[:34]}", pseudonymize(src)[0], want)
+    for text, repo, blocked in fx.SCAN_CASES:
+        check(f"scan[{repo.split('-')[0]}]: {text[:34]}",
+              bool(scan_text(text, denylist(repo), "t")), blocked)
+
+    bad = [c for c in cases if not c[1]]
+    for name, ok, got in cases:
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}" + ("" if ok else f"  -> {got!r}"))
+    print(f"{len(cases) - len(bad)}/{len(cases)} passed")
+    return 1 if bad else 0
+
+
 def status():
     c = cfg()
     print(f"{'project':<16} {'public repo':<28} {'state':<12} files")
@@ -416,6 +450,8 @@ if __name__ == "__main__":
         sys.exit(publish(arg, dry="--dry" in sys.argv))
     elif cmd == "refresh":
         refresh(dry="--dry" in sys.argv)
+    elif cmd == "selftest":
+        sys.exit(selftest())
     elif cmd == "candidates":
         c = candidates()
         for x in c:

@@ -10,7 +10,7 @@ Nor does any caller decide WHEN it runs. Every call takes a slot from gpu.py, wh
 the box's one GPU by project priority and queues the rest (config/gpu.json). Callers need
 no code for this beyond passing a `job` label if they want a readable queue.
 """
-import json, os, re, sys, urllib.request
+import json, os, re, sys, time, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpu
@@ -47,9 +47,12 @@ def ask(prompt, model=None, num_predict=400, temperature=0.2, timeout=900,
         body["format"] = "json"
     req = urllib.request.Request(models.chat_url(), json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
+    t0 = time.time()
     with gpu.slot(job=job, model=model):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             d = json.loads(r.read().decode())
+    gpu.record_usage(job=job, model=model, prompt_tokens=d.get("prompt_eval_count"),
+                     output_tokens=d.get("eval_count"), seconds=time.time() - t0)
     txt = d.get("message", {}).get("content", "")
     return re.sub(r"<think>.*?</think>", "", txt, flags=re.S).strip()
 

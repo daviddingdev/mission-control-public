@@ -344,6 +344,31 @@ def wait_turn(proj=None, max_s=120):
     return round(time.time() - t0, 1)
 
 
+USAGE = os.path.join(DIR, "..", "local_usage.jsonl")
+
+
+def record_usage(job=None, model=None, prompt_tokens=0, output_tokens=0, seconds=None,
+                 proj=None):
+    """Log one local inference's token counts.
+
+    Recorded here rather than in each caller because this module already knows who is
+    asking — the project and job labels are the same ones the queue orders by, so usage
+    and priority are reported in the same terms.
+
+    Purely observational: any failure is swallowed. A ledger that can break a job is worse
+    than no ledger.
+    """
+    try:
+        with open(os.path.abspath(USAGE), "a") as f:
+            f.write(json.dumps({
+                "at": int(time.time()), "project": proj or project() or "?",
+                "job": job or os.path.basename(sys.argv[0]), "model": model,
+                "in": int(prompt_tokens or 0), "out": int(output_tokens or 0),
+                "secs": round(seconds, 1) if seconds else None}) + "\n")
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- reporting
 
 def status():
@@ -374,9 +399,19 @@ def status():
             else:
                 b["calls"] += 1
                 b["held_s"] += e.get("held_s", 0)
+    # What ran most recently, so the dashboard can answer "what is the GPU doing?" even
+    # when it polls between two calls. A holder is only set for the seconds a request is
+    # actually in flight; without this the panel reads "idle" all through a five-hour batch.
+    last = None
+    for e in reversed(ev):
+        if e.get("ev") == "release":
+            last = {"project": e.get("project"), "job": e.get("job"),
+                    "held_s": e.get("held_s"), "ago_s": int(now - e.get("at", now))}
+            break
     return {
         "holder": h and {"project": h["project"], "job": h["job"], "model": h.get("model"),
                          "held_s": round(now - h["acquired"], 1)},
+        "last": last,
         "queue": [{"project": w["project"], "job": w["job"], "tier": w["tier"],
                    "waiting_s": round(now - w["since"], 1),
                    "score": score(w, now, loaded_models())} for w in field],

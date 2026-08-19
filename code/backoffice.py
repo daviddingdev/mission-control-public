@@ -255,6 +255,30 @@ def _declared():
     return d
 
 
+_CLAUDE_SPAWN = re.compile(r'subprocess\.\w+\(\s*\[\s*["\']claude|runner\.launch|"claude",\s*"-p"')
+
+
+def _script_path(job, name):
+    for tok in re.findall(r"[\w./~-]+\.py", job.get("cmd", "")):
+        if os.path.basename(tok) != name:
+            continue
+        p = tok.replace("~", HOME)
+        if os.path.exists(p):
+            return p
+        cd = re.search(r"cd\s+(\S+)", job.get("cmd", ""))
+        cand = os.path.join((cd.group(1) if cd else HOME).replace("~", HOME), tok)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _spawns_claude(path):
+    try:
+        return bool(_CLAUDE_SPAWN.search(open(path, errors="replace").read()))
+    except OSError:
+        return False
+
+
 def _ollama_callers():
     """Every file that talks to ollama, and whether it goes through the shared client.
 
@@ -277,9 +301,141 @@ def _ollama_callers():
                 text = open(f, errors="replace").read()
             except OSError:
                 continue
+            # A file can name an ollama endpoint without ever calling one — a test fixture,
+            # a docstring, a denylist pattern. Require evidence of a request alongside it,
+            # or the rule reports every mention of a URL as an unmanaged caller.
+            calls = re.search(r"urlopen|requests\.(get|post)|httpx|curl\s+-|Request\(", text)
+            if not calls:
+                continue
             managed = ("import gpu" in text or "from gpu import" in text
                        or "localllm" in text or os.path.basename(f) in ("gpu.py", "models.py"))
             out.append({"file": os.path.relpath(f, HOME), "project": name, "managed": managed})
+    return out
+
+
+def _short(title):
+    return re.sub(r"^[\d-]+\s*·\s*", "", title)[:44]
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _experiments_state():
+    """The frontier-technique queue, checked against what actually happened to each item.
+
+    The queue is a ladder — scan appends, a research-only session writes a memo, David
+    reads it, implementation is a separate explicit ask. It had no last rung: nothing
+    noticed when a technique reached `verified` in the memo ledger, so two adopted-and-
+    running techniques sat under "## Queue" for ten days while "## Adopted" said "nothing
+    yet", and the state file still claimed their long-dead research processes were running.
+
+    A queue that never empties stops being read, which quietly disables the intake it
+    exists to gate.
+    """
+    out = {"queue": [], "dead_pids": [], "landed": [], "memo_waiting": []}
+    try:
+        txt = open(os.path.join(MC, "experiments.md"), errors="replace").read()
+        ledger = ""
+        lp = os.path.join(HOME, "memos/LEDGER.md")
+        if os.path.exists(lp):
+            ledger = open(lp, errors="replace").read()
+        state = load(os.path.join(STATE, "experiments.json"), {})
+        queue = txt.split("## Queue", 1)[-1].split("## Adopted", 1)[0]
+        for block in re.split(r"\n(?=### )", queue):
+            m = re.match(r"### ([^\n]+)", block.strip())
+            if not m:
+                continue
+            title = m.group(1).strip()
+            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40]
+            memo = re.search(r"\*\*Memo:\*\*\s*(\S+)", block)
+            st = next((v for k, v in state.items() if k in slug or slug.startswith(k)), {})
+            item = {"title": title, "slug": slug, "memo": memo.group(1) if memo else None,
+                    "state": st.get("status"), "started": st.get("started")}
+            out["queue"].append(item)
+            if st.get("status") == "running" and not _pid_alive(st.get("pid", -1)):
+                out["dead_pids"].append(item)
+            # has this technique already shipped? the memo ledger is the record of truth
+            if item["memo"]:
+                stem = os.path.basename(item["memo"]).replace(".md", "")
+                stem = re.sub(r"^\d{4}-\d{2}-\d{2}_", "", stem)
+                for row in ledger.splitlines():
+                    if stem and stem in row and re.search(r"\*\*(implemented|verified)", row):
+                        item["evidence"] = row.strip()[:400]
+                        out["landed"].append(item)
+                        break
+            if item["memo"] and item not in out["landed"]:
+                age = (time.time() - (st.get("started") or time.time())) / 86400
+                out["memo_waiting"].append({**item, "days": round(age, 1)})
+    except Exception as e:
+        out["error"] = str(e)[:120]
+    return out
+
+
+def _diagram_state():
+    """Architecture diagrams are AUTHORED, so nothing regenerates them — which means the
+    only thing standing between "explains the system" and "quietly lies about it" is a
+    check. Auto-generating them instead was rejected: an import graph drawn by a machine
+    shows what calls what and never why, which is the entire value of these.
+
+    So the diagrams stay hand-written and the machine checks two things it can actually
+    know: does the diagram name a file that no longer exists (it is now wrong), and has a
+    .d2 source been edited without re-rendering its .svg (mechanical, so it gets fixed).
+    """
+    out = {"ghosts": [], "unrendered": [], "diagrams": 0}
+    FILE_RE = re.compile(r"[\w][\w.-]*\.(?:py|js|sh|mjs|json|html)")
+    try:
+        cfg = load(os.path.join(CONFIG, "public_repos.json"), {})
+        for name, spec in cfg.get("projects", {}).items():
+            src = os.path.join(MC, "public", spec["repo"])
+            if not os.path.isdir(src):
+                continue
+            # everything the project actually contains, by basename
+            real = set()
+            for base, dirs, files in os.walk(os.path.join(HOME, name)):
+                dirs[:] = [d for d in dirs if d not in
+                           (".git", "node_modules", ".venv", "__pycache__", "worktrees")]
+                real.update(files)
+            for base, _, files in os.walk(src):
+                for fn in files:
+                    if not fn.endswith(".md"):
+                        continue
+                    text = open(os.path.join(base, fn), errors="replace").read()
+                    for block in re.findall(r"```mermaid\n(.*?)```", text, re.S):
+                        out["diagrams"] += 1
+                        for ref in set(FILE_RE.findall(block)):
+                            if ref not in real:
+                                out["ghosts"].append({"repo": spec["repo"], "doc": fn,
+                                                      "ref": ref, "project": name})
+        # A diagram can be perfectly valid — every file it names still exists — and still
+        # describe a system that has moved on. Nothing mechanical can see that, so the
+        # signal is "the project has changed a lot since anyone touched the picture".
+        out["outdated"] = []
+        arch = os.path.join(MC, "architecture")
+        proj_of = {"stocks": "Stocks", "clientco": "clientco-db", "poker": "poker",
+                   "mission-control": "maintenance"}
+        for f in sorted(os.listdir(arch)) if os.path.isdir(arch) else []:
+            if not f.endswith(".d2"):
+                continue
+            d2 = os.path.join(arch, f)
+            svg = d2[:-3] + ".svg"
+            out["diagrams"] += 1
+            if not os.path.exists(svg) or os.path.getmtime(svg) < os.path.getmtime(d2):
+                out["unrendered"].append(f)
+            proj = next((v for k, v in proj_of.items() if k in f), None)
+            if proj and os.path.isdir(os.path.join(HOME, proj, ".git")):
+                since = dt_from(os.path.getmtime(d2))
+                n = len(sh(["git", "-C", os.path.join(HOME, proj), "log",
+                            f"--since={since}", "--oneline"]).splitlines())
+                if n >= 40:
+                    out["outdated"].append({"file": f, "project": proj, "commits": n,
+                                            "days": round((time.time() - os.path.getmtime(d2)) / 86400, 1)})
+    except Exception as e:
+        out["error"] = str(e)[:120]
     return out
 
 
@@ -338,7 +494,10 @@ def census():
             except OSError:
                 c["logs"][p] = {"age_h": None, "size": None}
     c["ollama_callers"] = _ollama_callers()
+    _record_cron_seen(c["crons"])
     c["public"] = _public_state()
+    c["diagrams"] = _diagram_state()
+    c["experiments"] = _experiments_state()
     try:
         r = subprocess.run([sys.executable, os.path.join(MC, "bin/models.py"), "check"],
                            capture_output=True, text=True, timeout=30)
@@ -350,6 +509,51 @@ def census():
 
 
 # ---------------------------------------------------------------- audit
+
+SEEN = None            # path set at import; kept module-level so census and audit agree
+
+
+def _job_key(job):
+    return re.sub(r"\s+", " ", (job.get("sched", "") + " " + job.get("cmd", ""))).strip()[:200]
+
+
+def _record_cron_seen(crons):
+    """Stamp every cron line with when this pass first observed it.
+
+    The crontab spool is not readable by its own user, so "was this job added recently?"
+    cannot come from a file date. A record of what we have seen is better anyway — it
+    survives a crontab rewrite that touches an unrelated line.
+
+    Stamped for EVERY line during census, not lazily when a check needs it: recording on
+    first *failure* would mark a job that has genuinely gone silent as brand new and
+    suppress the alarm for a whole cycle. On the very first run the file does not exist
+    yet, so every line is backdated to the epoch — they all predate the record, and none
+    of them should look new because we only just started writing it down.
+    """
+    path = os.path.join(STATE, "cron_seen.json")
+    seen = load(path, None)
+    first_ever = seen is None
+    seen = seen or {}
+    stamp = 0 if first_ever else now()
+    changed = False
+    for job in crons:
+        k = _job_key(job)
+        if k not in seen:
+            seen[k] = stamp
+            changed = True
+    live = {_job_key(j) for j in crons}
+    for k in list(seen):                       # forget retired jobs so the file stays honest
+        if k not in live:
+            del seen[k]
+            changed = True
+    if changed:
+        save(path, seen)
+    return seen
+
+
+def _first_seen(job):
+    return load(os.path.join(STATE, "cron_seen.json"), {}).get(_job_key(job))
+
 
 def _finding(out, kind, sev, title, detail, project="", fix="human"):
     fid = f"{kind}:{project}:{re.sub(r'[^a-z0-9]+', '-', title.lower())[:60]}"
@@ -376,6 +580,23 @@ def audit(c=None):
             if s and s not in d["registry_text"]:
                 _finding(f, "registry-missing", "med", f"{s} runs but is not in CRON_REGISTRY",
                          f"`{job['sched']}` — {job['cmd'][:110]}", job["project"], fix="auto")
+    # A row can exist and lie. The VP sweep was documented as "zero Claude tokens" for five
+    # days after a Claude review stage landed in it — the registry had an entry, so every
+    # existing rule was satisfied. Check the claim, not just the presence.
+    for row in re.findall(r"^\|.*$", d["registry_text"], re.M):
+        if "zero claude" not in row.lower():
+            continue
+        for scr in re.findall(r"`?([\w./-]+\.py)", row):
+            job = next((j for j in c["crons"] if os.path.basename(scr) in j["scripts"]), None)
+            path = _script_path(job, os.path.basename(scr)) if job else None
+            if path and _spawns_claude(path):
+                _finding(f, "registry-false-claim", "med",
+                         f"CRON_REGISTRY says {os.path.basename(scr)} costs zero Claude tokens, "
+                         "but it spawns a session",
+                         "the row was true when written and stopped being true — a registry "
+                         "entry that exists is not the same as one that is correct",
+                         job.get("project", ""))
+
     live_scripts = {s for j in c["crons"] for s in j["scripts"]}
     for row in re.findall(r"^\|[^|]*\|\s*`?([\w./-]+\.(?:py|sh))", d["registry_text"], re.M):
         base = os.path.basename(row)
@@ -393,10 +614,17 @@ def audit(c=None):
         age = info.get("age_h")
         name = job["scripts"][0] if job["scripts"] else job["cmd"][:40]
         if age is None:
-            # a job added mid-cycle hasn't reached its first run yet — that's not drift
+            # A job added mid-cycle has not reached its first run yet — that is not drift.
+            # Two ways to tell: the script itself is newer than one cycle, or the crontab
+            # was edited within one cycle (which covers jobs with no script of their own,
+            # like a monthly `claude -p` line — the case that first produced this false
+            # positive, on the day its own cron line was written).
             src = next((os.path.join(MC, "bin", n) for n in job["scripts"]
                         if os.path.exists(os.path.join(MC, "bin", n))), None)
             if src and (time.time() - os.path.getmtime(src)) / 3600 < gap:
+                continue
+            first = _first_seen(job)
+            if first and (time.time() - first) / 3600 < gap:
                 continue
             _finding(f, "log-missing", "med",
                      f"{name} ({job['sched']}) has never written its log",
@@ -479,6 +707,45 @@ def audit(c=None):
 
     # 11. the public mirrors — the resume layer. Two ways they go wrong: they go stale,
     #     or they start leaking. The second is the one that matters.
+    # 11b. the experiments ladder's missing last rung. David does not check this often, so
+    #      the queue must clear itself and speak up only when it actually needs him.
+    exp = c.get("experiments", {})
+    for x in exp.get("landed", []):
+        _finding(f, "experiment-landed", "low",
+                 f"'{_short(x['title'])}' has shipped but is still queued",
+                 "the memo ledger records it implemented/verified — moving it to Adopted "
+                 "so the queue reflects what is actually open", "maintenance", fix="auto")
+    for x in exp.get("dead_pids", []):
+        _finding(f, "experiment-dead-pid", "low",
+                 f"'{_short(x['title'])}' is marked running but its process is gone",
+                 "state/experiments.json outlived the research session — the dashboard "
+                 "would show it as in-flight forever", "maintenance", fix="auto")
+    for x in exp.get("memo_waiting", []):
+        if x["days"] >= 0:
+            _finding(f, "experiment-memo-waiting", "med",
+                     f"a design memo is ready to read"
+                     + (f" (waiting {x['days']:.0f}d)" if x["days"] >= 1 else ""),
+                     f"{x['memo']} — the ladder is stalled at the one rung that needs David: "
+                     "read it in the Memos tab, then either ask a session to build it or "
+                     "let it drop to the graveyard", "maintenance")
+
+    # 11a. diagrams that have gone out of date with the code they describe
+    dia = c.get("diagrams", {})
+    for g in dia.get("ghosts", [])[:6]:
+        _finding(f, "diagram-ghost", "med",
+                 f"{g['repo']} diagram references {g['ref']}, which no longer exists",
+                 f"{g['doc']} draws a component the project does not have any more — the "
+                 "diagram is now describing a system that is gone", g["project"])
+    # Deliberately NOT a finding (David, 2026-08-19): "stale diagrams should just be clear
+    # when these were last drawn." A drawing is a point-in-time statement, so the honest fix
+    # is to date it and review on a schedule, not to nag daily about a judgement call. The
+    # date rides on the diagram itself; the monthly session is what acts on it.
+    if dia.get("unrendered"):
+        _finding(f, "diagram-unrendered", "low",
+                 f"{len(dia['unrendered'])} diagram source(s) edited but not re-rendered",
+                 ", ".join(dia["unrendered"]) + " — the .svg the dashboard serves is older "
+                 "than its .d2 source", "maintenance", fix="auto")
+
     pub = c.get("public", {})
     q = load(os.path.join(STATE, "publish_refresh.json"), {}).get("quarantined", [])
     if q:
@@ -496,7 +763,7 @@ def audit(c=None):
             _finding(f, "public-missing", "med", f"{r['project']} has no public counterpart built",
                      f"config/public_repos.json declares {r['repo']} but nothing is rendered",
                      r["project"])
-        elif r["commits_since_readme"] >= 60:
+        elif r["commits_since_readme"] >= 25:
             _finding(f, "public-stale", "low",
                      f"{r['repo']} is {r['commits_since_readme']} commits behind the project",
                      "the public overview describes work that has moved on — refresh the "
@@ -611,6 +878,30 @@ def fix(open_findings, dry=False):
                     _append_registry_row(reg_path, job, script)
                 done.append((f, f"documented {script} in CRON_REGISTRY.md"))
 
+        elif f["kind"] == "experiment-landed":
+            if not dry and _adopt_experiment(f["title"]):
+                done.append((f, f"moved a shipped technique to Adopted in experiments.md"))
+            elif dry:
+                done.append((f, "would move a shipped technique to Adopted"))
+
+        elif f["kind"] == "experiment-dead-pid":
+            st_path = os.path.join(STATE, "experiments.json")
+            st = load(st_path, {})
+            changed = False
+            for k, v in st.items():
+                if v.get("status") == "running" and not _pid_alive(v.get("pid", -1)):
+                    v["status"] = "finished"
+                    changed = True
+            if changed and not dry:
+                save(st_path, st)
+            if changed:
+                done.append((f, "reaped a finished research process's stale 'running' state"))
+
+        elif f["kind"] == "diagram-unrendered":
+            if not dry:
+                sh([os.path.join(MC, "bin/render-diagrams.sh")], timeout=180)
+            done.append((f, "re-rendered the architecture diagrams"))
+
         elif f["kind"] == "name-missing":
             script = f["title"].split(":")[-1].strip()
             names = load(names_path, {})
@@ -638,6 +929,41 @@ def fix(open_findings, dry=False):
         if theirs:
             print("  left uncommitted (another session has them open): " + ", ".join(sorted(theirs)))
     return done
+
+
+def _adopt_experiment(finding_title):
+    """Move a shipped technique from Queue to Adopted, carrying its evidence.
+
+    Mission Control's own file, mechanical to do, and the thing that keeps the queue
+    honest — so the janitor does it rather than asking. The entry keeps its memo link and
+    gains the ledger row that proves it landed.
+    """
+    path = os.path.join(MC, "experiments.md")
+    cen = load(CENSUS, {}).get("experiments", {})
+    name = finding_title.split("'")[1] if "'" in finding_title else ""
+    item = next((x for x in cen.get("landed", []) if _short(x["title"]) == name), None)
+    if not item:
+        return False
+    text = open(path).read()
+    block = None
+    for b in re.split(r"\n(?=### )", text.split("## Queue", 1)[-1].split("## Adopted", 1)[0]):
+        if b.strip().startswith("### ") and item["title"] in b:
+            block = b.rstrip() + "\n"
+            break
+    if not block or block not in text:
+        return False
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    adopted = block.rstrip() + f"\n- **Adopted {stamp}** — shipped and recorded in the memo ledger.\n"
+    text = text.replace(block, "")
+    text = text.replace("## Adopted\n(nothing yet)\n", "## Adopted\n")
+    head, sep, rest = text.partition("## Adopted")
+    if sep and "### " not in head.split("## Queue", 1)[-1]:
+        head = re.sub(r"(## Queue\n)\s*", r"\1(empty — the Friday frontier scan refills it)\n\n", head)
+        text = head + sep + rest
+    idx = text.index("## Adopted") + len("## Adopted\n")
+    text = text[:idx] + "\n" + adopted + text[idx:]
+    open(path, "w").write(text)
+    return True
 
 
 def _append_registry_row(reg_path, job, script):
