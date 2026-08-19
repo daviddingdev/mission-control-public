@@ -57,9 +57,13 @@ def ask_local(text):
                                     {"role": "user", "content": text}],
                        "options": {"num_predict": 120, "temperature": 0.1}}).encode()
     req = urllib.request.Request(OLLAMA, data=body, headers={"Content-Type": "application/json"})
+    t0 = time.time()
     with gpu.slot(job="model watch", model=LOCAL_MODEL):
         with urllib.request.urlopen(req, timeout=180) as r:
-            return json.loads(r.read())["message"]["content"].strip()
+            d = json.loads(r.read())
+    gpu.record_usage(job="model watch", model=LOCAL_MODEL, prompt_tokens=d.get("prompt_eval_count"),
+                     output_tokens=d.get("eval_count"), seconds=time.time() - t0)
+    return d["message"]["content"].strip()
 
 
 def run(days=8):

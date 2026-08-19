@@ -26,6 +26,17 @@ python3 bin/models.py check >/dev/null 2>&1; [ $? -ge 2 ] && FAIL+=("local-model
 
 systemctl --user is-active --quiet pokerlog 2>/dev/null || FAIL+=("pokerlog.service")
 
+# Sample the GPU temperature on the watchdog's guaranteed cadence. This lived only in the
+# dashboard's request path, so the 48h thermal record only accumulated while somebody had
+# the page open — exactly backwards for a question ("can it run this 24/7?") that is about
+# the hours nobody is watching.
+T=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+[ -n "$T" ] && printf '{"at": %s, "c": %s}\n' "$(date +%s)" "$T" >> state/thermal.jsonl
+
+# Thermal: alert only if the card is ACTIVELY being held back, not on a temperature number.
+# 80C means nothing on its own — what matters is whether the part had to give up clocks.
+nvidia-smi -q -d PERFORMANCE 2>/dev/null | grep -q "HW Thermal Slowdown *: Active" && FAIL+=("gpu-thermal-throttling")
+
 USE=$(df --output=pcent / | tail -1 | tr -dc '0-9')
 [ "${USE:-0}" -ge 90 ] && FAIL+=("disk-${USE}%")
 

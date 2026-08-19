@@ -54,18 +54,83 @@ def _netdata_latest(chart):
 
 
 def _gpu_stats():
+    """Utilisation, memory, and the thermal picture in one call.
+
+    Temperature alone does not answer "can this run flat out forever" — 80C is fine or
+    alarming depending on where the throttle point is. So we also read T.Limit (the
+    driver reports *headroom to throttle*, not the limit itself) and the slowdown
+    counters, which say whether the card has ever actually been held back.
+    """
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,"
+             "temperature.gpu,power.draw,clocks.sm,clocks.max.sm",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=4).stdout.strip().splitlines()[0]
         f = [x.strip() for x in out.split(",")]
-        num = lambda x: float(x) if x.replace(".", "", 1).isdigit() else None
+        num = lambda x: float(x) if x.replace(".", "", 1).replace("-", "", 1).isdigit() else None
         util, mused, mtotal = num(f[0]), num(f[1]), num(f[2])
         mem = round(100.0 * mused / mtotal, 1) if mused is not None and mtotal else None
-        return util, mem   # GB10 unified memory: mem usually None; system RAM covers it
+        therm = {"temp_c": num(f[3]), "power_w": num(f[4]),
+                 "sm_mhz": num(f[5]), "sm_max_mhz": num(f[6])}
+        q = subprocess.run(["nvidia-smi", "-q", "-d", "TEMPERATURE,PERFORMANCE"],
+                           capture_output=True, text=True, timeout=6).stdout
+        m = re.search(r"GPU T\.Limit Temp\s*:\s*(\d+)", q)
+        therm["headroom_c"] = int(m.group(1)) if m else None
+        for key, label in (("thermal_slowdown_us", "SW Thermal Slowdown"),
+                           ("power_capped_us", "SW Power Capping")):
+            m = re.search(re.escape(label) + r"\s*:\s*(\d+) us", q)
+            therm[key] = int(m.group(1)) if m else None
+        therm["throttling"] = bool(re.search(r"HW Thermal Slowdown\s*:\s*Active", q))
+        return util, mem, therm
     except Exception:
-        return None, None
+        return None, None, {}
+
+
+_THERM = f"{HOME}/maintenance/state/thermal.jsonl"
+
+
+def _thermal_history(now_c, keep_h=48):
+    """A rolling record, because one reading answers nothing.
+
+    The question "is it strong enough to run this 24/7" is about the STEADY STATE and
+    about whether load temperature ever approaches the throttle point — neither of which
+    a single sample shows. Sampled here on the dashboard's own cadence; cheap enough that
+    it needs no job of its own.
+    """
+    out = {}
+    try:
+        if now_c is not None:
+            last = 0.0
+            if os.path.exists(_THERM):
+                with open(_THERM, "rb") as f:      # cheap tail: last line only
+                    f.seek(max(0, os.path.getsize(_THERM) - 400))
+                    tail = f.read().decode(errors="replace").splitlines()
+                if tail:
+                    try:
+                        last = json.loads(tail[-1]).get("at", 0)
+                    except Exception:
+                        pass
+            if time.time() - last > 300:           # at most one sample per 5 min
+                with open(_THERM, "a") as f:
+                    f.write(json.dumps({"at": int(time.time()), "c": now_c}) + "\n")
+        cutoff = time.time() - keep_h * 3600
+        rows = []
+        if os.path.exists(_THERM):
+            with open(_THERM, errors="replace") as f:
+                for line in f.readlines()[-4000:]:
+                    try:
+                        r = json.loads(line)
+                        if r.get("at", 0) > cutoff:
+                            rows.append(r["c"])
+                    except Exception:
+                        pass
+        if rows:
+            out = {"min_c": min(rows), "max_c": max(rows),
+                   "avg_c": round(sum(rows) / len(rows), 1), "samples": len(rows)}
+    except Exception:
+        pass
+    return out
 
 
 def _apt_updates():
@@ -97,7 +162,8 @@ def system_stats():
         s["disk_free_tb"] = round(du.free / 1e12, 2)
     except Exception:
         s["disk_pct"] = None
-    s["gpu_pct"], s["gpu_mem_pct"] = _gpu_stats()
+    s["gpu_pct"], s["gpu_mem_pct"], s["thermal"] = _gpu_stats()
+    s["thermal"].update(_thermal_history(s["thermal"].get("temp_c")))
     try:
         s["load1"] = round(os.getloadavg()[0], 2)
         s["uptime_days"] = round(float(open("/proc/uptime").read().split()[0]) / 86400, 1)
@@ -452,6 +518,13 @@ def localai():
         out["gpu"] = gpu.status()
     except Exception:
         out["gpu"] = None
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import localusage
+        out["usage7"] = localusage.summarize(days=7)
+        out["usage7"].pop("by_job", None)          # panel shows totals; CLI has the detail
+    except Exception:
+        out["usage7"] = None
     return out
 
 
@@ -900,7 +973,26 @@ def architecture():
                 t = re.search(r"#\s*title:\s*([^\n]+)", open(src, errors="replace").read())
                 if t:
                     title = t.group(1).strip()
-            out.append({"file": f, "title": title,
+            # A diagram is a point-in-time statement about a system that keeps moving, so
+            # it carries the date it was drawn and how far the project has run since. Taken
+            # from git rather than mtime — a re-render must not look like a re-think.
+            drawn, commits = None, None
+            proj = next((v for k, v in (("stocks", "Stocks"), ("clientco", "clientco-db"),
+                                        ("poker", "poker"), ("mission-control", "maintenance"))
+                         if k in f), None)
+            try:
+                iso = subprocess.run(["git", "-C", f"{HOME}/maintenance", "log", "-1",
+                                      "--format=%cI", "--", f"architecture/{f[:-4]}.d2"],
+                                     capture_output=True, text=True, timeout=5).stdout.strip()
+                drawn = iso[:10] or None
+                if drawn and proj and os.path.isdir(f"{HOME}/{proj}/.git"):
+                    commits = len(subprocess.run(
+                        ["git", "-C", f"{HOME}/{proj}", "log", f"--since={iso}", "--oneline"],
+                        capture_output=True, text=True, timeout=8).stdout.splitlines())
+            except Exception:
+                pass
+            out.append({"file": f, "title": title, "drawn": drawn, "project": proj,
+                        "commits_since": commits,
                         "svg": open(os.path.join(d, f), errors="replace").read()})
     return out
 
@@ -1011,7 +1103,18 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(dailylog()).encode(), "application/json")
         elif self.path.startswith("/api/usage"):
             import usage as usage_mod
-            self._send(200, json.dumps(usage_mod.usage()).encode(), "application/json")
+            data = usage_mod.usage()
+            # The local tier is the other half of the same question — what the box spent,
+            # and what it did NOT spend. Same payload so the tab renders in one fetch.
+            try:
+                sys.path.insert(0, f"{HOME}/maintenance/bin")
+                import localusage
+                data["local"] = {"daily": localusage.daily(30),
+                                 "summary": localusage.summarize(days=30),
+                                 "pricing": localusage.pricing()["models"]}
+            except Exception as e:
+                data["local"] = {"error": str(e)[:120]}
+            self._send(200, json.dumps(data).encode(), "application/json")
         elif self.path.startswith("/api/architecture"):
             self._send(200, json.dumps(architecture()).encode(), "application/json")
         elif re.match(r"^/vendor/[\w.-]+\.js$", self.path):

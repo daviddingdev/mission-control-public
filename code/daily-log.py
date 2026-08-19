@@ -66,8 +66,11 @@ def narrative(jobs, prev):
         "think": False, "stream": False,
         "options": {"num_predict": 350, "temperature": 0.2}}).encode(),
         {"Content-Type": "application/json"})
+    t0 = time.time()
     with gpu.slot(job="daily log", model=MODEL), urllib.request.urlopen(req, timeout=900) as r:
         d = json.loads(r.read().decode())
+    gpu.record_usage(job="daily log", model=MODEL, prompt_tokens=d.get("prompt_eval_count"),
+                     output_tokens=d.get("eval_count"), seconds=time.time() - t0)
     import re as _re
     txt = _re.sub(r"<think>.*?</think>", "", d.get("message", {}).get("content", ""),
                   flags=_re.S).strip()
