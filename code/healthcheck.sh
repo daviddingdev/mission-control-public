@@ -31,7 +31,13 @@ systemctl --user is-active --quiet pokerlog 2>/dev/null || FAIL+=("pokerlog.serv
 # the page open — exactly backwards for a question ("can it run this 24/7?") that is about
 # the hours nobody is watching.
 T=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
-[ -n "$T" ] && printf '{"at": %s, "c": %s}\n' "$(date +%s)" "$T" >> state/thermal.jsonl
+G=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1)
+# Wall power from the UPS. It reports in 1% steps of 900W and updates slowly, so it is
+# useless for a short test and fine on a 15-minute cadence — which is exactly what this is.
+UL=$(upsc cyberpower ups.load 2>/dev/null)
+[ -n "$T" ] && printf '{"at": %s, "c": %s, "gpu_w": %s, "wall_w": %s}\n' \
+  "$(date +%s)" "$T" "${G:-null}" "$([ -n "$UL" ] && echo "$UL * 9" | bc -l | cut -d. -f1 || echo null)" \
+  >> state/thermal.jsonl
 
 # Thermal: alert only if the card is ACTIVELY being held back, not on a temperature number.
 # 80C means nothing on its own — what matters is whether the part had to give up clocks.

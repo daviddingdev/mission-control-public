@@ -48,6 +48,7 @@ import fcntl
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.request
@@ -347,8 +348,13 @@ def wait_turn(proj=None, max_s=120):
 USAGE = os.path.join(DIR, "..", "local_usage.jsonl")
 
 
+REFUSAL = re.compile(r"I can'?t (help|assist|provide|comply)|I'?m (unable|not able) to|"
+                     r"I must decline|as an AI|I cannot (help|assist|provide)|"
+                     r"against my guidelines|not appropriate for me", re.I)
+
+
 def record_usage(job=None, model=None, prompt_tokens=0, output_tokens=0, seconds=None,
-                 proj=None):
+                 proj=None, text=None):
     """Log one local inference's token counts.
 
     Recorded here rather than in each caller because this module already knows who is
@@ -364,7 +370,12 @@ def record_usage(job=None, model=None, prompt_tokens=0, output_tokens=0, seconds
                 "at": int(time.time()), "project": proj or project() or "?",
                 "job": job or os.path.basename(sys.argv[0]), "model": model,
                 "in": int(prompt_tokens or 0), "out": int(output_tokens or 0),
-                "secs": round(seconds, 1) if seconds else None}) + "\n")
+                "secs": round(seconds, 1) if seconds else None,
+                # A refusal is a successful HTTP call returning nothing usable — the exact
+                # silent-failure shape this box treats as the cardinal sin. Counted so the
+                # "should we run an uncensored model?" question stays a measurement.
+                **({"refused": True} if text and REFUSAL.search(text[:600]) else {})})
+                    + "\n")
     except Exception:
         pass
 
