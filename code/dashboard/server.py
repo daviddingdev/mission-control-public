@@ -90,7 +90,7 @@ def _gpu_stats():
 _THERM = f"{HOME}/maintenance/state/thermal.jsonl"
 
 
-def _thermal_history(now_c, keep_h=48):
+def _thermal_history(now_c, keep_h=48, _gpu_w=None):
     """A rolling record, because one reading answers nothing.
 
     The question "is it strong enough to run this 24/7" is about the STEADY STATE and
@@ -113,7 +113,8 @@ def _thermal_history(now_c, keep_h=48):
                         pass
             if time.time() - last > 300:           # at most one sample per 5 min
                 with open(_THERM, "a") as f:
-                    f.write(json.dumps({"at": int(time.time()), "c": now_c}) + "\n")
+                    f.write(json.dumps({"at": int(time.time()), "c": now_c,
+                                        "gpu_w": _gpu_w}) + "\n")
         cutoff = time.time() - keep_h * 3600
         rows = []
         if os.path.exists(_THERM):
@@ -163,7 +164,8 @@ def system_stats():
     except Exception:
         s["disk_pct"] = None
     s["gpu_pct"], s["gpu_mem_pct"], s["thermal"] = _gpu_stats()
-    s["thermal"].update(_thermal_history(s["thermal"].get("temp_c")))
+    s["thermal"].update(_thermal_history(s["thermal"].get("temp_c"),
+                                        _gpu_w=s["thermal"].get("power_w")))
     try:
         s["load1"] = round(os.getloadavg()[0], 2)
         s["uptime_days"] = round(float(open("/proc/uptime").read().split()[0]) / 86400, 1)
@@ -180,6 +182,214 @@ def system_stats():
         lines = [l for l in open(ulog, errors="replace").read().splitlines() if l.strip()]
         s["update_tail"] = lines[-1][-120:] if lines else ""
     return s
+
+
+_SPAWNS = re.compile(r'subprocess\.\w+\(\s*\[\s*["\']claude|runner\.launch|"claude",\s*"-p"')
+
+
+def _kind_of(cmd):
+    if re.search(r"(^|[|&;\s])claude\s+-", cmd):
+        return "claude"
+    for tok in re.findall(r"[\w./~-]+\.py", cmd):
+        path = tok.replace("~", HOME)
+        if not os.path.isabs(path):
+            cd = re.search(r"cd\s+(\S+)", cmd)
+            path = os.path.join((cd.group(1) if cd else HOME).replace("~", HOME), tok)
+        try:
+            text = open(path, errors="replace").read()
+        except OSError:
+            continue
+        if _SPAWNS.search(text):
+            return "claude"
+    return "local" if _is_local_ai(cmd) else "code"
+
+
+def _measured_runtimes():
+    """Median wall-clock per run, from evidence rather than estimate.
+
+    Two sources, because the two kinds of job leave different traces: a headless Claude
+    session is logged start-to-end by the session hook, and a local-model job leaves a
+    string of GPU slot releases that cluster into runs (a gap over ten minutes starts a
+    new one). Anything with no trace reports no duration rather than a guess.
+    """
+    import statistics
+    out = {}
+    try:
+        rows = []
+        with open(f"{HOME}/maintenance/state/claude_sessions.jsonl", errors="replace") as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+        from datetime import datetime as _dt, timezone as _tz
+        # Only schedules specific enough to identify a session. A `*/5` keepalive matches
+        # almost any minute and would claim the first session it saw — which is exactly what
+        # it did, attributing a 20-minute interactive session to the Remote Control watchdog.
+        scheds = []
+        for j in cron_jobs():
+            sc = j.get("schedule", "")
+            f = sc.split()
+            if len(f) != 5 or sc.startswith("@"):
+                continue
+            if re.match(r"\*/\d+$", f[0]) or f[1] == "*":
+                continue
+            scheds.append((sc, j.get("cmd", "")))
+        by = {}
+        for r in rows:
+            # Only unattended sessions. An interactive one that happens to start on a cron
+            # minute is not that job — this attributed a 19-hour session of David's to the
+            # 23:00 evening digest, a job that takes about thirty seconds.
+            if (r.get("event") != "SessionEnd" or not r.get("duration_s")
+                    or not r.get("time") or not r.get("headless")):
+                continue
+            try:
+                t = _dt.fromtimestamp(r["time"] - r["duration_s"], _tz.utc)
+            except Exception:
+                continue
+            for sched, cmd in scheds:
+                f = sched.split()
+                if len(f) != 5:
+                    continue
+                # allow a couple of minutes of launch slack either side of the cron minute
+                if (any(_field_match(f[0], (t.minute + d) % 60) for d in (-2, -1, 0, 1, 2))
+                        and _field_match(f[1], t.hour) and _field_match(f[2], t.day)
+                        and _field_match(f[4], (t.weekday() + 1) % 7)):
+                    by.setdefault(cmd, []).append(r["duration_s"])
+                    break
+        for k, v in by.items():
+            out[("claude", k)] = (statistics.median(v), len(v))
+    except Exception:
+        pass
+    try:
+        ev = []
+        with open(f"{HOME}/maintenance/state/gpu/events.jsonl", errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if e.get("ev") == "release" and e.get("job"):
+                    ev.append(e)
+        ev.sort(key=lambda e: e["at"])
+        runs, cur = {}, {}
+        for e in ev:
+            k = e["job"]
+            c = cur.get(k)
+            if c and e["at"] - c["last"] <= 600:
+                c["secs"] += e.get("held_s", 0)
+                c["last"] = e["at"]
+            else:
+                if c:
+                    runs.setdefault(k, []).append(c["secs"])
+                cur[k] = {"secs": e.get("held_s", 0), "last": e["at"]}
+        for k, c in cur.items():
+            runs.setdefault(k, []).append(c["secs"])
+        for k, v in runs.items():
+            out[("local", k)] = (statistics.median(v), len(v))
+    except Exception:
+        pass
+    return out
+
+
+def schedule_week():
+    """The week as a timetable, not a list.
+
+    Four shapes, because they are genuinely different things and drawing them the same way
+    lies about at least one of them:
+
+      block  a fixed-time job that runs at least weekly -> placed on the grid
+      band   a minute-stepped job (every 5/15/30m) -> a span across its active hours;
+             drawing 288 separate marks for a 5-minute keepalive is noise, not information
+      rare   less often than weekly (day-of-month) -> NOT on the week grid at all. A
+             monthly job drawn on Monday says it runs every Monday, which is false; it
+             gets its own strip with the date it next fires.
+      boot   @reboot -> no time to place it at
+    """
+    dur = _measured_runtimes()
+    jobs = cron_jobs()
+    # The grid is David's week, so occurrences are shifted from UTC into ET before placing.
+    # Drawing UTC days under ET labels would put a job that fires 02:00Z Monday on the
+    # Monday row when in New York it already happened on Sunday evening.
+    from datetime import datetime as _dt, timezone as _tz
+    off_min = int((_dt.now(ET).utcoffset().total_seconds() // 60)) if ET else 0
+
+    def to_et(day, minute):
+        tot = minute + off_min
+        return (day + (tot // 1440)) % 7, tot % 1440
+    out = {"blocks": [], "bands": [], "rare": [], "boot": [], "projects": []}
+    for j in jobs:
+        sched = j.get("schedule", "")
+        cmd = j.get("cmd", "")
+        kind = _kind_of(cmd)
+        seconds = None
+        # Match on a whole token, longest key first. A bare substring test let the ad-hoc
+        # job label "-c" claim "remote-control.sh", which is how a 5-minute keepalive
+        # acquired a three-minute GPU runtime it never had.
+        # Prefer the label with the most observed runs. One-off probe labels from ad-hoc
+        # testing would otherwise outrank the real job — "bench (incumbent)", seen once,
+        # was beating "the Bench" and reporting the box's longest job as zero minutes.
+        best = None
+        for (k, key), (v, n) in sorted(dur.items(), key=lambda x: -x[1][1]):
+            if k == "claude" and key == cmd:
+                best = v
+                break
+            # a job's queue label and its script name are not always the same string
+            # ("the Bench" vs bench.py), so try the label's own words too
+            stem = (key or "").split(".")[0]
+            words = [w for w in re.split(r"[\s_-]+", stem) if len(w) >= 4] or [stem]
+            if k == "local" and n >= 2 and any(
+                    re.search(r"(?<![\w-])" + re.escape(w) + r"(?![\w-])", cmd, re.I)
+                    for w in ([stem] if len(stem) >= 4 else []) + words):
+                best = best if best is not None else v
+        seconds = best
+        item = {"name": j.get("desc"), "project": j.get("project"), "kind": kind,
+                "freq": j.get("freq"), "schedule": sched, "seconds": seconds,
+                "next_run": j.get("next_run"), "log": j.get("log")}
+        if sched.startswith("@"):
+            out["boot"].append(item)
+            continue
+        f = sched.split()
+        if len(f) != 5:
+            out["boot"].append(item)
+            continue
+        minute, hour, dom, mon, dow = f
+        if dom != "*":                       # day-of-month => less often than weekly
+            out["rare"].append(item)
+            continue
+        days = [d for d in range(7) if _field_match(dow, (d + 1) % 7)]   # grid is Mon-first
+        step = re.match(r"\*/(\d+)$", minute)
+        hrs = [h for h in range(24) if _field_match(hour, h)]
+        # a band is anything that repeats within the day: minute-stepped, or a single
+        # minute across many hours (hourly at :20 draws 24 identical marks otherwise)
+        if step or len(hrs) > 3:
+            if hrs:
+                # a band can straddle midnight once shifted; clamp rather than wrap so the
+                # span stays readable, and keep the true window in the tooltip text
+                fh, th = min(hrs) * 60, (max(hrs) + 1) * 60
+                d0, m0 = to_et(0, fh)
+                _, m1 = to_et(0, th)
+                if m1 <= m0:
+                    m1 = 1440
+                out["bands"].append({**item,
+                                     "days": sorted({to_et(d, fh)[0] for d in days}),
+                                     "from_h": m0 / 60.0, "to_h": m1 / 60.0,
+                                     "every_m": int(step.group(1)) if step else 60})
+            continue
+        for h in range(24):
+            if not _field_match(hour, h):
+                continue
+            for mi in range(60):
+                if _field_match(minute, mi):
+                    placed = [to_et(d, h * 60 + mi) for d in days]
+                    out["blocks"].append({**item, "days": sorted({p[0] for p in placed}),
+                                          "at_m": placed[0][1]})
+    seen = []
+    for j in jobs:
+        if j.get("project") and j["project"] not in seen:
+            seen.append(j["project"])
+    out["projects"] = seen
+    return out
 
 
 # ---------- crons ----------
@@ -223,6 +433,54 @@ def _runs_per_week(sched):
     return float(runs_day * dow_days)
 
 
+ET = None
+try:
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+except Exception:
+    pass
+
+
+def _et_hm(hour_utc, minute):
+    """A UTC wall-clock time as it reads in New York. Returns (label, tz_abbrev).
+
+    The box stays UTC — cron, logs, every stored timestamp — because three other projects
+    schedule against it and PROJECT_STANDARDS says so. This is display only, and it uses a
+    real timezone rather than a fixed offset so it says EDT in August and EST in January
+    without anyone remembering to change it.
+    """
+    if ET is None:
+        return f"{hour_utc:02d}:{minute:02d}", "UTC"
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    d = now.replace(hour=hour_utc % 24, minute=minute, second=0, microsecond=0).astimezone(ET)
+    h = d.hour % 12 or 12
+    return f"{h}:{d.minute:02d}{'am' if d.hour < 12 else 'pm'}", d.strftime("%Z")
+
+
+def next_run(sched, within_days=40):
+    """When this cron line fires next, as a UTC epoch. None for @reboot or unparseable.
+
+    Minute-by-minute walk rather than a dependency: at most ~58k cheap field matches for a
+    monthly job, well inside the dashboard's 8s cache, and it reuses the same _field_match
+    the load calculator already trusts.
+    """
+    if sched.startswith("@"):
+        return None
+    f = sched.split()
+    if len(f) != 5:
+        return None
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    t = _dt.now(_tz.utc).replace(second=0, microsecond=0) + _td(minutes=1)
+    for _ in range(within_days * 1440):
+        if (_field_match(f[0], t.minute) and _field_match(f[1], t.hour)
+                and _field_match(f[2], t.day) and _field_match(f[3], t.month)
+                and _field_match(f[4], t.weekday() == 6 and 0 or t.weekday() + 1)):
+            return int(t.timestamp())
+        t += _td(minutes=1)
+    return None
+
+
 def _ord(n):
     n = int(n)
     return f"{n}{'th' if 10 <= n % 100 <= 20 else {1:'st',2:'nd',3:'rd'}.get(n % 10, 'th')}"
@@ -249,12 +507,16 @@ def _freq_label(sched):
         return f"every {m.group(1)}m"
     if m and f[1] != "*":
         return f"every {m.group(1)}m · hrs {f[1]}" + (f" {_dow_label(f[4])}" if f[4] != "*" else "")
+    if f[0].isdigit() and f[1] == "*":
+        return f"hourly :{int(f[0]):02d}"
+    hm, tz = _et_hm(int(f[1]), int(f[0])) if f[1].isdigit() and f[0].isdigit() else (None, None)
     if f[2] != "*":
-        return f"monthly ({_ord(f[2])}) {f[1]}:{f[0]:0>2}"
+        return (f"monthly ({_ord(f[2])}) {hm} {tz}" if hm else
+                f"monthly ({_ord(f[2])}) {f[1]}:{f[0]:0>2}")
     if f[4] != "*":
-        return f"{_dow_label(f[4])} {f[1]}:{f[0]:0>2}"
+        return f"{_dow_label(f[4])} {hm} {tz}" if hm else f"{_dow_label(f[4])} {f[1]}:{f[0]:0>2}"
     if f[1] != "*" and "," not in f[1] and "-" not in f[1] and "/" not in f[1]:
-        return f"daily {f[1]}:{f[0]:0>2}"
+        return f"daily {hm} {tz}" if hm else f"daily {f[1]}:{f[0]:0>2}"
     return sched
 
 
@@ -301,8 +563,21 @@ def _project_of(text):
     return "Mission Control"
 
 
-_LOCAL_MARKERS = ("sentinel.py", "daily-log.py", "evening-digest.py", "relevance.py",
-                  "predigest", "sweep-brief.py", "build-journal.py", "memo-triage.py")
+def _local_markers():
+    """Which scripts are local-model jobs — derived from config/models.json, not listed here.
+
+    This was a hardcoded tuple and had gone stale by eight jobs (backoffice, model-watch,
+    the Bench, scout, cannibal, numwatch, dossier, navindex), so the dashboard was calling
+    the box's heaviest GPU consumer a plain coded job. The registry is already required to
+    be current — PROJECT_STANDARDS §3 makes registering a role part of adding a local job —
+    so read it instead of keeping a second inventory that nothing forces anyone to update.
+    """
+    names = set()
+    for meta in _cfg_live("models.json", {"jobs": {}}, "jobs").values():
+        where = (meta or {}).get("where", "")
+        if where:
+            names.add(os.path.basename(where))
+    return tuple(names) or ("sentinel.py", "daily-log.py", "evening-digest.py")
 
 
 def _tokens_per_run(cmd, desc):
@@ -314,7 +589,7 @@ def _tokens_per_run(cmd, desc):
 
 
 def _is_local_ai(cmd):
-    return any(m in cmd for m in _LOCAL_MARKERS)
+    return any(m in cmd for m in _local_markers())
 
 
 def _interval_minutes(sched):
@@ -359,6 +634,7 @@ def cron_jobs():
         j = {"desc": _job_name(cmd, (desc.split("—")[0].split(";")[0].strip() or cmd[:70])[:95]),
              "schedule": sched, "freq": _freq_label(sched), "log": log,
              "project": _project_of(cmd), "ai": tpr > 0, "local_ai": _is_local_ai(cmd),
+             "next_run": next_run(sched), "cmd": cmd,
              "tokens_per_run": tpr, "weekly_tokens": int(tpr * rpw),
              "last_run": None, "age_min": None, "tail": "",
              "expect_min": _interval_minutes(sched)}
@@ -1071,7 +1347,8 @@ def overview():
             return _cache["data"]
     data = {"generated_at": int(time.time()), "system": system_stats(), "crons": cron_jobs(),
             "notifications": notifications(), "watchdog": watchdog(), "projects": projects(),
-            "experiments": experiments(), "ports": ports(), "localai": localai()}
+            "experiments": experiments(), "ports": ports(), "localai": localai(),
+            "schedule": schedule_week()}
     with _cache["lock"]:
         _cache.update(t=time.time(), data=data)
     return data
@@ -1117,6 +1394,15 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(data).encode(), "application/json")
         elif self.path.startswith("/api/architecture"):
             self._send(200, json.dumps(architecture()).encode(), "application/json")
+        elif self.path.startswith("/api/claude/file"):
+            import claudecfg
+            from urllib.parse import urlparse, parse_qs, unquote
+            q = parse_qs(urlparse(self.path).query)
+            p = unquote((q.get("p") or [""])[0])
+            self._send(200, json.dumps(claudecfg.read_file(p)).encode(), "application/json")
+        elif self.path.startswith("/api/claude"):
+            import claudecfg
+            self._send(200, json.dumps(claudecfg.claude()).encode(), "application/json")
         elif re.match(r"^/vendor/[\w.-]+\.js$", self.path):
             p = os.path.join(BASE, "vendor", os.path.basename(self.path))
             if os.path.exists(p):

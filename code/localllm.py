@@ -51,9 +51,9 @@ def ask(prompt, model=None, num_predict=400, temperature=0.2, timeout=900,
     with gpu.slot(job=job, model=model):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             d = json.loads(r.read().decode())
-    gpu.record_usage(job=job, model=model, prompt_tokens=d.get("prompt_eval_count"),
-                     output_tokens=d.get("eval_count"), seconds=time.time() - t0)
     txt = d.get("message", {}).get("content", "")
+    gpu.record_usage(job=job, model=model, prompt_tokens=d.get("prompt_eval_count"),
+                     output_tokens=d.get("eval_count"), seconds=time.time() - t0, text=txt)
     return re.sub(r"<think>.*?</think>", "", txt, flags=re.S).strip()
 
 

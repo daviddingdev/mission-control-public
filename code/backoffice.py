@@ -495,6 +495,18 @@ def census():
                 c["logs"][p] = {"age_h": None, "size": None}
     c["ollama_callers"] = _ollama_callers()
     _record_cron_seen(c["crons"])
+    # the Claude layer — plugins/skills that load into every session on the box.
+    # The dashboard's Claude tab is the live view; the census copy is what the
+    # audit rules read, same as everything else here.
+    try:
+        sys.path.insert(0, os.path.join(MC, "dashboard"))
+        import claudecfg
+        pl = claudecfg.plugins()
+        c["claude_layer"] = {"installed": pl["installed"], "markets": pl["markets"],
+                             "global_mcp": claudecfg.floor()["global_mcp"]}
+        _record_plugins_seen(pl["installed"])
+    except Exception as e:
+        c["claude_layer"] = {"error": str(e)[:200]}
     c["public"] = _public_state()
     c["diagrams"] = _diagram_state()
     c["experiments"] = _experiments_state()
@@ -553,6 +565,26 @@ def _record_cron_seen(crons):
 
 def _first_seen(job):
     return load(os.path.join(STATE, "cron_seen.json"), {}).get(_job_key(job))
+
+
+def _record_plugins_seen(installed):
+    """When did each Claude plugin first appear? Unlike cron_seen, everything present
+    when this record starts gets stamped NOW, not the epoch: the rule downstream is
+    about idleness over time, and backdating would nag every plugin on day one."""
+    path = os.path.join(STATE, "claude_plugins_seen.json")
+    seen = load(path, {})
+    live = {f"{p['name']}@{p['market']}" for p in installed}
+    changed = False
+    for pid in live:
+        if pid not in seen:
+            seen[pid] = now()
+            changed = True
+    for pid in list(seen):
+        if pid not in live:
+            del seen[pid]
+            changed = True
+    if changed:
+        save(path, seen)
 
 
 def _finding(out, kind, sev, title, detail, project="", fix="human"):
@@ -792,6 +824,30 @@ def audit(c=None):
             _finding(f, "backup-stale", "high", f"{name} backup is {age / 24:.1f} days old",
                      f"limit is {limit}h; the watchdog alerts too, so this one is already loud",
                      name)
+
+    # 13. the Claude layer. A plugin loads into EVERY session — one that never fires
+    #     is context tax plus attack surface for nothing. First-seen stamps give a new
+    #     install 60 days to prove itself; an accepted keeper gets muted, not ignored.
+    pseen = load(os.path.join(STATE, "claude_plugins_seen.json"), {})
+    for p in (c.get("claude_layer") or {}).get("installed", []):
+        pid = f"{p['name']}@{p['market']}"
+        active = max(p.get("last_used") or 0, pseen.get(pid) or now())
+        idle_d = (now() - active) / 86400
+        if idle_d > 60:
+            _finding(f, "claude-plugin-unused", "low",
+                     f"Claude plugin {pid} idle for {idle_d:.0f} days",
+                     f"{p.get('uses', 0)} recorded fires; it still loads into every "
+                     "session (context + surface) — uninstall it or mute this")
+    # A user-scope MCP server rides into every session on the box, and every session
+    # re-pays it on every step (the 2026-08-19 BrokerB lesson: ~8M tokens/session of
+    # floor re-reads, most of it tools the session could never use). Project tools
+    # live at project scope; a genuinely box-wide server gets muted here, not ignored.
+    for name in (c.get("claude_layer") or {}).get("global_mcp", []):
+        _finding(f, "claude-global-mcp", "med",
+                 f"MCP server '{name}' is user-scope (global)",
+                 "every session on the box carries it — move it to the project that "
+                 "uses it (`claude mcp add --scope local` there, then remove the "
+                 "user-scope entry), or mute if it is truly box-wide")
 
     uniq = {}
     for x in f:
