@@ -17,6 +17,7 @@ chk 8000 ClientCoWiki
 chk 8088 Pokerlog <host-ip>   # pokerlog binds the tailscale IP, not localhost
 chk 8787 StocksDash
 chk 8900 MissionControl
+chk 8910 HBSCasework
 chk 19999 Netdata
 curl -sf -m 5 -o /dev/null "http://127.0.0.1:11434/api/tags" || FAIL+=("ollama(:11434)")   # local AI is production now (sentinel/digest/scoring depend on it)
 # Every local job binds to a ROLE in config/models.json and pre-checks it before running.
