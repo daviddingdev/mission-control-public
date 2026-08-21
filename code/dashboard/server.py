@@ -683,6 +683,7 @@ KNOWN_PORTS = {
     8000: ("clientco wiki (mkdocs)", "clientco-db"), 8001: ("clientco control server", "clientco-db"),
     8088: ("Poker app (pokerlog.service, tailscale HTTPS)", "poker"),
     8787: ("Stocks dashboard", "Stocks"), 8900: ("Mission Control (this)", "Mission Control"),
+    8910: ("HBS casework dashboard", "hbs"),
     19999: ("Netdata monitoring", "system"), 445: ("Samba", "system"), 631: ("CUPS printing", "system"),
     3493: ("NUT / UPS daemon", "system"), 4317: ("OpenTelemetry", "system"),
     8125: ("StatsD (netdata)", "system"), 51820: ("WireGuard (tailscale)", "system"),
