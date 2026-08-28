@@ -1395,6 +1395,10 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(data).encode(), "application/json")
         elif self.path.startswith("/api/architecture"):
             self._send(200, json.dumps(architecture()).encode(), "application/json")
+        elif self.path == "/api/relogin":
+            r = subprocess.run([sys.executable, f"{HOME}/maintenance/bin/claude-relogin.py",
+                                "status"], capture_output=True, text=True, timeout=15)
+            self._send(200, (r.stdout.strip() or "{}").encode(), "application/json")
         elif self.path.startswith("/api/claude/file"):
             import claudecfg
             from urllib.parse import urlparse, parse_qs, unquote
@@ -1439,6 +1443,24 @@ class H(BaseHTTPRequestHandler):
                                                     d.get("body", ""), d.get("source_file", ""),
                                                     bool(d.get("interactive", True)))).encode(),
                        "application/json")
+        elif self.path in ("/api/relogin/start", "/api/relogin/cancel"):
+            act = self.path.rsplit("/", 1)[1]
+            r = subprocess.run([sys.executable, f"{HOME}/maintenance/bin/claude-relogin.py",
+                                act], capture_output=True, text=True, timeout=60)
+            self._send(200, (r.stdout.strip() or "{}").encode(), "application/json")
+        elif self.path == "/api/relogin/code":
+            d = self._body()
+            code = str(d.get("code", "")).strip()
+            if not re.fullmatch(r"[\w#%-]{8,600}", code):
+                self._send(200, b'{"ok": false, "msg": "that does not look like a code"}',
+                           "application/json")
+            else:
+                cf = f"{HOME}/maintenance/state/relogin_code.txt"
+                with open(cf, "w") as fh:
+                    fh.write(code)
+                os.chmod(cf, 0o600)
+                self._send(200, b'{"ok": true, "msg": "code handed to the login flow - '
+                                b'watch for the confirmation push"}', "application/json")
         elif self.path == "/api/bus/ignore":
             d = self._body()
             self._send(200, json.dumps(bus_ignore(d.get("slug", ""))).encode(), "application/json")
