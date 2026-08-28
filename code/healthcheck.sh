@@ -27,6 +27,21 @@ python3 bin/models.py check >/dev/null 2>&1; [ $? -ge 2 ] && FAIL+=("local-model
 
 systemctl --user is-active --quiet pokerlog 2>/dev/null || FAIL+=("pokerlog.service")
 
+# Headless-Claude auth canary — coded, zero tokens (memo 2026-08-28 from hbs: OAuth refresh
+# died ~08-27 and every `claude -p` job failed silently for a day). The CLI refreshes the
+# token on use; an expiry >2h in the PAST with jobs scheduled hourly means refresh is dead
+# and only David's interactive /login fixes it. Reads the file, spends nothing.
+python3 - <<'PYEOF' || FAIL+=("claude-cli-auth(needs /login)")
+import json, time, sys
+try:
+    c = json.load(open("/home/user/.claude/.credentials.json"))
+    exp = (c.get("claudeAiOauth") or {}).get("expiresAt", 0)
+    exp = exp / 1000 if exp > 1e12 else exp
+    sys.exit(1 if exp and time.time() - exp > 2 * 3600 else 0)
+except Exception:
+    sys.exit(0)   # unreadable file is not proof of dead auth — don't false-alarm
+PYEOF
+
 # Sample the GPU temperature on the watchdog's guaranteed cadence. This lived only in the
 # dashboard's request path, so the 48h thermal record only accumulated while somebody had
 # the page open — exactly backwards for a question ("can it run this 24/7?") that is about
@@ -51,6 +66,15 @@ USE=$(df --output=pcent / | tail -1 | tr -dc '0-9')
 # this used to hardcode Stocks, which is why nothing noticed that the poker app's live
 # database had no backup at all). backup.py check exits 1 if anything is stale.
 python3 bin/backup.py check >/dev/null 2>&1 || FAIL+=("backup-stale")
+
+# Dead CLI auth is fixable from David's phone — when it NEWLY fails, auto-start the
+# remote re-auth flow (pty scrape of `claude setup-token`, zero tokens): the OAuth link
+# lands on his phone via ntfy and the code comes back through Mission Control's Claude
+# tab. claude-relogin.py is idempotent while a flow is already waiting.
+if printf '%s\n' "${FAIL[@]}" | grep -q "claude-cli-auth" && \
+   ! grep -q "claude-cli-auth" "$STATE" 2>/dev/null; then
+  python3 bin/claude-relogin.py start >> logs/relogin.log 2>&1 &
+fi
 
 NOW=$(printf '%s\n' "${FAIL[@]}" | sort)
 PREV=$(cat "$STATE" 2>/dev/null)

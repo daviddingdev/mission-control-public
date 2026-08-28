@@ -838,6 +838,39 @@ def audit(c=None):
                      f"Claude plugin {pid} idle for {idle_d:.0f} days",
                      f"{p.get('uses', 0)} recorded fires; it still loads into every "
                      "session (context + surface) — uninstall it or mute this")
+    # 14. the PROTECTED window (PROJECT_STANDARDS §2, David 2026-08-28): 20:00-04:00 UTC
+    #     is HBS prep — no scheduled Claude session may START in it. The trigger engine
+    #     is exempt (event-driven, market-hours). Checks the cron HOUR field only; a
+    #     range or list that touches the window counts.
+    def _hours_of(sched):
+        parts = sched.split()
+        if len(parts) != 5 or parts[1] == "@":
+            return set()
+        hrs = set()
+        for piece in parts[1].split(","):
+            piece = piece.split("/")[0]
+            if piece == "*":
+                return set(range(24))
+            if "-" in piece:
+                a, b = piece.split("-")
+                hrs |= set(range(int(a), int(b) + 1))
+            elif piece.isdigit():
+                hrs.add(int(piece))
+        return hrs
+    PROTECTED = {20, 21, 22, 23, 0, 1, 2, 3}
+    for job in c["crons"]:
+        if "triggers.py" in job["cmd"]:
+            continue
+        is_claude = "claude -p" in job["cmd"] or any(
+            _spawns_claude(_script_path(job, s)) for s in job["scripts"]
+            if s.endswith(".py") and _script_path(job, s))
+        if is_claude and _hours_of(job["sched"]) & PROTECTED:
+            _finding(f, "claude-protected-window", "med",
+                     f"Claude cron starts inside the protected HBS window: {job['sched']}",
+                     f"{job['cmd'][:110]} — 20:00-04:00 UTC is David's prep time "
+                     "(PROJECT_STANDARDS §2); move it to the quiet window, or mute if "
+                     "David pinned it here", job.get("project", ""))
+
     # A user-scope MCP server rides into every session on the box, and every session
     # re-pays it on every step (the 2026-08-19 BrokerB lesson: ~8M tokens/session of
     # floor re-reads, most of it tools the session could never use). Project tools
