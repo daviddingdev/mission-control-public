@@ -507,6 +507,13 @@ def census():
         _record_plugins_seen(pl["installed"])
     except Exception as e:
         c["claude_layer"] = {"error": str(e)[:200]}
+    # docker is a blind spot the audit paid for: retired open-webui kept restart=always
+    # and served 0.0.0.0:8080 for three weeks after its 2026-08-08 retirement.
+    try:
+        c["containers"] = [x for x in sh(["docker", "ps", "--format", "{{.Names}}"]
+                                         ).splitlines() if x.strip()]
+    except Exception:
+        c["containers"] = []
     c["public"] = _public_state()
     c["diagrams"] = _diagram_state()
     c["experiments"] = _experiments_state()
@@ -714,7 +721,14 @@ def audit(c=None):
     # 9. an AI cron with no display name / no load weight is invisible in the dashboard's
     #    cost view — the Usage tab silently under-reports the box.
     for job in c["crons"]:
-        if not re.search(r"(^|[|&;\s])claude\s+-", job["cmd"]):
+        # "spawns Claude" includes python launchers (ops.py, loop.py, vp.py …) — the
+        # crontab-literal `claude -` test missed all of them, which is how six trading
+        # roles (incl. a 2M-token COO) ran unweighted until 2026-08-29.
+        spawns = (re.search(r"(^|[|&;\s])claude\s+-", job["cmd"])
+                  or "claude-headless" in job["cmd"]
+                  or any(_spawns_claude(_script_path(job, s)) for s in job["scripts"]
+                         if s.endswith(".py") and _script_path(job, s)))
+        if not spawns:
             continue
         if not any(w and w in job["cmd"] for w in d["weights"]):
             _finding(f, "weight-missing", "low",
@@ -881,6 +895,129 @@ def audit(c=None):
                  "every session on the box carries it — move it to the project that "
                  "uses it (`claude mcp add --scope local` there, then remove the "
                  "user-scope entry), or mute if it is truly box-wide")
+
+    # 15. a running docker container nobody sanctioned. Containers dodge every other
+    #     census (ports table knows the port, not the owner; cron knows nothing), and
+    #     restart=always resurrects them across reboots forever.
+    sanctioned = set(load(os.path.join(CONFIG, "containers.json"), {}).get("sanctioned", []))
+    for name in c.get("containers", []):
+        if name not in sanctioned:
+            _finding(f, "container-unsanctioned", "med",
+                     f"docker container '{name}' is running but not sanctioned",
+                     "add it to config/containers.json with why, or stop it and set "
+                     "--restart=no (a retired service kept resurrecting itself for "
+                     "three weeks this way)")
+
+    # 16. GUARDRAIL ARMED CHECKS (2026-08-29). Every preventive control on this box gets a
+    #     rule here proving it is actually live. Born from a real miss: claude-headless was
+    #     mandated by §2a.3, used by all seven Claude cron lines, and inert for a month
+    #     because ~/.claude/headless-token was never written — so every "compliant" job ran
+    #     on the rotating credential that killed auth box-wide three times. A guardrail that
+    #     silently no-ops is worse than none: it manufactures confidence. If you add a
+    #     preventive control, add its armed-check here in the same commit.
+    tok = os.path.expanduser("~/.claude/headless-token")
+    if not (os.path.exists(tok) and os.path.getsize(tok) > 0):
+        _finding(f, "guardrail-inert", "high",
+                 "claude-headless is installed but has no token — it is a no-op",
+                 "bin/claude-headless falls through to plain `claude` when "
+                 "~/.claude/headless-token is missing, putting every headless job back on "
+                 "the rotating credential (the 08-27/28/29 box-wide auth deaths). Re-auth "
+                 "from the phone (Mission Control -> Claude -> Headless auth) writes it.")
+
+    # The sudoers grant the update path depends on: config/91-spark-updates is the SOURCE,
+    # /etc/sudoers.d/ is what actually applies. They drifted (2026-08-29): the repo file had
+    # granted /usr/sbin/reboot for weeks while the installed copy had not, so the scheduled
+    # update could never have rebooted. Compare the declared verbs against `sudo -n -l`.
+    try:
+        declared = open(os.path.join(CONFIG, "91-spark-updates")).read()
+        effective = sh(["sudo", "-n", "-l"], timeout=10) or ""
+        want = [v for v in ("full-upgrade", "/usr/sbin/reboot") if v in declared]
+        gap = [v for v in want if v not in effective]
+        if gap:
+            _finding(f, "guardrail-inert", "high",
+                     "the sudoers grant on disk is not the one installed",
+                     f"config/91-spark-updates declares {', '.join(gap)} but `sudo -n -l` does "
+                     f"not show it, so the scheduled update aborts instead of running. Install: "
+                     f"sudo cp ~/maintenance/config/91-spark-updates /etc/sudoers.d/91-spark-updates "
+                     f"&& sudo chmod 440 /etc/sudoers.d/91-spark-updates")
+    except Exception:
+        pass
+
+    pol = os.path.join(CONFIG, "notify_policy.json")
+    try:
+        _p = load(pol, None)
+        assert _p and _p.get("rules"), "no rules"
+    except Exception as e:
+        _finding(f, "guardrail-inert", "high",
+                 "notify_policy.json is unreadable — push tiering is off",
+                 f"notify.sh fails OPEN by design, so every push goes through unthrottled "
+                 f"until this parses again ({e}).")
+
+    # 17. pushes that dodge the choke point entirely. notify.sh is where tiering, the daily
+    #     cap and the ledger live; a direct ntfy.sh post is invisible to all three.
+    ALLOWED_DIRECT = {
+        "maintenance/bin/healthcheck.sh":  "deliberate — the outage alarm must not route "
+                                           "through code that can throttle it",
+        "maintenance/bin/notify.sh":       "is the choke point",
+        "maintenance/dashboard/server.py": "reads the ntfy poll, does not push",
+        "Stocks/_engine/advised/desk.py":  "pushes to another person's topic",
+        "Stocks/_engine/dashboard/advised_page.py": "pushes to another person's topic",
+        "clientco-db/scripts/ntfy.py":      "project-local helper; reads the same ntfy.json",
+        "maintenance/bin/backoffice.py":   "this rule quotes the pattern it looks for",
+    }
+    # Copies are not call sites. ~/public/ is generated FROM the private repos, worktrees are
+    # throwaway checkouts, and vendored/venv trees are not ours — flagging them would make the
+    # rule cry wolf every day and get muted, which is how a good rule dies.
+    SKIP = ("/.claude/", "/worktrees/", "/.venv/", "/node_modules/", "/site-packages/")
+    hits = sh(["grep", "-rIl", "--include=*.py", "--include=*.sh", "--include=*.js",
+               "ntfy.sh/", os.path.expanduser("~")], timeout=30) or ""
+    for line in hits.splitlines():
+        rel = line.replace(os.path.expanduser("~") + "/", "")
+        if (not rel or rel in ALLOWED_DIRECT
+                or rel.startswith((".", "archive/", "backups/", "public/", "poker-data/",
+                                   "model-vault/", "memos/"))
+                or any(k in "/" + rel for k in SKIP)):
+            continue
+        _finding(f, "notify-bypass", "med",
+                 f"{rel} pushes to ntfy directly",
+                 "route it through ~/maintenance/bin/notify.sh so box-wide tiering, the "
+                 "per-channel daily cap and the notifications ledger can see it "
+                 "(PROJECT_STANDARDS §1). If the bypass is deliberate, add it to "
+                 "ALLOWED_DIRECT in backoffice.py with the reason.",
+                 project=rel.split("/")[0])
+
+    # 18. a project whose CLAUDE.md never points at the standards. The CLAUDE.md chain is
+    #     the ONLY governance a session is guaranteed to read; doctrine nothing links to is
+    #     doctrine nobody follows.
+    for name in _project_dirs():
+        cm = os.path.join(HOME, name, "CLAUDE.md")
+        if os.path.exists(cm):
+            try:
+                if "PROJECT_STANDARDS" not in open(cm, errors="replace").read():
+                    _finding(f, "standards-unlinked", "med",
+                             f"{name}/CLAUDE.md does not reference PROJECT_STANDARDS",
+                             "add the box-rules line so a session working here is bound to "
+                             "the same guardrails as every other project",
+                             project=name)
+            except Exception:
+                pass
+
+    # 19. an in-dev label that has expired. config/dev.json makes a WIP service invisible to
+    #     the watchdog and to every notification tier — which is right while it is being built
+    #     and dangerous forever. The expiry is what keeps it a pause rather than an erasure.
+    try:
+        import importlib.util as _ilu
+        _sp = _ilu.spec_from_file_location("_dev", os.path.join(HOME, "maintenance/bin/dev.py"))
+        _dev = _ilu.module_from_spec(_sp); _sp.loader.exec_module(_dev)
+        for e in _dev.expired():
+            _finding(f, "dev-stale", "med",
+                     f"{e.get('label')} is still labelled in-dev (expired {e.get('expires')})",
+                     "ship it and delete the entry from config/dev.json so it can alert again, "
+                     "or extend the date with a reason. While it is listed, the watchdog will "
+                     "not page on it and none of its notifications can reach the phone.",
+                     project=e.get("project", ""))
+    except Exception:
+        pass
 
     uniq = {}
     for x in f:

@@ -135,7 +135,21 @@ def _thermal_history(now_c, keep_h=48, _gpu_w=None):
 
 
 def _apt_updates():
+    """The real backlog: what a FULL upgrade would install (includes new deps)."""
     out = subprocess.run(["apt-get", "-s", "dist-upgrade"], capture_output=True,
+                         text=True, timeout=30).stdout
+    return len([l for l in out.splitlines() if l.startswith("Inst ")])
+
+
+def _apt_applicable():
+    """What the Update BUTTON can actually install — it runs `apt-get upgrade`, which
+    refuses anything needing new dependencies.
+
+    These two numbers diverged silently and made the button look broken (2026-08-29):
+    the tile said 52 while the button could install 0, because every pending update here
+    is the NVIDIA driver + kernel stack, which always pulls new packages. Counting what
+    the button does, next to what is actually pending, is the honest version."""
+    out = subprocess.run(["apt-get", "-s", "upgrade"], capture_output=True,
                          text=True, timeout=30).stdout
     return len([l for l in out.splitlines() if l.startswith("Inst ")])
 
@@ -172,6 +186,7 @@ def system_stats():
     except Exception:
         pass
     s["updates_available"] = _slow_get("apt", 3600, _apt_updates, None)
+    s["updates_applicable"] = _slow_get("apt_applicable", 3600, _apt_applicable, None)
     s["reboot_required"] = os.path.exists("/var/run/reboot-required")
     # update-run status
     st = _exp_state().get("__update__", {})
@@ -181,7 +196,42 @@ def system_stats():
     if os.path.exists(ulog):
         lines = [l for l in open(ulog, errors="replace").read().splitlines() if l.strip()]
         s["update_tail"] = lines[-1][-120:] if lines else ""
+    s["update_last"] = _update_summary(ulog)
     return s
+
+
+def _update_summary(ulog):
+    """One line describing the LAST update run, shown when nothing is running.
+
+    Before this (2026-08-29) the tile showed only the button once a run finished, so a
+    completed run looked identical to one that never fired — David clicked it twice and
+    still could not tell. Worse, the big number never moves: every one of the packages it
+    counts is held back by `apt-get upgrade`, which by design refuses anything needing new
+    dependencies (the whole NVIDIA driver + kernel stack on this box). Saying so out loud
+    is the difference between a broken button and a button that correctly did nothing.
+    """
+    if not os.path.exists(ulog):
+        return ""
+    try:
+        blocks = open(ulog, errors="replace").read().split("=== update run ")
+        if len(blocks) < 2:
+            return ""
+        last = blocks[-1]
+        when = last.split("===")[0].strip()[11:16]          # HH:MM off the ISO stamp
+        if "BLOCKED" in last:
+            return f"last run {when} — BLOCKED: passwordless apt not configured"
+        held = 0
+        for line in last.splitlines():
+            m = re.search(r"(\d+) upgraded.*?(\d+) not upgraded", line)
+            if m:
+                held = int(m.group(2))
+                installed = int(m.group(1))
+        if "update complete" not in last:
+            return f"last run {when} — did not finish"
+        extra = f", {held} held back (need full-upgrade)" if held else ""
+        return f"last run {when} — {installed} installed{extra}"
+    except Exception:
+        return ""
 
 
 _SPAWNS = re.compile(r'subprocess\.\w+\(\s*\[\s*["\']claude|runner\.launch|"claude",\s*"-p"')
@@ -683,7 +733,7 @@ KNOWN_PORTS = {
     8000: ("clientco wiki (mkdocs)", "clientco-db"), 8001: ("clientco control server", "clientco-db"),
     8088: ("Poker app (pokerlog.service, tailscale HTTPS)", "poker"),
     8787: ("Stocks dashboard", "Stocks"), 8900: ("Mission Control (this)", "Mission Control"),
-    8910: ("HBS casework dashboard", "hbs"),
+    8910: ("HBS casework dashboard", "hbs"), 8790: ("Justin desk — advised book paper mode", "Stocks"),
     19999: ("Netdata monitoring", "system"), 445: ("Samba", "system"), 631: ("CUPS printing", "system"),
     3493: ("NUT / UPS daemon", "system"), 4317: ("OpenTelemetry", "system"),
     8125: ("StatsD (netdata)", "system"), 51820: ("WireGuard (tailscale)", "system"),
