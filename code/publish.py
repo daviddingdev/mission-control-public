@@ -52,6 +52,11 @@ import time
 import sys
 from datetime import datetime, timezone
 
+# cron's PATH is /usr/bin:/bin and does NOT include ~/.local/bin, where gh lives. (`claude`
+# survives because it also has a /usr/bin symlink; gh does not.) Calling bare "gh" killed this
+# job every morning from 2026-08-20 to 08-29 with FileNotFoundError. Resolve it once, here.
+GH = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+
 HOME = os.path.expanduser("~")
 MC = os.path.join(HOME, "maintenance")
 CFG = os.path.join(MC, "config/public_repos.json")
@@ -290,10 +295,10 @@ def publish(repo=None, dry=False):
         if dry:
             print(f"  dry: would publish {spec['repo']}")
             continue
-        exists = subprocess.run(["gh", "repo", "view", f"userdev/{spec['repo']}"],
+        exists = subprocess.run([GH, "repo", "view", f"userdev/{spec['repo']}"],
                                 capture_output=True, text=True).returncode == 0
         if not exists:
-            subprocess.run(["gh", "repo", "create", spec["repo"], "--public",
+            subprocess.run([GH, "repo", "create", spec["repo"], "--public",
                             "-d", spec.get("description", "")[:350], "--source", d,
                             "--remote", "origin", "--push"], check=True, timeout=180)
             print(f"  created + pushed {spec['repo']}")
@@ -425,7 +430,7 @@ def status():
             for base, dirs, files in os.walk(d):
                 dirs[:] = [x for x in dirs if x != ".git"]   # count content, not git internals
                 n += len(files)
-        live = subprocess.run(["gh", "repo", "view", f"userdev/{spec['repo']}"],
+        live = subprocess.run([GH, "repo", "view", f"userdev/{spec['repo']}"],
                               capture_output=True).returncode == 0
         state = "live" if live else ("built" if os.path.isdir(d) else "—")
         if not spec.get("publish"):
