@@ -4,9 +4,10 @@
 # The one choke point for phone pushes. Channels map to topics in ../config/ntfy.json.
 #
 # Since 2026-08-29 every call is TIERED by config/notify_policy.json before it can reach the
-# phone: critical always sends, actionable sends but is deduped and capped per channel per day,
-# digest never sends on its own and is consolidated into the 23:00 UTC rollup. Pass --tier to
-# override the policy for a caller that knows better.
+# phone: critical always sends, activity (a scheduled job is running — headless Claude or a
+# local model; always sends, David 2026-08-31), actionable sends but is deduped and capped per
+# channel per day, digest never sends on its own and is consolidated into the 23:00 UTC rollup.
+# Pass --tier to override the policy for a caller that knows better.
 #
 # Everything is recorded to state/notifications.jsonl either way (with tier + pushed), which is
 # the permanent history the dashboard renders and the rollup reads — ntfy.sh keeps only ~12h.

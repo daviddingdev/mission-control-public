@@ -885,6 +885,62 @@ def audit(c=None):
                      "(PROJECT_STANDARDS §2); move it to the quiet window, or mute if "
                      "David pinned it here", job.get("project", ""))
 
+    # 14b. the USAGE-WINDOW band (Stocks CLAUDE.md, David 2026-08-31; memo usage-window-cron-moves
+    #      2026-09-01): the 14:05 UTC trade session shares a rolling 5-hour usage limit with
+    #      everything that started after 09:05, and it died on that limit on 08-31 behind the
+    #      morning cluster. So no Claude-weighted cron may START in 09:05-14:04 Mon-Fri. The one
+    #      authorized exception (the Monday 10:45 board) is muted by id, which is the record.
+    def _mins_of(sched):
+        parts = sched.split()
+        if len(parts) != 5:
+            return set()
+        mins = set()
+        for piece in parts[0].split(","):
+            piece = piece.split("/")[0]
+            if piece == "*":
+                return set(range(60))
+            if "-" in piece:
+                a, b = piece.split("-")
+                mins |= set(range(int(a), int(b) + 1))
+            elif piece.isdigit():
+                mins.add(int(piece))
+        return mins
+
+    def _weekday_possible(sched):
+        parts = sched.split()
+        if len(parts) != 5:
+            return False
+        dow = parts[4]
+        if dow == "*":
+            return True                       # incl. day-of-month jobs — the 1st lands on weekdays too
+        days = set()
+        for piece in dow.split(","):
+            piece = piece.split("/")[0]
+            if "-" in piece:
+                a, b = piece.split("-")
+                days |= set(range(int(a), int(b) + 1))
+            elif piece.isdigit():
+                days.add(int(piece))
+        return bool(days & {1, 2, 3, 4, 5})
+
+    BAND_LO, BAND_HI = 9 * 60 + 5, 14 * 60 + 5          # [09:05, 14:05) — 14:05 IS the trade session
+    for job in c["crons"]:
+        if "triggers.py" in job["cmd"] or "loop.py trade" in job["cmd"]:
+            continue
+        is_claude = "claude -p" in job["cmd"] or "claude-headless" in job["cmd"] or any(
+            _spawns_claude(_script_path(job, s)) for s in job["scripts"]
+            if s.endswith(".py") and _script_path(job, s))
+        if not is_claude or not _weekday_possible(job["sched"]):
+            continue
+        starts = {h * 60 + m for h in _hours_of(job["sched"]) for m in _mins_of(job["sched"])}
+        if any(BAND_LO <= t < BAND_HI for t in starts):
+            _finding(f, "usage-window", "med",
+                     f"Claude cron in the usage-window band: {job['sched']} {job['scripts'][0] if job.get('scripts') else ''}".strip(),
+                     f"{job['cmd'][:110]} — 09:05-14:05 UTC Mon-Fri is the 5h window the 14:05 "
+                     "BrokerB PM session draws on (it died on the shared limit 2026-08-31); "
+                     "start it before 09:00 or after 15:00, or mute here if David authorized it",
+                     job.get("project", ""))
+
     # A user-scope MCP server rides into every session on the box, and every session
     # re-pays it on every step (the 2026-08-19 BrokerB lesson: ~8M tokens/session of
     # floor re-reads, most of it tools the session could never use). Project tools
@@ -943,6 +999,23 @@ def audit(c=None):
     except Exception:
         pass
 
+    # The memo-inbox SessionStart hook (2026-09-01) is how a directive reaches a session that
+    # never read CLAUDE.md. If it is unregistered or not executable, memos go back to being a
+    # sentence nobody obeys — and the daily triage nudges David instead of the session.
+    try:
+        _st = load(os.path.expanduser("~/.claude/settings.json"), {}) or {}
+        _cmds = [h.get("command", "") for grp in (_st.get("hooks", {}).get("SessionStart") or [])
+                 for h in grp.get("hooks", [])]
+        _hook = os.path.join(MC, "bin", "hook-memo-inbox.py")
+        if not any("hook-memo-inbox" in c for c in _cmds) or not os.access(_hook, os.X_OK):
+            _finding(f, "guardrail-inert", "high",
+                     "the memo-inbox SessionStart hook is not armed",
+                     "bin/hook-memo-inbox.py must be listed under hooks.SessionStart in "
+                     "~/.claude/settings.json and be executable; without it sessions only see "
+                     "their memos if they happen to read the sentence in CLAUDE.md")
+    except Exception:
+        pass
+
     pol = os.path.join(CONFIG, "notify_policy.json")
     try:
         _p = load(pol, None)
@@ -952,6 +1025,34 @@ def audit(c=None):
                  "notify_policy.json is unreadable — push tiering is off",
                  f"notify.sh fails OPEN by design, so every push goes through unthrottled "
                  f"until this parses again ({e}).")
+
+    # WRDS credential liveness (2026-08-31, asked for in memo hbs-database-credentials):
+    # the Stocks desk's SQL fundamentals layer authenticates with a password that HBS/WRDS
+    # can expire without warning — a dead credential should be a finding the day it dies,
+    # not a surprise mid-teardown. One auth probe per daily pass, via the consuming stack's
+    # own venv (if THAT can't connect, the layer is down in exactly the way that matters).
+    # Skipped entirely when Stocks has no wrds credential configured.
+    _wrds_cfg = os.path.expanduser("~/Stocks/_engine/config/sources.json")
+    try:
+        _has_wrds = "wrds" in (load(_wrds_cfg, {}) or {})
+    except Exception:
+        _has_wrds = False
+    if _has_wrds:
+        probe = sh([os.path.expanduser("~/Stocks/_engine/.venv/bin/python"), "-c",
+                    "import json,os,psycopg2;"
+                    "u=json.load(open(os.path.expanduser('~/Stocks/_engine/config/sources.json')))['wrds']['username'];"
+                    "psycopg2.connect(host='wrds-pgdata.wharton.upenn.edu',port=9737,dbname='wrds',"
+                    "user=u,sslmode='require',connect_timeout=25).close();print('OK')"],
+                   timeout=45)
+        if (probe or "").strip() != "OK":
+            _finding(f, "credential-dead", "med",
+                     "WRDS credential no longer authenticates",
+                     "the Stocks desk's wrds_source.py adapter will fail on next use. "
+                     "Password may have expired or the account lapsed (Masters accounts "
+                     "pause over summer). Fix: David logs in at wrds-www.wharton.upenn.edu "
+                     "to check the account, then re-runs "
+                     "`~/Stocks/_engine/.venv/bin/python ~/Stocks/_engine/sources/wrds_source.py setup`.",
+                     project="stocks")
 
     # 17. pushes that dodge the choke point entirely. notify.sh is where tiering, the daily
     #     cap and the ledger live; a direct ntfy.sh post is invisible to all three.
