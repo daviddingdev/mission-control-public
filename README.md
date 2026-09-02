@@ -270,4 +270,4 @@ Python standard library only — no dependencies to rot — over cron, systemd, 
 model server, and git. The dashboard is a single-file HTTP server plus one HTML page,
 mobile-first because it is mostly read from a phone. Roughly 4,000 lines.
 
-_Last updated August 2026._
+_Last updated September 2026._

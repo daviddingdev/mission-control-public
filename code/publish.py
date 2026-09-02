@@ -83,10 +83,10 @@ def denylist(repo=None):
     """
     pats = []
 
-    def add(p, why, except_repos=()):
+    def add(p, why, except_repos=(), flags=re.I):
         if repo and repo in except_repos:
             return
-        pats.append((re.compile(p, re.I), why))
+        pats.append((re.compile(p, flags), why))
     add(r"/home/user", "absolute home path")
     add(r"\bhellopie\b", "sudo password")
     add(r"<host>|<tailnet>", "tailnet identity")
@@ -113,13 +113,20 @@ def denylist(repo=None):
         held = sorted({d.split("-")[-1] for d in os.listdir(os.path.join(HOME, "Stocks"))
                        if "-" in d and d.split("-")[-1].isupper()
                        and os.path.isdir(os.path.join(HOME, "Stocks", d))})
+        # tickers that are also plain identifiers (config, with the false positive named)
+        common = set((cfg().get("ticker_common_words") or {}).get("words", []))
+        held = [t for t in held if t not in common]
         if held:
             # Research subjects are public companies; naming one says what was studied, not
             # what is owned. Allowed where the repo is about the research itself (David,
             # 2026-08-18) and still blocked everywhere else, where a ticker has no business
             # appearing at all and its presence is a signal something leaked.
+            # CASE-SENSITIVE (2026-09-01): the AppLovin teardown created a Stocks research folder for that ticker and the
+            # case-insensitive match then quarantined 26 files across four repos for the word
+            # "app" — 12 days of a high finding nobody could act on. A ticker is upper-case
+            # by construction; a lower-case hit is prose, not a leak.
             add(r"\b(" + "|".join(held) + r")\b", "researched ticker",
-                tuple(cfg().get("ticker_ok_repos", [])))
+                tuple(cfg().get("ticker_ok_repos", [])), flags=0)
     except Exception:
         pass
     return pats

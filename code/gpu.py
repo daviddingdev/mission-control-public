@@ -49,6 +49,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -62,12 +63,14 @@ WAITERS = os.path.join(DIR, "waiters")
 HOLDER = os.path.join(DIR, "holder.json")
 LOCK = os.path.join(DIR, "lock")
 EVENTS = os.path.join(DIR, "events.jsonl")
+ANNOUNCE = os.path.join(DIR, "announce")
 EVENT_CAP = 4000
 
 DEFAULTS = {
     "slots": 1, "lease_ttl_s": 1800, "wait_timeout_s": 2700, "age_step_s": 120,
     "max_age_bonus": 25, "affinity_bonus": 5, "poll_s": 0.4, "keep_alive": "30m",
     "tiers": {"interactive": 0, "Stocks": 10, "maintenance": 30}, "default_tier": 20,
+    "announce_pushes": True, "announce_min_gap_s": 600,
 }
 _cfg_cache = {"mt": 0, "v": None}
 
@@ -275,6 +278,48 @@ def _waiter_path(wid):
     return os.path.join(WAITERS, f"{wid}.json")
 
 
+def _should_announce(prev, pid, now, min_gap):
+    """One push per job RUN. A run is a new pid outside the min gap: the same pid never
+    re-announces (a 5-hour Bench process is one run, however many slots it takes), and
+    the gap keeps a job that spawns a process per item from paging every item."""
+    if prev and prev.get("pid") == pid:
+        return False
+    if prev and now - prev.get("time", 0) < min_gap:
+        return False
+    return True
+
+
+def _announce(me):
+    """Phone push when a batch job starts using the GPU (David 2026-08-31: "i need to see
+    whenever a cron job is running ... a local model. those shouldn't be filtered out").
+    Interactive callers stay silent — a human at a terminal announces nothing, the same
+    rule the headless-session hook applies to Claude. A local call made from INSIDE a
+    Claude session (CLAUDECODE in env) is also silent — the session already announced
+    itself, and it reports its own failures (David 2026-08-31: "local calls don't need
+    to notify during a session, only if something is wrong"). Fire-and-forget Popen so
+    a slow ntfy can never delay the inference; notify_policy.json decides phone vs
+    ledger — as of 2026-08-31 these all tier digest (rollup only)."""
+    with contextlib.suppress(Exception):
+        if _interactive() or os.environ.get("CLAUDECODE"):
+            return
+        c = cfg()
+        if not c.get("announce_pushes", True):
+            return
+        os.makedirs(ANNOUNCE, exist_ok=True)
+        key = re.sub(r"[^A-Za-z0-9._-]", "_", f"{me['project']}__{me['job']}")[:120]
+        path = os.path.join(ANNOUNCE, key + ".json")
+        now = time.time()
+        if not _should_announce(_read(path), me["pid"], now, c.get("announce_min_gap_s", 600)):
+            return
+        _write_atomic(path, {"pid": me["pid"], "time": now})
+        ch = {"Stocks": "stocks", "clientco-db": "clientco"}.get(me["project"], "maintenance")
+        msg = me["job"] + (f" · {me['model']}" if me.get("model") else "")
+        with open(os.devnull, "wb") as null:
+            subprocess.Popen([os.path.join(MC, "bin/notify.sh"), ch,
+                              f"Local model — {me['project']}", msg],
+                             stdout=null, stderr=null)
+
+
 @contextlib.contextmanager
 def slot(job=None, model=None, proj=None, timeout=None):
     """Hold the GPU for one inference. Blocks until this caller is the best waiter.
@@ -308,6 +353,8 @@ def slot(job=None, model=None, proj=None, timeout=None):
                   reason="wait timeout")
     except Exception as e:                       # never let the scheduler break the work
         event("bypass", job=job or "?", reason=f"{type(e).__name__}: {e}"[:120])
+    if me:                                       # inference proceeds on both paths
+        _announce(me)
     try:
         yield
     finally:
@@ -507,7 +554,21 @@ def _selftest():
         ok = got == want
         bad += not ok
         print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
-    print(f"{len(cases) - bad}/{len(cases)} passed")
+    announce_cases = [
+        ("first run of a job announces", _should_announce(None, 100, now, 600), True),
+        ("same pid never re-announces",
+         _should_announce({"pid": 100, "time": now - 9999}, 100, now, 600), False),
+        ("new pid inside the gap is held",
+         _should_announce({"pid": 100, "time": now - 60}, 200, now, 600), False),
+        ("new pid past the gap announces",
+         _should_announce({"pid": 100, "time": now - 700}, 200, now, 600), True),
+    ]
+    for name, got, want in announce_cases:
+        ok = got == want
+        bad += not ok
+        print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
+    total = len(cases) + len(announce_cases)
+    print(f"{total - bad}/{total} passed")
     return bad
 
 

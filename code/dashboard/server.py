@@ -1029,7 +1029,7 @@ def experiments():
 
 
 def memos():
-    d = f"{HOME}/maintenance/memos"
+    d = f"{HOME}/maintenance/proposals"
     out = []
     for f in sorted(os.listdir(d), reverse=True) if os.path.isdir(d) else []:
         if f.endswith(".md"):
@@ -1084,13 +1084,13 @@ def attention():
 
 
 # ---------- cross-project memo bus (~/memos/, shared with Stocks; protocol in LEDGER.md) ----------
-# Distinct from memos() above — that serves *design* memos (~/maintenance/memos/, the
+# Distinct from memos() above — that serves *design* memos (~/maintenance/proposals/, the
 # experiments pipeline). This is the box-wide inbox+ledger bus every project drops into.
 MEMOBUS = f"{HOME}/memos"
 LEDGER = f"{MEMOBUS}/LEDGER.md"
 # project slug -> (working dir for its processing session, human label). Extend as projects register.
 BUS_PROJECTS = {
-    "mission-control": (f"{HOME}/maintenance", "Mission Control"),
+    "maintenance": (f"{HOME}/maintenance", "Mission Control"),   # slug = folder name, like every other project (was "mission-control" until 2026-09-01: two inboxes for one project)
     "stocks": (f"{HOME}/Stocks", "Stocks"),
 }
 
@@ -1142,7 +1142,7 @@ def bus_process(target):
         os.makedirs(os.path.dirname(log), exist_ok=True)
         with open(log, "ab") as fh:
             fh.write(f"\n=== process {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
-            subprocess.Popen([CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"],
+            subprocess.Popen([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"],
                              cwd=root, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
     except Exception as e:
         return {"ok": False, "msg": str(e)[:120]}
@@ -1176,7 +1176,8 @@ def bus_send(target, title, body, launch):
     return {"ok": True, "msg": msg}
 
 
-CLAUDE_BIN = f"{HOME}/.local/bin/claude"  # RC-capable native build (2.1.212+, full claude.ai login)
+CLAUDE_BIN = f"{HOME}/.local/bin/claude"  # RC-capable native build (2.1.212+, full claude.ai login) — INTERACTIVE tmux dispatches only
+CLAUDE_HEADLESS = f"{HOME}/maintenance/bin/claude-headless"  # every -p spawn (box rule #2; the dashboard itself was bare until 2026-09-01)
 
 
 def _tmux_env():
@@ -1209,14 +1210,14 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     interactive=True -> detached tmux session running interactive claude seeded with the
     task; it auto-registers with Remote Control (remoteControlAtStartup), so David can
     join it from claude.ai/code / the mobile app. interactive=False -> headless -p.
-    source_file: dispatch an existing design memo (~/maintenance/memos/<file>) instead
+    source_file: dispatch an existing design memo (~/maintenance/proposals/<file>) instead
     of composed text; it is copied into the bus inbox for the paper trail."""
     if target not in BUS_PROJECTS:
         return {"ok": False, "msg": f"unknown project '{target}'"}
     root, label = BUS_PROJECTS[target]
     today = time.strftime("%Y-%m-%d")
     if source_file:
-        src = f"{HOME}/maintenance/memos/{os.path.basename(source_file)}"
+        src = f"{HOME}/maintenance/proposals/{os.path.basename(source_file)}"
         if not os.path.isfile(src):
             return {"ok": False, "msg": "memo file not found"}
         slug = re.sub(r"^[\d-]+_", "", os.path.basename(src))[:-3]
@@ -1259,7 +1260,7 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     log = f"{HOME}/maintenance/logs/memo_process_{target}.log"
     os.makedirs(os.path.dirname(log), exist_ok=True)
     with open(log, "ab") as fh:
-        subprocess.Popen(["claude", "-p", prompt, "--dangerously-skip-permissions"],
+        subprocess.Popen([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"],
                          cwd=root, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
     return {"ok": True, "msg": "Dispatched headless."}
 
@@ -1305,7 +1306,7 @@ def architecture():
             # from git rather than mtime — a re-render must not look like a re-think.
             drawn, commits = None, None
             proj = next((v for k, v in (("stocks", "Stocks"), ("clientco", "clientco-db"),
-                                        ("poker", "poker"), ("mission-control", "maintenance"))
+                                        ("poker", "poker"), ("maintenance", "maintenance"))
                          if k in f), None)
             try:
                 iso = subprocess.run(["git", "-C", f"{HOME}/maintenance", "log", "-1",
@@ -1336,7 +1337,7 @@ stage produces paper, not code.
 1. Read the entry in experiments.md, then the target project's CLAUDE.md/playbooks/relevant
    code (read-only) so the memo is grounded in OUR actual system.
 2. Research the technique properly (WebSearch/WebFetch): primary sources over blog hype.
-3. Write the memo to ~/maintenance/memos/{date}_{slug}.md, ≤80 lines, structure:
+3. Write the memo to ~/maintenance/proposals/{date}_{slug}.md, ≤80 lines, structure:
    # <technique name>
    **Verdict: ADOPT / EXPERIMENT / SKIP** — one-line reason
    ## What it is (3-5 sentences, no hype)
@@ -1362,7 +1363,7 @@ def run_experiment(slug):
     prompt = RUN_PROMPT.format(title=exps[slug]["title"], slug=topic,
                                date=time.strftime("%Y-%m-%d"))
     import shlex
-    shell_cmd = (f"claude -p {shlex.quote(prompt)} "
+    shell_cmd = (f"{CLAUDE_HEADLESS} -p {shlex.quote(prompt)} "
                  f"--dangerously-skip-permissions --verbose --output-format stream-json "
                  f"| python3 -u {HOME}/maintenance/bin/stream_filter.py")
     if os.environ.get("EXPERIMENT_DRY"):
