@@ -33,6 +33,7 @@ CLI: backoffice.py [census|audit|fix|brief|run|show] [--dry]
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -255,7 +256,13 @@ def _declared():
     return d
 
 
-_CLAUDE_SPAWN = re.compile(r'subprocess\.\w+\(\s*\[\s*["\']claude|runner\.launch|"claude",\s*"-p"')
+# A CALL, never a mention. `runner.launch` bare matched any file that merely NAMES the
+# launcher — including this one, once its own rules started quoting it (2026-09-20). The
+# trailing paren is what makes it a spawn rather than a sentence.
+_CLAUDE_SPAWN = re.compile(
+    r'subprocess\.\w+\(\s*\[\s*["\']claude'
+    r'|runner\.launch\s*\('
+    r'|"claude",\s*"-p"')
 
 
 def _script_path(job, name):
@@ -270,6 +277,25 @@ def _script_path(job, name):
         if os.path.exists(cand):
             return cand
     return None
+
+
+def _declared_zero(cmd):
+    """True when config/job_weights.json declares this invocation as spending no tokens.
+
+    The mechanism `ops.py verify` already documents ("0 keeps the spawner-aware audit
+    honest"): a Claude-CAPABLE script invoked in a code-only mode is declared with a 0
+    weight rather than special-cased in a rule. Honoured here so the window rules stop
+    flagging dispatchers — the box-wide claudeq tick names runner.launch and runs every
+    5 minutes, which would otherwise read as a Claude job in both protected hours and the
+    trade lookback, every single day."""
+    try:
+        w = load(os.path.join(CONFIG, "job_weights.json"), {}) or {}
+        for x in w.get("weights", []):
+            if x.get("match") and x["match"] in cmd:
+                return not x.get("tokens_per_run")
+    except Exception:
+        pass
+    return False
 
 
 def _spawns_claude(path):
@@ -494,6 +520,13 @@ def census():
             except OSError:
                 c["logs"][p] = {"age_h": None, "size": None}
     c["ollama_callers"] = _ollama_callers()
+    # The data catalog is compiled here for the same reason everything else is: the audit
+    # rules read a census, never the live box. Zero Claude tokens, stdlib only.
+    try:
+        import catalog as _catalog
+        c["catalog"] = _catalog.compile_all()["counts"]
+    except Exception as e:
+        c["catalog"] = {"error": str(e)[:160]}
     _record_cron_seen(c["crons"])
     # the Claude layer — plugins/skills that load into every session on the box.
     # The dashboard's Claude tab is the live view; the census copy is what the
@@ -873,7 +906,7 @@ def audit(c=None):
         return hrs
     PROTECTED = {20, 21, 22, 23, 0, 1, 2, 3}
     for job in c["crons"]:
-        if "triggers.py" in job["cmd"]:
+        if "triggers.py" in job["cmd"] or _declared_zero(job["cmd"]):
             continue
         is_claude = "claude -p" in job["cmd"] or any(
             _spawns_claude(_script_path(job, s)) for s in job["scripts"]
@@ -925,7 +958,8 @@ def audit(c=None):
 
     BAND_LO, BAND_HI = 9 * 60 + 5, 14 * 60 + 5          # [09:05, 14:05) — 14:05 IS the trade session
     for job in c["crons"]:
-        if "triggers.py" in job["cmd"] or "loop.py trade" in job["cmd"]:
+        if ("triggers.py" in job["cmd"] or "loop.py trade" in job["cmd"]
+                or _declared_zero(job["cmd"])):
             continue
         is_claude = "claude -p" in job["cmd"] or "claude-headless" in job["cmd"] or any(
             _spawns_claude(_script_path(job, s)) for s in job["scripts"]
@@ -1016,6 +1050,45 @@ def audit(c=None):
     except Exception:
         pass
 
+    # The schedule preflight (2026-09-20, David: "set up a global rule to check schedules
+    # around automated jobs when these are created"). §2a listed what a cron job ships with
+    # and this pass audited it the morning after; the hook is what moves the check to the
+    # moment of creation. Unregistered or unexecutable, and we are back to finding five
+    # undeclared jobs the next day — which is the miss that prompted it.
+    try:
+        _st = load(os.path.expanduser("~/.claude/settings.json"), {}) or {}
+        _cmds = [h.get("command", "") for grp in (_st.get("hooks", {}).get("PreToolUse") or [])
+                 for h in grp.get("hooks", [])]
+        _hook = os.path.join(MC, "bin", "hook-guard-schedule.py")
+        _chk = os.path.join(MC, "bin", "schedule-check.py")
+        if not any("hook-guard-schedule" in c for c in _cmds) or not os.access(_hook, os.X_OK):
+            _finding(f, "guardrail-inert", "high",
+                     "the schedule-check PreToolUse hook is not armed",
+                     "bin/hook-guard-schedule.py must be listed under hooks.PreToolUse "
+                     "(matcher Bash) in ~/.claude/settings.json and be executable, or a "
+                     "crontab install goes in unchecked again")
+        elif os.path.exists(_chk):
+            # ...and the checker it calls must still run. A hook that shells out to a broken
+            # script is the guardrail-inert pattern one level down.
+            _rc = subprocess.run([sys.executable, _chk, "--audit", "--quiet"],
+                                 capture_output=True, text=True, timeout=120)
+            if _rc.returncode not in (0, 1, 2):
+                _finding(f, "guardrail-inert", "high",
+                         "schedule-check.py does not run — the crontab hook is calling a "
+                         "broken checker",
+                         f"`schedule-check.py --audit` exited {_rc.returncode}: "
+                         + (_rc.stderr or "")[:240])
+            elif _rc.returncode == 2:
+                _finding(f, "schedule-blocker", "med",
+                         "the live crontab has a schedule blocker",
+                         "`schedule-check.py --audit` found a job that would be refused at "
+                         "creation today — fix it, or record the deviation in "
+                         "config/backoffice_mute.json with its reason: "
+                         + " | ".join(l.strip() for l in (_rc.stdout or "").splitlines()
+                                      if "[BLOCK]" in l)[:300])
+    except Exception:
+        pass
+
     pol = os.path.join(CONFIG, "notify_policy.json")
     try:
         _p = load(pol, None)
@@ -1025,6 +1098,19 @@ def audit(c=None):
                  "notify_policy.json is unreadable — push tiering is off",
                  f"notify.sh fails OPEN by design, so every push goes through unthrottled "
                  f"until this parses again ({e}).")
+
+    # The policy's own expectations table (2026-09-03). The 08-31 maintenance-channel mute
+    # silently swallowed every non-Stocks agent session for three days; a rule edit that
+    # breaks a pinned expectation now surfaces the next morning instead of when David asks.
+    _st_out = sh([sys.executable, os.path.join(MC, "bin", "notify_policy.py"), "selftest"],
+                 timeout=20) or ""
+    if "FAIL" in _st_out or "expectations hold" not in _st_out:
+        _finding(f, "guardrail-inert", "high",
+                 "notify_policy selftest fails — a tiering rule no longer does what was agreed",
+                 "run `python3 ~/maintenance/bin/notify_policy.py selftest`; each FAIL line "
+                 "names the channel/title and the tier David asked for. Fix the rule, not "
+                 "the expectation, unless he changed his mind: "
+                 + _st_out.strip().replace("\n", " | ")[:300])
 
     # WRDS credential liveness (2026-08-31, asked for in memo hbs-database-credentials):
     # the Stocks desk's SQL fundamentals layer authenticates with a password that HBS/WRDS
@@ -1119,6 +1205,64 @@ def audit(c=None):
                      project=e.get("project", ""))
     except Exception:
         pass
+
+    # 20. THE DATA CATALOG (2026-09-20). Every dataset on the box is declared by the project
+    #     that owns it; these rules are what make "continuously updated" a mechanism rather
+    #     than goodwill — a project that ignores the memo is a finding every morning until it
+    #     declares. Rule logic and its fixture tests live in bin/catalog.py, so the guardrail
+    #     can be proven to fire without running a whole daily pass.
+    try:
+        import catalog as _catalog
+        for r in _catalog.audit():
+            _finding(f, r["kind"], r["sev"], r["title"], r["detail"], r["project"],
+                     fix=r.get("fix", "human"))
+    except Exception as e:
+        _finding(f, "guardrail-inert", "high",
+                 "the data catalog did not compile — every catalog rule is off",
+                 f"bin/catalog.py audit raised {type(e).__name__}: {e}. While this is broken "
+                 "nothing checks that projects declare their data, that declarations still "
+                 "resolve, or that a feed has gone stale.")
+
+    # …and the armed-check for it, the same shape as the notify_policy one: a rule nobody has
+    # seen fire is a rule nobody should trust (box rule: `guardrail-inert`).
+    _cat_st = sh([sys.executable, os.path.join(MC, "bin", "catalog.py"), "selftest"],
+                 timeout=40) or ""
+    if "FAIL" in _cat_st or not re.search(r"^(\d+)/\1 passed", _cat_st.strip().splitlines()[-1]
+                                          if _cat_st.strip() else ""):
+        _finding(f, "guardrail-inert", "high",
+                 "catalog selftest fails — a data-catalog rule no longer fires",
+                 "run `python3 ~/maintenance/bin/catalog.py selftest`; each FAIL line names "
+                 "the contract or rule that broke. The adoption guardrail, the staleness rule "
+                 "and the irreplaceable-and-unbacked rule are all proven by that fixture "
+                 "suite: " + _cat_st.strip().replace("\n", " | ")[-300:])
+
+    # The dashboard's own tab tests. They are shim-DOM renders against the LIVE :8900
+    # payloads, so they catch the thing a syntax check cannot: a field renamed in
+    # server.py that leaves a panel blank on David's phone. Nothing ran them until now
+    # and test_claude_tab.js had been throwing for weeks unnoticed — a guardrail nobody
+    # executes is the `guardrail-inert` case applied to a test.
+    _dash = os.path.join(MC, "dashboard")
+    if shutil.which("node"):
+        for _t, _lbl in (("test_overview_tab.js", "Overview"), ("test_claude_tab.js", "Claude"),
+                         ("test_catalog_tab.js", "Catalog")):
+            _tp = os.path.join(_dash, _t)
+            if not os.path.exists(_tp):
+                continue
+            try:
+                _r = subprocess.run(["node", _tp], cwd=_dash, capture_output=True,
+                                    text=True, timeout=90)
+                _ok, _out = _r.returncode == 0, (_r.stdout + _r.stderr)
+            except Exception as _e:
+                _ok, _out = False, f"{type(_e).__name__}: {_e}"
+            if not _ok:
+                _finding(f, "guardrail-inert", "high",
+                         f"dashboard {_lbl} tab test fails",
+                         f"`node dashboard/{_t}` does not pass. The tab renders from the live "
+                         f"payload, so this is a panel that is blank or wrong on the dashboard "
+                         f"right now, not a style complaint: "
+                         + " | ".join(l for l in _out.splitlines()
+                                      if "FAIL" in l or "THREW" in l or "Error" in l)[-300:],
+                         project="maintenance")
 
     uniq = {}
     for x in f:

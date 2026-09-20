@@ -37,12 +37,37 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
-def ask(prompt, model=None, num_predict=400, temperature=0.2, timeout=900,
-        force_json=False, job=None):
+# When a caller turns thinking on, the model spends tokens reasoning BEFORE its answer, and
+# ollama counts those against num_predict. A think call that keeps a 400-token cap returns an
+# empty answer mid-thought. So a think call gets this much headroom on top of what it asked.
+THINK_HEADROOM = 2500
+
+
+def ask(prompt, model=None, num_predict=400, temperature=None, timeout=900,
+        force_json=False, job=None, think=None, num_ctx=None, system=None):
+    """One local-model call. Sampling defaults come from the registry's per-role `options`
+    (models.json: temperature, think, num_ctx) so the box can change them in one place;
+    an explicit argument wins. `think` on a reasoning model (qwen3.*) is a real quality
+    lever for adjudication/extraction and a real cost (seconds) for bulk reads — callers
+    choose per prompt. `num_ctx` is sent EXPLICITLY: the server happens to be sized at
+    256K today, but an unrequested window is a default that can change under us."""
     model = model or _model()
-    body = {"model": model, "messages": [{"role": "user", "content": prompt}],
-            "think": False, "stream": False, "keep_alive": gpu.cfg()["keep_alive"],
+    opts = models.options(ROLE)
+    if think is None:
+        think = bool(opts.get("think", False))
+    if temperature is None:
+        temperature = opts.get("temperature", 0.2)
+    if num_ctx is None:
+        num_ctx = opts.get("num_ctx")
+    if think:
+        num_predict = num_predict + THINK_HEADROOM
+    messages = ([{"role": "system", "content": system}] if system else []) + \
+               [{"role": "user", "content": prompt}]
+    body = {"model": model, "messages": messages,
+            "think": bool(think), "stream": False, "keep_alive": gpu.cfg()["keep_alive"],
             "options": {"num_predict": num_predict, "temperature": temperature}}
+    if num_ctx:
+        body["options"]["num_ctx"] = int(num_ctx)
     if force_json:
         body["format"] = "json"
     req = urllib.request.Request(models.chat_url(), json.dumps(body).encode(),
@@ -57,14 +82,29 @@ def ask(prompt, model=None, num_predict=400, temperature=0.2, timeout=900,
     return re.sub(r"<think>.*?</think>", "", txt, flags=re.S).strip()
 
 
+PARSE_FAIL_LOG = os.path.expanduser("~/maintenance/state/local_parse_failures.jsonl")
+
+
 def ask_json(prompt, **kw):
-    """ask() but parses a JSON object out of the reply; returns {} on failure."""
+    """ask() but parses a JSON object out of the reply; returns {} on failure — and RECORDS
+    the failure (job, model, first 300 chars) in state/local_parse_failures.jsonl, because
+    an empty dict at the call site is indistinguishable from an empty answer and nobody could
+    say how many local calls failed to parse in a month (audit 2026-09-07)."""
     txt = ask(prompt, force_json=True, **kw)
     try:
         return json.loads(txt)
     except Exception:
         m = re.search(r"\{.*\}", txt, re.S)
         try:
-            return json.loads(m.group(0)) if m else {}
+            return json.loads(m.group(0)) if m else _parse_fail(txt, kw)
         except Exception:
-            return {}
+            return _parse_fail(txt, kw)
+
+
+def _parse_fail(txt, kw):
+    with __import__("contextlib").suppress(Exception):
+        with open(PARSE_FAIL_LOG, "a") as f:
+            f.write(json.dumps({"at": time.time(), "job": kw.get("job"), "think": kw.get("think"),
+                                "num_predict": kw.get("num_predict"), "head": (txt or "")[:300]}) + "\n")
+    print(f"localllm: unparseable JSON from job={kw.get('job')} ({len(txt or '')} chars)", file=sys.stderr)
+    return {}

@@ -5,6 +5,7 @@ Stdlib only (no deps to rot). Read-only aggregation of netdata, crontab, logs, g
 ntfy history, watchdog state — plus two actions: run a green-lit experiment, and
 update the Spark's packages. Serves on :8900 (tailnet-only box).
 """
+import glob
 import json, os, re, subprocess, sys, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen
@@ -254,7 +255,7 @@ def _kind_of(cmd):
     return "local" if _is_local_ai(cmd) else "code"
 
 
-def _measured_runtimes():
+def _measured_runtimes(jobs=None):
     """Median wall-clock per run, from evidence rather than estimate.
 
     Two sources, because the two kinds of job leave different traces: a headless Claude
@@ -277,7 +278,7 @@ def _measured_runtimes():
         # almost any minute and would claim the first session it saw — which is exactly what
         # it did, attributing a 20-minute interactive session to the Remote Control watchdog.
         scheds = []
-        for j in cron_jobs():
+        for j in (jobs if jobs is not None else cron_jobs()):
             sc = j.get("schedule", "")
             f = sc.split()
             if len(f) != 5 or sc.startswith("@"):
@@ -342,7 +343,7 @@ def _measured_runtimes():
     return out
 
 
-def schedule_week():
+def schedule_week(jobs=None):
     """The week as a timetable, not a list.
 
     Four shapes, because they are genuinely different things and drawing them the same way
@@ -356,8 +357,10 @@ def schedule_week():
              gets its own strip with the date it next fires.
       boot   @reboot -> no time to place it at
     """
-    dur = _measured_runtimes()
-    jobs = cron_jobs()
+    # One crontab read per request, not three: overview() already has the parsed jobs and
+    # hands them down. Re-reading cost ~0.7s a time, twice, for an identical answer.
+    jobs = cron_jobs() if jobs is None else jobs
+    dur = _measured_runtimes(jobs)
     # The grid is David's week, so occurrences are shifted from UTC into ET before placing.
     # Drawing UTC days under ET labels would put a job that fires 02:00Z Monday on the
     # Monday row when in New York it already happened on Sunday evening.
@@ -532,7 +535,21 @@ def next_run(sched, within_days=40):
 
 
 def _ord(n):
-    n = int(n)
+    """'3' -> '3rd'. Tolerant of cron day-of-month ranges/lists/steps ('1-7' -> '1st–7th',
+    '3,5' -> '3rd/5th', '*/2' -> 'every 2 days'): the Stocks strategy line `0 4 1-7 * *`
+    (2026-09-07) took down /api/overview AND sentinel.py for a day via int('1-7')."""
+    s = str(n).strip()
+    if "," in s:
+        return "/".join(_ord(x) for x in s.split(","))
+    if s.startswith("*/"):
+        return f"every {s[2:]} days"
+    if "-" in s:
+        a, b = s.split("-", 1)
+        return f"{_ord(a)}–{_ord(b)}"
+    try:
+        n = int(s)
+    except ValueError:
+        return s
     return f"{n}{'th' if 10 <= n % 100 <= 20 else {1:'st',2:'nd',3:'rd'}.get(n % 10, 'th')}"
 
 
@@ -547,6 +564,15 @@ def _dow_label(f4):
 
 
 def _freq_label(sched):
+    """Human label for a cron schedule. Never raises: one odd crontab line must not take the
+    whole overview (and every sentinel tick) down with it — fall back to the raw schedule."""
+    try:
+        return _freq_label_inner(sched)
+    except Exception:
+        return sched
+
+
+def _freq_label_inner(sched):
     if sched == "@reboot":
         return "at boot"
     f = sched.split()
@@ -762,33 +788,89 @@ def ports():
 NOTIF_LEDGER = f"{HOME}/maintenance/state/notifications.jsonl"
 
 
-def notifications():
-    """Permanent local ledger (notify.sh writes it) merged with a live ntfy poll —
-    the poll catches direct pushers (e.g. Stocks triggers.py) and is written back
-    into the ledger so history accumulates from every source."""
-    ledger, seen = [], set()
+NOTIF_KEEP = 500          # what the feed can page through
+NTFY_POLL_TTL = 180       # how often the remote poll is actually paid for
+
+
+def _ntfy_poll():
+    """Poll every ntfy channel AT ONCE and return the raw messages.
+
+    Serially this was the single slowest thing on the box's busiest endpoint: five
+    HTTPS round-trips to ntfy.sh, each with a 4s socket timeout, on every /api/overview
+    — 12s of the 13s an overview cost, to learn (almost always) that there is nothing
+    new. Five threads make the worst case one timeout instead of five, and the caller
+    holds the result for NTFY_POLL_TTL so a 15s page refresh does not re-pay it.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    channels = _cfg("ntfy.json", {"channels": {}})["channels"]
+    if not channels:
+        return []
+
+    def one(item):
+        name, topic = item
+        out = []
+        try:
+            with urlopen(f"https://ntfy.sh/{topic}/json?poll=1&since=12h", timeout=3) as r:
+                for line in r.read().decode().splitlines():
+                    m = json.loads(line)
+                    if m.get("event") == "message":
+                        out.append({"time": m["time"], "channel": name,
+                                    "title": m.get("title", ""),
+                                    "message": m.get("message", "")[:300]})
+        except Exception:
+            pass
+        return out
+
+    with ThreadPoolExecutor(max_workers=min(8, len(channels))) as ex:
+        return [m for chunk in ex.map(one, list(channels.items())) for m in chunk]
+
+
+def _ledger_tail(path, keep):
+    """Last `keep` ledger entries without parsing the whole file.
+
+    The ledger is append-only and already at 765KB; only the newest few hundred rows
+    can ever be shown, so reading from the end is the whole job. 700 bytes/row is a
+    generous estimate — if the slice comes up short we widen it once and stop.
+    """
+    rows = []
     try:
-        for line in open(NOTIF_LEDGER, errors="replace"):
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            for window in (keep * 700, keep * 2500):
+                fh.seek(max(0, size - window))
+                if size > window:
+                    fh.readline()          # drop the partial first line
+                lines = fh.read().decode("utf-8", "replace").splitlines()
+                if len(lines) >= keep or window >= size:
+                    break
+        for line in lines[-keep:]:
             try:
-                m = json.loads(line)
-                ledger.append(m)
-                seen.add((m["time"], m.get("title", "")))
+                rows.append(json.loads(line))
             except Exception:
                 pass
     except Exception:
         pass
-    new = []
-    channels = _cfg("ntfy.json", {"channels": {}})["channels"]
-    for name, topic in channels.items():
-        try:
-            with urlopen(f"https://ntfy.sh/{topic}/json?poll=1&since=12h", timeout=4) as r:
-                for line in r.read().decode().splitlines():
-                    m = json.loads(line)
-                    if m.get("event") == "message" and (m["time"], m.get("title", "")) not in seen:
-                        new.append({"time": m["time"], "channel": name,
-                                    "title": m.get("title", ""), "message": m.get("message", "")[:300]})
-        except Exception:
-            continue
+    return rows
+
+
+def notifications():
+    """Permanent local ledger (notify.sh writes it) merged with a live ntfy poll —
+    the poll catches direct pushers (e.g. Stocks triggers.py) and is written back
+    into the ledger so history accumulates from every source.
+
+    The ledger read is local and fresh on every call, so a notify.sh push shows up
+    immediately; only the remote poll is cached.
+    """
+    ledger = _ledger_tail(NOTIF_LEDGER, NOTIF_KEEP)
+    seen = {(m["time"], m.get("title", "")) for m in ledger if "time" in m}
+    # The tail is only the newest NOTIF_KEEP rows, so it can only prove a message is a
+    # duplicate back to its own oldest row. Today that is ~7 days against a 12h poll
+    # window, but a burst could shrink it — anything older than the tail is left alone
+    # rather than re-appended as "new".
+    floor = min((m["time"] for m in ledger if "time" in m), default=0)
+    polled = _slow_get("ntfy", NTFY_POLL_TTL, _ntfy_poll, []) or []
+    new = [m for m in polled
+           if m["time"] >= floor and (m["time"], m.get("title", "")) not in seen]
     if new:
         try:
             os.makedirs(os.path.dirname(NOTIF_LEDGER), exist_ok=True)
@@ -799,7 +881,7 @@ def notifications():
             pass
     out = ledger + new
     out.sort(key=lambda x: -x["time"])
-    return out[:500]
+    return out[:NOTIF_KEEP]
 
 
 def localai():
@@ -875,9 +957,15 @@ def watchdog():
         w["ok"] = w["state"] == ""
     except Exception:
         pass
-    log = f"{HOME}/maintenance/logs/healthcheck.log"
-    if os.path.exists(log):
-        w["last_check"] = int(os.stat(log).st_mtime)
+    # "Last ran" must come from something the watchdog writes on EVERY tick. healthcheck.log
+    # only gets a line on a state change (a quiet week reads as a dead watchdog — that was the
+    # sentinel's false "not run for 47 days", memo 2026-09-04); thermal.jsonl is appended each run.
+    stamps = []
+    for f in (f"{HOME}/maintenance/state/thermal.jsonl", f"{HOME}/maintenance/logs/healthcheck.log"):
+        if os.path.exists(f):
+            stamps.append(int(os.stat(f).st_mtime))
+    if stamps:
+        w["last_check"] = max(stamps)
     return w
 
 
@@ -925,6 +1013,67 @@ def backoffice():
     out["census"] = {"at": cen.get("at"), "projects": len(cen.get("projects", {})),
                      "crons": len(cen.get("crons", [])), "ports": len(cen.get("ports", []))}
     return out
+
+
+def catalog_view():
+    """The Catalog tab's payload: an inventory, its sources, and its lineage.
+
+    Shaped the way a data catalog is normally browsed — a landing page of counts and
+    sources, then a domain (here: a project), then one asset — rather than as one flat
+    table. Everything is read from the compiled snapshot; no walk happens per request.
+    """
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import catalog as cat
+    except Exception as e:
+        return {"error": str(e)[:160], "rows": [], "projects": {}, "counts": {}}
+    st = cat.compiled()
+    ent = st.get("entries", {})
+
+    downstream = {}
+    for cid, r in ent.items():
+        for up in (r.get("upstream") or []):
+            downstream.setdefault(up, []).append(cid)
+
+    rows = []
+    for cid, r in sorted(ent.items()):
+        declared = set(r.get("readers") or []) | {r["project"]}
+        seen = set(r.get("readers_seen") or [])
+        rows.append({k: r.get(k) for k in
+                     ("id", "path", "project", "layer", "origin", "source", "source_system",
+                      "upstream", "format", "writer", "schema", "private", "backup",
+                      "disposable", "note", "exists", "fresh", "age_h", "bytes", "files",
+                      "reads_30d", "last_read", "cadence_h", "bound_h")}
+                    | {"declared": sorted(declared), "seen": sorted(seen),
+                       "unused": sorted(declared - seen - {r["project"]}),
+                       "downstream": sorted(downstream.get(cid, []))})
+
+    links = {}
+    try:
+        for r in cat.reads(30):
+            owner = r["id"].split("/")[0]
+            rp = r.get("reader_project")
+            if rp and rp != owner and rp != "?":
+                k = (rp, owner)
+                links[k] = {"reader": rp, "owner": owner,
+                            "n": links.get(k, {}).get("n", 0) + 1,
+                            "last": max(links.get(k, {}).get("last", 0), r.get("at", 0)),
+                            "ids": sorted(set(links.get(k, {}).get("ids", []) + [r["id"]]))}
+    except Exception:
+        pass
+
+    projs = dict(st.get("projects", {}))
+    for sl, p in projs.items():
+        mine = [r for r in rows if r["project"] == sl]
+        p["bytes"] = sum(r["bytes"] or 0 for r in mine)
+        p["sources"] = sorted({s for r in mine for s in (r["source_system"] or [])})
+        p["reads_30d"] = sum(r["reads_30d"] or 0 for r in mine)
+    order = sorted(projs, key=lambda p: (-(projs[p].get("declared") or 0), p))
+    return {"at": st.get("at"), "counts": st.get("counts", {}), "projects": projs,
+            "sources": st.get("sources", {}), "order": order, "rows": rows,
+            "errors": st.get("errors", []), "links": sorted(links.values(),
+                                                            key=lambda x: -x["n"]),
+            "findings": cat.audit(st)}
 
 
 def projects():
@@ -1142,8 +1291,9 @@ def bus_process(target):
         os.makedirs(os.path.dirname(log), exist_ok=True)
         with open(log, "ab") as fh:
             fh.write(f"\n=== process {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
-            subprocess.Popen([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"],
-                             cwd=root, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+            _p = subprocess.Popen([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"],
+                                  cwd=root, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+        _claim_slot(f"memo process ({target})", "memo", _p.pid, 15)
     except Exception as e:
         return {"ok": False, "msg": str(e)[:120]}
     return {"ok": True}
@@ -1174,6 +1324,23 @@ def bus_send(target, title, body, launch):
         r = bus_process(target)
         msg += " Processing session launched." if r.get("ok") else f" Launch failed: {r.get('msg')}"
     return {"ok": True, "msg": msg}
+
+
+def _claim_slot(job, kind, pid, est_min):
+    """Tell the box Claude queue that David just launched a session from the dashboard.
+
+    A dashboard click is David-initiated, so it is exempt from the clock windows (SOUL.md /
+    PROJECT_STANDARDS §2) — but it is NOT exempt from the credential. It preempts like the
+    trade session: his click wins, and the queue holds everything else rather than stacking
+    a second session on the same login. Best-effort; a queue error never blocks his click.
+    """
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import claudeq
+        claudeq.take(job, pid, kind, est_min=est_min, preempt=True)
+        claudeq.watcher(pid)
+    except Exception as e:
+        print(f"[dashboard] claudeq claim failed for {job}: {type(e).__name__}: {e}", flush=True)
 
 
 CLAUDE_BIN = f"{HOME}/.local/bin/claude"  # RC-capable native build (2.1.212+, full claude.ai login) — INTERACTIVE tmux dispatches only
@@ -1260,8 +1427,9 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     log = f"{HOME}/maintenance/logs/memo_process_{target}.log"
     os.makedirs(os.path.dirname(log), exist_ok=True)
     with open(log, "ab") as fh:
-        subprocess.Popen([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"],
-                         cwd=root, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+        _p = subprocess.Popen([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"],
+                              cwd=root, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+    _claim_slot(f"dispatch ({target})", "foreign", _p.pid, 30)
     return {"ok": True, "msg": "Dispatched headless."}
 
 
@@ -1372,6 +1540,7 @@ def run_experiment(slug):
         fh.write(f"\n=== run {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
         p = subprocess.Popen(["bash", "-c", shell_cmd], stdout=fh, stderr=fh,
                              cwd=f"{HOME}/maintenance", start_new_session=True)
+    _claim_slot(f"experiment {slug}", "foreign", p.pid, 60)
     state = _exp_state()
     state[slug] = {"status": "running", "pid": p.pid, "started": int(time.time()), "log": log}
     _save_exp_state(state)
@@ -1393,16 +1562,333 @@ def run_update():
 
 # ---------- http ----------
 
-def overview():
-    with _cache["lock"]:
-        if _cache["data"] and time.time() - _cache["t"] < 8:
-            return _cache["data"]
-    data = {"generated_at": int(time.time()), "system": system_stats(), "crons": cron_jobs(),
-            "notifications": notifications(), "watchdog": watchdog(), "projects": projects(),
+# ---------------------------------------------------------------- live Claude sessions
+# David 2026-09-08: "I need some visibility in mission control of active headless sessions and
+# how long they've been running with number of tokens." Sources, all already on disk:
+#   state/claude_sessions/<sid>.start  "<epoch> <pid> <headless> <project>"  (SessionStart hook)
+#   /proc/<pid>                         is it still alive
+#   ~/.claude/projects/*/<sid>.jsonl    the transcript — every assistant turn carries `usage`
+#   state/claude_sessions.jsonl         the task text the hook recorded at start
+# Transcripts are parsed INCREMENTALLY (bytes appended since the last look), so a 26-hour
+# session costs one seek per refresh, not a re-read of 50MB.
+_SESS = {}
+
+
+def _transcript_for(sid):
+    hits = glob.glob(f"{HOME}/.claude/projects/*/{sid}.jsonl")
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def _transcript_totals(path):
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return None
+    c = _SESS.get(path)
+    if c and c["size"] == size:
+        return c
+    if not c or size < c["size"]:
+        c = {"size": 0, "in": 0, "out": 0, "cc": 0, "cr": 0, "msgs": 0, "model": None, "last_ts": None,
+             "first_prompt": None}
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(c["size"])
+            buf = fh.read()
+    except OSError:
+        return c
+    nl = buf.rfind(b"\n")
+    if nl < 0:
+        return c
+    for line in buf[:nl].split(b"\n"):
+        if c["first_prompt"] is None and b'"type":"user"' in line:
+            try:
+                j = json.loads(line)
+                txt = (j.get("message") or {}).get("content")
+                if isinstance(txt, list):
+                    txt = " ".join(b.get("text", "") for b in txt
+                                   if isinstance(b, dict) and b.get("type") == "text")
+                txt = " ".join((txt or "").split())
+                if txt and not txt.startswith("<"):       # skip injected system-reminder turns
+                    c["first_prompt"] = txt[:160]
+            except Exception:
+                pass
+        if b'"usage"' not in line:
+            continue
+        try:
+            j = json.loads(line)
+        except Exception:
+            continue
+        if j.get("type") != "assistant":
+            continue
+        m = j.get("message") or {}
+        u = m.get("usage") or {}
+        if not u:
+            continue
+        c["in"] += u.get("input_tokens") or 0
+        c["out"] += u.get("output_tokens") or 0
+        c["cc"] += u.get("cache_creation_input_tokens") or 0
+        c["cr"] += u.get("cache_read_input_tokens") or 0
+        c["msgs"] += 1
+        c["model"] = m.get("model") or c["model"]
+        c["last_ts"] = j.get("timestamp") or c["last_ts"]
+    c["size"] += nl + 1
+    _SESS[path] = c
+    return c
+
+
+def _proc_started(pid):
+    """Epoch start of a pid, from /proc/<pid>/stat field 22 + boot time."""
+    try:
+        st = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+        ticks = int(st[19])
+        btime = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime"))
+        return btime + ticks // os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+
+def _claude_procs():
+    """Every live Claude CLI on the box: pid -> {cwd, args, headless, started}. The CLI binary is
+    ~/.local/bin/claude for cron/queue launches and ~/.claude/remote/ccd-cli/<ver> for the
+    desktop app, so match on the path. `remote-control` is the bridge daemon, not a session."""
+    out = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            cmd = [a.decode("utf-8", "replace") for a in open(f"/proc/{d}/cmdline", "rb").read().split(b"\0") if a]
+        except OSError:
+            continue
+        if not cmd or "claude" not in cmd[0].lower() or (len(cmd) > 1 and cmd[1] == "remote-control"):
+            continue
+        if os.path.basename(cmd[0]) == "server" or "--serve" in cmd or "--bridge" in cmd:
+            continue                                   # desktop-app bridge daemons, not sessions
+        try:
+            cwd = os.readlink(f"/proc/{d}/cwd")
+        except OSError:
+            cwd = None
+        out[int(d)] = {"cwd": cwd, "args": " ".join(cmd[1:])[:120],
+                       "headless": "-p" in cmd[1:] or "--print" in cmd[1:],
+                       "started": _proc_started(int(d))}
+    return out
+
+
+def _label_cwd(cwd):
+    """('Stocks', 'weekend-strategy-run-summary') from a worktree path; ('home', None) at ~."""
+    if not cwd:
+        return None, None
+    cwd = cwd.replace(" (deleted)", "")
+    rel = os.path.relpath(cwd, HOME)
+    project = "home" if rel in (".", "") or rel.startswith("..") else rel.split("/")[0]
+    wt = None
+    if "/.claude/worktrees/" in cwd:
+        wt = re.sub(r"-[0-9a-f]{6}$", "", cwd.split("/.claude/worktrees/")[1].split("/")[0])
+    return project, wt
+
+
+def _guess_transcript(cwd, started, claimed):
+    """A pid-less process's transcript: the one file in its project dir written since it
+    started and not claimed by a recorded session. Ambiguous -> None (say so, don't guess)."""
+    if not cwd or not started:
+        return None
+    slug = cwd.replace(" (deleted)", "").replace("/", "-")
+    cands = [f for f in glob.glob(f"{HOME}/.claude/projects/{slug}/*.jsonl")
+             if f not in claimed and os.path.getmtime(f) >= started - 60]
+    return cands[0] if len(cands) == 1 else None
+
+
+_Q = {"t": 0, "data": None}
+
+
+def _stocks_queue():
+    """The Stocks Claude queue (claudeq.py status — pure code, zero tokens), cached 60s."""
+    if time.time() - _Q["t"] < 60:
+        return _Q["data"]
+    data = None
+    try:
+        r = subprocess.run(["python3", "-c", "import sys, json; sys.path.insert(0, '.'); import claudeq; "
+                            "print(json.dumps(claudeq.status(), default=str))"],
+                           cwd=f"{HOME}/Stocks/_engine", capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            q = json.loads(r.stdout)
+            data = {"holder": q.get("holder"), "blocked": q.get("blocked"),
+                    "budget": q.get("budget"), "next_boundary": q.get("next_boundary"),
+                    "queue": (q.get("queue") or [])[:6], "pending": len(q.get("queue") or [])}
+    except Exception:
+        pass
+    _Q.update(t=time.time(), data=data)
+    return data
+
+
+def live_sessions(crons=None):
+    now = int(time.time())
+    tasks = {}
+    try:
+        with open(f"{HOME}/maintenance/state/claude_sessions.jsonl", errors="replace") as fh:
+            for line in fh:
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                if j.get("event") == "SessionStart":
+                    tasks[j.get("session")] = j
+    except OSError:
+        pass
+    procs = _claude_procs()
+    out, seen, claimed = [], set(), set()
+    for mk in glob.glob(f"{HOME}/maintenance/state/claude_sessions/*.start"):
+        sid = os.path.basename(mk)[:-6]
+        try:
+            parts = open(mk).read().split()
+            start = int(parts[0])
+        except Exception:
+            continue
+        pid = int(parts[1]) if len(parts) > 1 else 0
+        row = tasks.get(sid, {})
+        cwd = row.get("cwd")
+        if not pid and cwd:
+            # marker predates pid recording: the live CLI whose cwd matches, closest start time
+            cands = [(abs((p["started"] or 0) - start), q) for q, p in procs.items()
+                     if q not in seen and (p["cwd"] or "").replace(" (deleted)", "") == cwd]
+            if cands:
+                pid = min(cands)[1]
+        if pid and pid not in procs:
+            continue                                   # died without a SessionEnd; hook sweeps it
+        headless = (parts[2] == "1") if len(parts) > 2 else bool(row.get("headless"))
+        project, wt = _label_cwd(cwd or (procs.get(pid) or {}).get("cwd"))
+        project = (parts[3] if len(parts) > 3 else None) or row.get("project") or project
+        tp = _transcript_for(sid)
+        tot = _transcript_totals(tp) if tp else None
+        last = int(os.stat(tp).st_mtime) if tp else None
+        if not pid and (last is None or now - last > 3 * 3600):
+            continue                                   # no pid to check and the transcript is cold
+        seen.add(pid)
+        if tp:
+            claimed.add(tp)
+        task = row.get("task") if headless else ((tot or {}).get("first_prompt") or "")
+        if task == "(no prompt)":
+            task = ""
+        out.append({"sid": sid, "pid": pid or None, "project": project, "worktree": wt,
+                    "headless": headless, "task": task or "", "cwd": cwd,
+                    "started": start, "elapsed_s": now - start,
+                    "idle_s": (now - last) if last else None,
+                    "tokens": {k: tot[k] for k in ("in", "out", "cc", "cr", "msgs")} if tot else None,
+                    "model": (tot or {}).get("model"), "recorded": True})
+    for pid, p in procs.items():
+        if pid in seen:
+            continue
+        project, wt = _label_cwd(p["cwd"])
+        tp = _guess_transcript(p["cwd"], p["started"], claimed)
+        tot = _transcript_totals(tp) if tp else None
+        last = int(os.stat(tp).st_mtime) if tp else None
+        if tp:
+            claimed.add(tp)
+        out.append({"sid": None, "pid": pid, "project": project, "worktree": wt,
+                    "headless": p["headless"],
+                    "task": (p["args"] if p["headless"] else (tot or {}).get("first_prompt")) or "",
+                    "cwd": p["cwd"], "started": p["started"],
+                    "elapsed_s": (now - p["started"]) if p["started"] else None,
+                    "idle_s": (now - last) if last else None,
+                    "tokens": {k: tot[k] for k in ("in", "out", "cc", "cr", "msgs")} if tot else None,
+                    "model": (tot or {}).get("model"), "recorded": False,
+                    "deleted_worktree": bool(p["cwd"] and p["cwd"].endswith("(deleted)"))})
+    # Headless only (David 2026-09-08: "i don't want to see those interactive ones" — the desktop
+    # app already lists them, and an idle one spends nothing). Interactive rows are still
+    # computed so a pid-less marker's cwd match claims its transcript before the guessing step.
+    out = [r for r in out if r["headless"]]
+    out.sort(key=lambda r: -(r["elapsed_s"] or 0))
+    caps = []
+    try:
+        with open(f"{HOME}/maintenance/state/headless_caps.jsonl") as fh:
+            caps = [json.loads(l) for l in fh if l.strip()][-5:]
+    except Exception:
+        pass
+    # Up next — like the GPU tile: the Stocks queue (what it is running and what waits), then
+    # the next scheduled Claude crons on the box.
+    nxt = sorted([c for c in (crons or []) if c.get("ai") and c.get("next_run")],
+                 key=lambda c: c["next_run"])[:5]
+    return {"sessions": out, "cap_min": int(os.environ.get("CLAUDE_HEADLESS_MAX_MIN", "180")),
+            "recent_kills": caps, "queue": _stocks_queue(),
+            "next_cron": [{"desc": c["desc"], "project": c["project"], "next_run": c["next_run"],
+                           "tokens_per_run": c["tokens_per_run"]} for c in nxt]}
+
+
+def catalog_summary():
+    """One glance at the data catalog for the Overview tiles. Reads the compiled snapshot
+    only — no walk, no stat storm on an 8-second cache."""
+    st = _load_json(f"{HOME}/maintenance/state/catalog.json", {})
+    c = st.get("counts", {})
+    projs = st.get("projects", {})
+    declared = sum(p.get("declared", 0) for p in projs.values())
+    undeclared = sum(p.get("undeclared", 0) or 0 for p in projs.values())
+    nodecl = sorted(p.get("dir") or sl for sl, p in projs.items() if not p.get("has_catalog"))
+    return {"at": st.get("at"), "datasets": c.get("datasets", 0),
+            "projects_declaring": c.get("projects_declaring", 0),
+            "projects_total": len(projs), "projects_without": nodecl,
+            "coverage_pct": round(declared / (declared + undeclared) * 100) if declared + undeclared else 100,
+            "undeclared": undeclared, "stale": c.get("stale", 0), "orphan": c.get("orphan", 0),
+            "external": c.get("external", 0), "internal": c.get("internal", 0),
+            "mixed": c.get("mixed", 0), "read_30d": c.get("read_30d", 0)}
+
+
+OVERVIEW_FRESH = 10    # younger than this: serve it, do nothing
+OVERVIEW_STALE = 120   # older than this: the caller waits for a rebuild
+
+
+def _overview_build():
+    crons = cron_jobs()
+    return {"generated_at": int(time.time()), "system": system_stats(), "crons": crons,
+            "watchdog": watchdog(), "projects": projects(),
             "experiments": experiments(), "ports": ports(), "localai": localai(),
-            "schedule": schedule_week()}
+            "schedule": schedule_week(crons), "sessions": live_sessions(crons),
+            "catalog": catalog_summary()}
+
+
+def _overview_refresh():
+    """Rebuild into the cache. Never raises — it also runs on a background thread,
+    where an exception would only be lost, and a failed rebuild must leave the last
+    good snapshot in place rather than blank the dashboard."""
+    try:
+        data = _overview_build()
+        with _cache["lock"]:
+            _cache.update(t=time.time(), data=data)
+    except Exception:
+        pass
+    finally:
+        with _cache["lock"]:
+            _cache["building"] = False
+
+
+def overview():
+    """Stale-while-revalidate: the page never waits on a rebuild it did not need.
+
+    The old cache was 8s against a 15s page refresh, so *every* refresh was a miss and
+    every miss paid the full build — which had grown to ~13s. The browser gave up before
+    the response landed (BrokenPipeError in _server.log) and the dashboard looked
+    permanently mid-load. Now a warm entry is returned immediately and a rebuild runs on
+    one background thread; only a cold or genuinely stale cache blocks the caller.
+    """
+    now = time.time()
     with _cache["lock"]:
-        _cache.update(t=time.time(), data=data)
+        data, age = _cache["data"], now - _cache["t"]
+        if data and age < OVERVIEW_FRESH:
+            return data
+        if data and age < OVERVIEW_STALE:
+            spawn = not _cache.get("building")
+            if spawn:
+                _cache["building"] = True
+        else:
+            spawn = None            # cold/too stale — build inline, caller waits
+    if spawn is None:
+        with _cache["lock"]:
+            _cache["building"] = True
+        _overview_refresh()
+        with _cache["lock"]:
+            if _cache["data"]:
+                return _cache["data"]
+        return _overview_build()     # nothing cached and the rebuild failed: surface it
+    if spawn:
+        threading.Thread(target=_overview_refresh, daemon=True).start()
     return data
 
 
@@ -1410,18 +1896,41 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, cache="no-store"):
+        # Gzip anything worth gzipping. These payloads are JSON read over the tailnet from
+        # a phone; the overview compresses about 8:1, and http.server does none of this for
+        # us. Below ~1KB the header costs more than the saving.
+        enc = None
+        if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            try:
+                import gzip as _gz
+                body, enc = _gz.compress(body, 6), "gzip"
+            except Exception:
+                enc = None
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
+        if enc:
+            self.send_header("Content-Encoding", enc)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # the browser navigated away mid-response; not an error worth a traceback
 
     def do_GET(self):
         if self.path.startswith("/api/overview"):
             self._send(200, json.dumps(overview()).encode(), "application/json")
+        elif self.path.startswith("/api/notifications"):
+            # Split off /api/overview 2026-09-20: 500 notification rows are 139KB of a
+            # 211KB payload, and the feed shows ten at a time. The page pulls this on its
+            # own slower cadence instead of shipping the whole history every 15 seconds.
+            self._send(200, json.dumps(notifications()).encode(), "application/json")
         elif self.path.startswith("/api/memos"):
             self._send(200, json.dumps(memos()).encode(), "application/json")
+        elif self.path == "/api/catalog":
+            self._send(200, json.dumps(catalog_view()).encode(), "application/json")
         elif self.path == "/api/backoffice":
             self._send(200, json.dumps(backoffice()).encode(), "application/json")
         elif self.path == "/api/reports":
@@ -1462,7 +1971,8 @@ class H(BaseHTTPRequestHandler):
         elif re.match(r"^/vendor/[\w.-]+\.js$", self.path):
             p = os.path.join(BASE, "vendor", os.path.basename(self.path))
             if os.path.exists(p):
-                self._send(200, open(p, "rb").read(), "application/javascript")
+                self._send(200, open(p, "rb").read(), "application/javascript",
+                           cache="public, max-age=604800, immutable")
             else:
                 self._send(404, b"not found", "text/plain")
         elif self.path in ("/", "/index.html"):
@@ -1524,5 +2034,25 @@ class H(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
 
+def _warm():
+    """Build the overview and poll ntfy once before anyone asks.
+
+    Everything after the first request is served from cache, so without this the one
+    person who opens the dashboard after a restart pays the entire cold build — which is
+    exactly the load David would notice. Backgrounded so a slow ntfy cannot delay the
+    port coming up.
+    """
+    for fn in (overview, notifications):
+        threading.Thread(target=lambda f=fn: _quiet(f), daemon=True).start()
+
+
+def _quiet(fn):
+    try:
+        fn()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    threading.Thread(target=_warm, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

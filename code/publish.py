@@ -132,6 +132,22 @@ def denylist(repo=None):
     return pats
 
 
+def _private_paths(project_dir):
+    """{catalog id: relative path} for everything this project declared private. Reading the
+    catalog here is its second use of the same declaration — the project says "private" once
+    and both the backup rule and the publish gate honour it."""
+    out = {}
+    try:
+        sys.path.insert(0, os.path.join(MC, "bin"))
+        import catalog as _catalog
+        for e in _catalog.index().values():
+            if e.get("private") and e.get("project_dir") == project_dir:
+                out[e["id"]] = e["path"]
+    except Exception:
+        pass
+    return out
+
+
 def scan_text(text, pats, where=""):
     hits = []
     for i, line in enumerate(text.splitlines(), 1):
@@ -246,11 +262,20 @@ def build(repo=None):
                     os.unlink(fp)
                     print(f"  pruned (no longer allowlisted): {os.path.relpath(fp, root())}")
 
+        private = _private_paths(name)
         for entry in spec.get("include_code", []):
             rel, dest = (entry, None) if isinstance(entry, str) else (entry["from"], entry.get("to"))
             src_f = os.path.join(HOME, name, rel)
             if not os.path.exists(src_f):
                 print(f"  ! missing allowlisted file: {rel}")
+                continue
+            # A dataset the project declared `private: true` can never be an allowlisted
+            # file, however it got onto the list. The scanner catches private STRINGS; this
+            # catches a private FILE, which is the failure that would matter.
+            hit = next((cid for cid, p in private.items()
+                        if rel == p or rel.startswith(p.rstrip("/") + "/")), None)
+            if hit:
+                print(f"  ! REFUSED {rel}: declared private in the data catalog ({hit})")
                 continue
             out = os.path.join(d, dest or os.path.join("code", os.path.basename(rel)))
             os.makedirs(os.path.dirname(out), exist_ok=True)
