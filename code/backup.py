@@ -17,6 +17,7 @@ qualifies goes in `exempt` with the reason, which is also what stops the audit a
 Every archive is verified by reading it back before the old ones are pruned: a backup you
 have never restored is a hypothesis, and `tar tzf` is the cheapest possible test of it.
 """
+import glob
 import json
 import os
 import subprocess
@@ -58,7 +59,11 @@ def age_h(path):
 def write_one(name, spec):
     """tar the declared paths, verify the archive, then prune. Returns (ok, message)."""
     src = os.path.join(HOME, name)
-    paths = [p for p in spec.get("paths", []) if os.path.exists(os.path.join(src, p))]
+    paths = sorted({
+        os.path.relpath(m, src)
+        for p in spec.get("paths", [])
+        for m in glob.glob(os.path.join(src, p))
+    })
     if not paths:
         return False, f"{name}: none of the declared paths exist"
     d = dest_dir(name)

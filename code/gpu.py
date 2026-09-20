@@ -165,8 +165,12 @@ def _write_atomic(path, obj):
 def _alive(pid):
     try:
         os.kill(pid, 0)
-        return True
     except (OSError, TypeError):
+        return False
+    try:  # os.kill(pid, 0) succeeds for <defunct> zombies; check /proc to confirm
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(") ", 1)[1].split(" ", 1)[0] != "Z"
+    except OSError:
         return False
 
 
@@ -567,7 +571,25 @@ def _selftest():
         ok = got == want
         bad += not ok
         print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
-    total = len(cases) + len(announce_cases)
+    # zombie liveness: a <defunct> child must NOT pass _alive() (the 2026-09-09 starvation bug)
+    cpid = os.fork()
+    if cpid == 0:
+        os._exit(0)
+    time.sleep(0.05)  # let child enter zombie state before parent calls waitpid
+    zombie_alive = _alive(cpid)
+    os.waitpid(cpid, 0)
+    after_reap = _alive(cpid)
+    self_alive = _alive(os.getpid())
+    zombie_cases = [
+        ("zombie pid is not alive", zombie_alive, False),
+        ("reaped pid is not alive", after_reap, False),
+        ("self is alive", self_alive, True),
+    ]
+    for name, got, want in zombie_cases:
+        ok = got == want
+        bad += not ok
+        print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
+    total = len(cases) + len(announce_cases) + len(zombie_cases)
     print(f"{total - bad}/{total} passed")
     return bad
 
