@@ -1015,12 +1015,152 @@ def backoffice():
     return out
 
 
+def _build_id():
+    """Mtime of the page the server is handing out. Cheap, monotonic, and exactly the thing
+    that changes when a deploy lands."""
+    try:
+        return str(int(os.path.getmtime(os.path.join(BASE, "index.html"))))
+    except OSError:
+        return "0"
+
+
+def catalog_sources():
+    """Every outside system, grouped by category, with what it is and what it feeds.
+    Metadata only, and small — the whole thing is a few kB."""
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import catalog as cat
+    except Exception as e:
+        return {"error": str(e)[:160]}
+    st = cat.compiled()
+    ent = st.get("entries", {})
+    cats = {}
+    for name, v in (st.get("sources") or {}).items():
+        c = v.get("category") or "uncategorised"
+        direct = [cid for cid in v["datasets"]
+                  if name in (ent.get(cid, {}).get("source_system") or [])]
+        cats.setdefault(c, {"category": c, "systems": [], "bytes": 0, "datasets": 0})
+        cats[c]["systems"].append({
+            "system": name, "what": v.get("what", ""), "bytes": v.get("bytes", 0),
+            "datasets": len(v["datasets"]), "direct": len(direct),
+            "projects": v.get("projects", []),
+            # what it lands as, before anything derives from it
+            "lands_as": sorted(
+                {ent[cid]["id"] for cid in direct if cid in ent},
+                key=lambda cid: -(ent[cid].get("bytes") or 0))[:8]})
+        cats[c]["bytes"] += v.get("bytes", 0)
+        cats[c]["datasets"] += len(v["datasets"])
+    for c in cats.values():
+        c["systems"].sort(key=lambda x: -x["bytes"])
+    order = sorted(cats, key=lambda c: (c == "uncategorised", -cats[c]["bytes"], c))
+    return {"categories": [cats[c] for c in order],
+            "systems": sum(len(c["systems"]) for c in cats.values()),
+            "bytes": sum(c["bytes"] for c in cats.values())}
+
+
+def catalog_origin(origin):
+    """One origin, grouped the way that origin is actually thought about.
+
+    `internal` groups by project and leads with whether the thing is protected — it is the
+    layer nothing off the box can reproduce, so "who wrote it and is it backed up" is the
+    only question that matters. `mixed` groups by the source category it derives from,
+    because mixed means our work over someone else's content and the interesting axis is
+    whose. `external` has its own view (catalog_sources) organised by system.
+    """
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import catalog as cat
+    except Exception as e:
+        return {"error": str(e)[:160]}
+    st = cat.compiled()
+    ent = st.get("entries", {})
+    srcs = st.get("sources") or {}
+    sys_cat = {k: (v.get("category") or "uncategorised") for k, v in srcs.items()}
+    # which categories a dataset traces back to, through lineage
+    of = {}
+    for name, v in srcs.items():
+        for cid in v["datasets"]:
+            of.setdefault(cid, set()).add(sys_cat.get(name, "uncategorised"))
+
+    groups = {}
+    for cid, r in sorted(ent.items()):
+        if r.get("origin") != origin:
+            continue
+        keys = ([r["project"]] if origin == "internal"
+                else sorted(of.get(cid) or []) or ["derived on the box"])
+        item = {"id": cid, "project": r["project"], "schema": r.get("schema"),
+                "layer": r.get("layer"), "bytes": r.get("bytes"), "age_h": r.get("age_h"),
+                "fresh": r.get("fresh"), "exists": r.get("exists"),
+                "private": bool(r.get("private")), "backup": r.get("backup"),
+                "disposable": r.get("disposable"), "reads_30d": r.get("reads_30d")}
+        for k in keys:
+            g = groups.setdefault(k, {"key": k, "items": [], "bytes": 0, "unprotected": 0})
+            g["items"].append(item)
+            g["bytes"] += r.get("bytes") or 0
+            if origin == "internal" and r.get("backup") == "none" and not r.get("disposable"):
+                g["unprotected"] += 1
+    for g in groups.values():
+        g["items"].sort(key=lambda x: -(x["bytes"] or 0))
+    order = sorted(groups, key=lambda k: (-groups[k]["bytes"], k))
+    c = st.get("counts", {})
+    return {"origin": origin, "groups": [groups[k] for k in order],
+            "datasets": c.get(origin, 0), "bytes": c.get("bytes_" + origin, 0),
+            "grouped_by": "project" if origin == "internal" else "where it came from"}
+
+
+def catalog_project(slug):
+    """One project's drill-down: what it owns, what it reads from others, what others read
+    from it. Metadata only — an id, a one-line description of what a record contains, a size.
+    Never the contents; this dashboard indexes 37 GB and must stay incapable of serving any
+    of it. Scoped to one project so the page never ships the whole catalog to show a corner
+    of it."""
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import catalog as cat
+    except Exception as e:
+        return {"error": str(e)[:160]}
+    st = cat.compiled()
+    ent = st.get("entries", {})
+    if slug not in {r["project"] for r in ent.values()} and slug not in st.get("projects", {}):
+        return {"error": f"no project {slug}"}
+
+    def brief(cid, r):
+        return {"id": cid, "schema": r.get("schema"), "origin": r.get("origin"),
+                "layer": r.get("layer"), "bytes": r.get("bytes"), "age_h": r.get("age_h"),
+                "fresh": r.get("fresh"), "exists": r.get("exists"),
+                "private": bool(r.get("private")), "format": r.get("format"),
+                "source_system": r.get("source_system") or [],
+                "upstream": r.get("upstream") or [], "reads_30d": r.get("reads_30d")}
+
+    owns, ins, outs = [], [], []
+    for cid, r in sorted(ent.items()):
+        readers = set(r.get("readers") or []) | set(r.get("readers_seen") or [])
+        if r["project"] == slug:
+            b = brief(cid, r)
+            owns.append(b)
+            out_to = sorted(readers - {slug})
+            if out_to:
+                outs.append({**b, "readers": out_to})
+        elif slug in readers:
+            ins.append({**brief(cid, r), "owner": r["project"],
+                        "observed": slug in (r.get("readers_seen") or [])})
+    p = dict(st.get("projects", {}).get(slug, {}))
+    p.pop("undeclared_sample", None)
+    return {"project": slug, "meta": p, "owns": owns, "ins": ins, "outs": outs,
+            "bytes": sum(x["bytes"] or 0 for x in owns)}
+
+
 def catalog_view():
     """The Catalog tab's payload: an inventory, its sources, and its lineage.
 
     Shaped the way a data catalog is normally browsed — a landing page of counts and
     sources, then a domain (here: a project), then one asset — rather than as one flat
     table. Everything is read from the compiled snapshot; no walk happens per request.
+
+    COUNTS AND SIZES ONLY. The per-dataset rows are computed here to derive the per-project
+    totals and the cross-project links, and then thrown away — they are ~92% of the bytes and
+    nothing on the page displays them. This dashboard indexes 37 GB; it must never be a way
+    to read any of it.
     """
     try:
         sys.path.insert(0, f"{HOME}/maintenance/bin")
@@ -1062,18 +1202,34 @@ def catalog_view():
     except Exception:
         pass
 
+    # The summary the tab opens on is a flow, not a file listing: what comes IN from outside
+    # (source systems), what this project IMPORTS from its neighbours, what it OWNS, and what
+    # it EXPORTS to them. Counts and bytes only — the names live one level down.
+    srcs = st.get("sources", {})
     projs = dict(st.get("projects", {}))
     for sl, p in projs.items():
         mine = [r for r in rows if r["project"] == sl]
         p["bytes"] = sum(r["bytes"] or 0 for r in mine)
-        p["sources"] = sorted({s for r in mine for s in (r["source_system"] or [])})
+        # inherited, not just declared: a brief built from a scored feed still counts the
+        # filings the feed pulled, which is the whole point of walking lineage
+        p["sources"] = sorted(k for k, v in srcs.items() if sl in (v.get("projects") or []))
         p["reads_30d"] = sum(r["reads_30d"] or 0 for r in mine)
+        p["exports"] = sum(1 for r in mine
+                           if set(r["declared"] + r["seen"]) - {sl})
+        p["imports"] = sum(1 for r in rows
+                           if r["project"] != sl and sl in set(r["declared"] + r["seen"]))
+        p["import_bytes"] = sum(r["bytes"] or 0 for r in rows
+                                if r["project"] != sl and sl in set(r["declared"] + r["seen"]))
+        p["export_bytes"] = sum(r["bytes"] or 0 for r in mine
+                                if set(r["declared"] + r["seen"]) - {sl})
     order = sorted(projs, key=lambda p: (-(projs[p].get("declared") or 0), p))
-    return {"at": st.get("at"), "counts": st.get("counts", {}), "projects": projs,
-            "sources": st.get("sources", {}), "order": order, "rows": rows,
-            "errors": st.get("errors", []), "links": sorted(links.values(),
-                                                            key=lambda x: -x["n"]),
-            "findings": cat.audit(st)}
+    out = {"at": st.get("at"), "build": _build_id(),
+           "counts": st.get("counts", {}), "projects": projs,
+           "sources": st.get("sources", {}), "order": order,
+           "errors": st.get("errors", []),
+           "links": sorted(links.values(), key=lambda x: -x["n"]),
+           "findings": cat.audit(st)}
+    return out
 
 
 def projects():
@@ -1929,6 +2085,18 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(notifications()).encode(), "application/json")
         elif self.path.startswith("/api/memos"):
             self._send(200, json.dumps(memos()).encode(), "application/json")
+        elif self.path.startswith("/api/catalog/origin"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            self._send(200, json.dumps(catalog_origin((q.get("o") or ["internal"])[0])).encode(),
+                       "application/json")
+        elif self.path == "/api/catalog/sources":
+            self._send(200, json.dumps(catalog_sources()).encode(), "application/json")
+        elif self.path.startswith("/api/catalog/project"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            self._send(200, json.dumps(catalog_project((q.get("p") or [""])[0])).encode(),
+                       "application/json")
         elif self.path == "/api/catalog":
             self._send(200, json.dumps(catalog_view()).encode(), "application/json")
         elif self.path == "/api/backoffice":
@@ -1976,7 +2144,23 @@ class H(BaseHTTPRequestHandler):
             else:
                 self._send(404, b"not found", "text/plain")
         elif self.path in ("/", "/index.html"):
-            self._send(200, open(os.path.join(BASE, "index.html"), "rb").read(), "text/html; charset=utf-8")
+            # Stamp the page with the build it was served from. A tab left open across a
+            # deploy keeps polling happily — the header clock stays live — while its
+            # JavaScript is hours old, and the first symptom is a panel that quietly does
+            # nothing. With this the page can say "I am older than the server" instead.
+            p = os.path.join(BASE, "index.html")
+            html = open(p, "rb").read().replace(b"__BUILD__", _build_id().encode())
+            # The catalog SUMMARY ships inside the page. It is ~10 kB, the server already
+            # has it, and inlining it means the tab draws with no request at all — so it
+            # cannot sit on "Loading…" because a fetch was slow, blocked by an extension,
+            # or answered by a server the page no longer agrees with. Drill-downs still
+            # fetch; those are the part that is actually big.
+            try:
+                boot = json.dumps(catalog_view()).replace("</", "<\\/")
+            except Exception as e:
+                boot = json.dumps({"error": str(e)[:160]})
+            html = html.replace(b"/*__CATALOG__*/null", boot.encode())
+            self._send(200, html, "text/html; charset=utf-8")
         else:
             self._send(404, b"not found", "text/plain")
 

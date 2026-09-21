@@ -1264,6 +1264,21 @@ def audit(c=None):
                                       if "FAIL" in l or "THREW" in l or "Error" in l)[-300:],
                          project="maintenance")
 
+    # 21. the dashboard itself. "If it isn't on the dashboard, it isn't real" cuts both ways:
+    #     a panel that silently renders nothing is worse than a missing one, because the page
+    #     still looks alive. dashboard/check.py executes the SERVED page and walks the catalog
+    #     click path; a syntax check cannot catch a name collision or a dead render.
+    _dash = sh([sys.executable, os.path.join(MC, "dashboard", "check.py")], timeout=180) or ""
+    if "ALL GREEN" not in _dash:
+        _finding(f, "dashboard-broken", "high",
+                 "a dashboard check is failing",
+                 "run `python3 ~/maintenance/dashboard/check.py`. It executes the served page "
+                 "(a top-level throw blanks everything), renders the catalog with no network, "
+                 "walks the click path, and refuses duplicate function names — the collision "
+                 "that silently swallowed every catalog render on 2026-09-20. Output: "
+                 + (_dash.strip().replace("\n", " | ")[-400:] or "no output — is the "
+                    "dashboard running? dashboard/serve.sh start"))
+
     uniq = {}
     for x in f:
         uniq.setdefault(x["id"], x)
