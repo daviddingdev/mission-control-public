@@ -19,7 +19,9 @@ have never restored is a hypothesis, and `tar tzf` is the cheapest possible test
 """
 import glob
 import json
+import fnmatch
 import os
+import re
 import subprocess
 import sys
 import time
@@ -56,9 +58,22 @@ def age_h(path):
     return round((time.time() - os.path.getmtime(path)) / 3600, 1) if path else None
 
 
+# Names that mean "this is a live secret". Matched against the archive listing, not the
+# filesystem, so it costs nothing on a 734MB tree.
+SECRETISH = re.compile(
+    r"(^|/)\.?(credentials?|secrets?)(\.json|\.yaml|\.yml|/|$)"
+    r"|(^|/)(headless-token|\.credentials\.json|id_rsa|id_ed25519)(/|$)"
+    r"|\.pem$|\.p12$|\.pfx$|(^|/)\.env$|(^|/)\.netrc$|(^|/)\.pgpass$",
+    re.I)
+
+
 def write_one(name, spec):
     """tar the declared paths, verify the archive, then prune. Returns (ok, message)."""
-    src = os.path.join(HOME, name)
+    # `src` lets a source live somewhere other than ~/<name>. Needed for the Claude layer:
+    # naming the source `.claude` would produce `.claude_<date>.tar.gz`, a HIDDEN file, and
+    # newest() skips dotfiles — so every archive would be written and then invisible, and
+    # the freshness check would fail forever against backups that were in fact being made.
+    src = os.path.expanduser(spec.get("src") or os.path.join(HOME, name))
     paths = sorted({
         os.path.relpath(m, src)
         for p in spec.get("paths", [])
@@ -79,6 +94,26 @@ def write_one(name, spec):
         os.unlink(out)
         return False, f"{name}: archive unreadable, discarded — {v.stderr.strip()[:120]}"
     entries = len(v.stdout.splitlines())
+    # A credential must never enter a backup. `claude-layer` is declared as a narrow include
+    # list precisely because ~/.claude also holds .credentials.json and headless-token — but
+    # a narrow include list is only safe until someone widens it, and the widening would look
+    # harmless in review. So the archive LISTING (already computed for the readability check
+    # above, so this is nearly free) is scanned, and a hit discards the archive rather than
+    # shipping it to ~/backups and, later, offsite.
+    # A source MAY deliberately archive a secret — clientco-db's whole backup is its .env,
+    # because the ERP data itself is in git and the credential is the only unrecoverable
+    # piece. It opts in BY NAME (`secrets_ok: [".env"]`), not with a blanket boolean, so
+    # widening the paths later still trips on anything that was not named.
+    allowed = spec.get("secrets_ok") or []
+    leaked = [ln for ln in v.stdout.splitlines()
+              if SECRETISH.search(ln)
+              and not any(fnmatch.fnmatch(ln.rstrip("/"), a) or ln.rstrip("/") == a
+                          for a in allowed)]
+    if leaked:
+        os.unlink(out)
+        return False, (f"{name}: REFUSED — archive contained {len(leaked)} credential-ish "
+                       f"path(s), e.g. {leaked[0][:60]}. Narrow the `paths` in "
+                       f"config/backups.json; do not add an exclude and hope.")
     keep = int(spec.get("keep_days", 30))
     olds = sorted((os.path.join(d, f) for f in os.listdir(d) if f.endswith(".tar.gz")),
                   key=os.path.getmtime, reverse=True)
@@ -138,8 +173,51 @@ def _list():
             print(f"  {name:<16} —      no backup yet")
 
 
+def selftest():
+    """Prove the credential refusal actually fires.
+
+    The `claude-layer` source is declared as a narrow include list because ~/.claude also
+    holds .credentials.json and headless-token. A narrow list is only safe until somebody
+    widens it, and the widening looks harmless in review — so write_one() scans the archive
+    listing and discards anything credential-shaped. A guard nobody has watched refuse is a
+    guard nobody should trust (box rule: `guardrail-inert`), hence these fixtures.
+    """
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="backup-selftest-")
+    src_dir = os.path.join(tmp, "fakeproj")
+    os.makedirs(os.path.join(src_dir, "state"))
+    open(os.path.join(src_dir, "state", "data.json"), "w").write("{}")
+    open(os.path.join(src_dir, ".credentials.json"), "w").write('{"oauth": "secret"}')
+    open(os.path.join(src_dir, "id_ed25519"), "w").write("KEY")
+    global root
+    _real_root, root = root, (lambda: os.path.join(tmp, "dest"))
+    cases = [
+        ({"paths": ["state"]}, True, "ordinary data archives fine"),
+        ({"paths": ["state", ".credentials.json"]}, False,
+         "an UNNAMED credential is refused"),
+        ({"paths": ["state", ".credentials.json"], "secrets_ok": [".credentials.json"]},
+         True, "…and allowed when opted in BY NAME"),
+        ({"paths": ["state", ".credentials.json", "id_ed25519"],
+          "secrets_ok": [".credentials.json"]}, False,
+         "a NEW secret beside an opted-in one still trips"),
+    ]
+    bad = 0
+    for spec, want, label in cases:
+        ok, msg = write_one("fakeproj", {**spec, "src": src_dir})
+        good = ok is want
+        bad += not good
+        print(f"  {'ok  ' if good else 'FAIL'} {label:<48} -> {'archived' if ok else 'refused'}")
+    root = _real_root
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("ALL PASS" if not bad else f"SELFTEST FAILED ({bad})")
+    return 1 if bad else 0
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if cmd == "selftest":
+        sys.exit(selftest())
     if cmd == "run":
         sys.exit(run(sys.argv[2] if len(sys.argv) > 2 else None))
     elif cmd == "check":
@@ -147,4 +225,4 @@ if __name__ == "__main__":
     elif cmd == "list":
         _list()
     else:
-        sys.exit("usage: backup.py run [project] | check | list")
+        sys.exit("usage: backup.py run [project] | check | list | selftest")

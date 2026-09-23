@@ -1279,6 +1279,56 @@ def audit(c=None):
                  + (_dash.strip().replace("\n", " | ")[-400:] or "no output — is the "
                     "dashboard running? dashboard/serve.sh start"))
 
+    # 21c. the backup layer's credential refusal. ~/.claude was backed up for the first time
+    #      on 2026-09-21 and it sits beside .credentials.json and headless-token, so the
+    #      source is a NARROW include list — safe only while nobody widens it, and a widening
+    #      looks harmless in review. backup.py scans each archive's listing and discards
+    #      anything credential-shaped unless the source opted in BY NAME. Proven, not assumed.
+    _bk_st = sh([sys.executable, os.path.join(MC, "bin", "backup.py"), "selftest"],
+                timeout=120) or ""
+    if "ALL PASS" not in _bk_st:
+        _finding(f, "guardrail-inert", "high",
+                 "backup selftest fails — a credential could reach an archive",
+                 "run `python3 ~/maintenance/bin/backup.py selftest`. Its fixtures assert "
+                 "that an unnamed credential is refused, that a `secrets_ok` name is "
+                 "honoured (clientco-db's .env is a deliberate one), and that a NEW secret "
+                 "beside an opted-in one still trips. Output: "
+                 + _bk_st.strip().replace("\n", " | ")[-300:])
+
+    # 22. systemd units that can never work, and units stuck in a restart storm (2026-09-21).
+    #     Found by hand twice and by a check never: five USER units at ~143,000 restarts each
+    #     after their folders were archived (09-08, 3.8G of journal), then a SYSTEM unit left
+    #     behind by the same family-vault retirement still looping 190,608 times on 09-21 —
+    #     because the 09-08 sweep had only looked at ~/.config/systemd/user/. Retiring a
+    #     project reliably removes the folder and the cron lines; the unit file is the step
+    #     that gets forgotten, and Restart=always makes forgetting expensive. Both scopes.
+    _du = sh([sys.executable, os.path.join(MC, "bin", "deadunits.py"), "scan", "--json"],
+             timeout=90)
+    try:
+        for h in json.loads(_du or "[]"):
+            _finding(f, "unit-dead", "med",
+                     f"{h['unit']} ({h['scope']}) is looping or cannot start",
+                     f"{h['why']}. Either the unit outlived what it ran (retire it: "
+                     "`systemctl [--user] disable --now <unit>`, move the unit file to "
+                     "~/archive/<project>/systemd/ and add restart notes to ARCHIVE.md), or "
+                     "the thing it needs is genuinely absent and the retry cadence should be "
+                     "backed off with a drop-in rather than left hammering. Not a finding you "
+                     "mute without deciding which.")
+    except Exception:
+        pass
+
+    # 22b. and the check above must itself be provable — rule `guardrail-inert`.
+    _du_st = sh([sys.executable, os.path.join(MC, "bin", "deadunits.py"), "selftest"],
+                timeout=60) or ""
+    if "ALL PASS" not in _du_st:
+        _finding(f, "guardrail-inert", "high",
+                 "deadunits selftest fails — the dead-unit rule no longer fires",
+                 "run `python3 ~/maintenance/bin/deadunits.py selftest`; each FAIL line names "
+                 "the fixture that stopped being detected. Its fixtures are the two real "
+                 "misses (09-08 user units, 09-21 system unit) plus the WorkingDirectory "
+                 "'!'/'-' prefixes that false-positived 14 healthy desktop units on the first "
+                 "draft. Output: " + _du_st.strip().replace("\n", " | ")[-300:])
+
     uniq = {}
     for x in f:
         uniq.setdefault(x["id"], x)

@@ -103,6 +103,14 @@ USE=$(df --output=pcent / | tail -1 | tr -dc '0-9')
 # database had no backup at all). backup.py check exits 1 if anything is stale.
 python3 bin/backup.py check >/dev/null 2>&1 || FAIL+=("backup-stale")
 
+# Download-speed floor — alert when rx throughput drops below ~1 MB/s. Fetch 1 MB from
+# Cloudflare with a 2-second ceiling: at ≥1 MB/s the transfer completes in time; below
+# that (the wlP9s9 link fell to 28 KB/s for 19 days from 09-03 unnoticed) it times out.
+# DNS + TLS setup on a good link costs well under the 2-second budget.
+curl -sf -m 2 -o /dev/null \
+  "https://speed.cloudflare.com/__down?bytes=1000000" 2>/dev/null \
+  || FAIL+=("download-slow(<1MB/s)")
+
 # Dead CLI auth is fixable from David's phone — when it NEWLY fails, auto-start the
 # remote re-auth flow (pty scrape of `claude setup-token`, zero tokens): the OAuth link
 # lands on his phone via ntfy and the code comes back through Mission Control's Claude
