@@ -760,7 +760,7 @@ KNOWN_PORTS = {
     8088: ("Poker app (pokerlog.service, tailscale HTTPS)", "poker"),
     8787: ("Stocks dashboard", "Stocks"), 8900: ("Mission Control (this)", "Mission Control"),
     8910: ("HBS casework dashboard", "hbs"), 8790: ("Justin desk — advised book paper mode", "Stocks"),
-    19999: ("Netdata monitoring", "system"), 445: ("Samba", "system"), 631: ("CUPS printing", "system"),
+    19999: ("Netdata monitoring", "system"), 445: ("Samba", "system"), 139: ("Samba NetBIOS", "system"), 631: ("CUPS printing", "system"),
     3493: ("NUT / UPS daemon", "system"), 4317: ("OpenTelemetry", "system"),
     8125: ("StatsD (netdata)", "system"), 51820: ("WireGuard (tailscale)", "system"),
     53: ("DNS", "system"), 11434: ("ollama — local AI models", "Mission Control"),

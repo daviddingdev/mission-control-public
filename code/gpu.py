@@ -333,6 +333,7 @@ def slot(job=None, model=None, proj=None, timeout=None):
     """
     c = cfg()
     me, held, t0 = None, False, time.time()
+    t_grant = t0   # updated when the slot is actually granted; separates wait from hold
     try:
         _ensure()
         me = {"id": uuid.uuid4().hex[:12], "pid": os.getpid(), "since": t0,
@@ -345,16 +346,17 @@ def slot(job=None, model=None, proj=None, timeout=None):
             with _locked():
                 if _try_admit(me):
                     held = True
+                    t_grant = time.time()
                     break
             time.sleep(c["poll_s"] * (1 + random.random() * 0.5))
-        wait_s = round(time.time() - t0, 1)
+        wait_s = round(t_grant - t0, 1)
         if held:
             if wait_s > 1:
                 event("grant", project=me["project"], job=me["job"], wait_s=wait_s,
                       tier=me["tier"], model=model)
         else:
-            event("bypass", project=me["project"], job=me["job"], wait_s=wait_s,
-                  reason="wait timeout")
+            event("bypass", project=me["project"], job=me["job"],
+                  wait_s=round(time.time() - t0, 1), reason="wait timeout")
     except Exception as e:                       # never let the scheduler break the work
         event("bypass", job=job or "?", reason=f"{type(e).__name__}: {e}"[:120])
     if me:                                       # inference proceeds on both paths
@@ -373,7 +375,7 @@ def slot(job=None, model=None, proj=None, timeout=None):
                             with contextlib.suppress(OSError):
                                 os.unlink(HOLDER)
                     event("release", project=me["project"], job=me["job"],
-                          held_s=round(time.time() - t0, 1), model=model)
+                          held_s=round(time.time() - t_grant, 1), model=model)
 
 
 def should_yield(proj=None, job=None):
