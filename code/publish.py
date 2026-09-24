@@ -73,6 +73,31 @@ def root():
 
 # ---------------------------------------------------------------- the gate
 
+SECRETS = os.path.join(HOME, ".secrets")
+
+
+def _secret_values():
+    """(why, value) for every credential in ~/.secrets — one per non-empty line, README
+    skipped. Read at call time so the values never appear in this (published) file."""
+    out = []
+    try:
+        names = sorted(os.listdir(SECRETS))
+    except OSError:
+        return out
+    for fn in names:
+        if fn.lower().startswith("readme") or fn.startswith("."):
+            continue
+        try:
+            with open(os.path.join(SECRETS, fn), errors="replace") as f:
+                for line in f:
+                    v = line.strip()
+                    if len(v) >= 6:
+                        out.append((f"credential from ~/.secrets/{fn}", v))
+        except OSError:
+            continue
+    return out
+
+
 def denylist(repo=None):
     """Every string that must never reach a public repo, assembled from the live box.
 
@@ -88,7 +113,14 @@ def denylist(repo=None):
             return
         pats.append((re.compile(p, flags), why))
     add(r"/home/user", "absolute home path")
-    add(r"\bhellopie\b", "sudo password")
+    # Credentials come from ~/.secrets at run time and never live in this file. Until
+    # 2026-09-23 the sudo password sat here as a literal, and because this file is on the
+    # public allowlist it shipped to mission-control-public for five weeks: the r"\b...\b"
+    # pattern could not match its own source line (no word boundary after the backslash-b),
+    # so the scanner was blind to the one copy it was carrying. A raw substring, not a
+    # word-bounded regex, so a credential is caught wherever it sits in a line.
+    for why, value in _secret_values():
+        add(re.escape(value), why, flags=0)
     add(r"<host>|<tailnet>", "tailnet identity")
     add(r"userstudent@gmail\.com", "personal email")
     add(r"\bdd-[a-z-]+-spark-[0-9a-f]{6}\b", "ntfy topic pattern")
@@ -444,6 +476,14 @@ def selftest():
     for text, repo, blocked in fx.SCAN_CASES:
         check(f"scan[{repo.split('-')[0]}]: {text[:34]}",
               bool(scan_text(text, denylist(repo), "t")), blocked)
+
+    # The credential rule is armed: every ~/.secrets value is caught mid-line, and no
+    # published file (this one included) carries one.
+    creds = _secret_values()
+    check("credential rule armed (~/.secrets readable)", bool(creds), True)
+    for why, v in creds:
+        check(f"scan: {why} caught mid-line", bool(scan_text(f"x={v};", denylist(), "t")), True)
+        check(f"this file carries no {why}", v in open(os.path.abspath(__file__)).read(), False)
 
     bad = [c for c in cases if not c[1]]
     for name, ok, got in cases:

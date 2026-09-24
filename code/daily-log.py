@@ -2,7 +2,7 @@
 """Daily automated-jobs summary — runs 12:05 UTC (end of quiet window).
 Snapshots every cron job's state + writes a plain-English narrative via the LOCAL
 model (ollama — zero Claude tokens; the token-saving pilot). Appends one record/day
-to state/dailylog.jsonl; the dashboard's Daily log tab renders it."""
+to state/dailylog.jsonl; the dashboard's Box › Archive (daily log) renders it."""
 import json, os, sys, time, urllib.request
 
 HOME = os.path.expanduser("~")
