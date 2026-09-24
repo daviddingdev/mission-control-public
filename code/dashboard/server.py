@@ -1235,7 +1235,11 @@ def catalog_view():
 def projects():
     out = []
     for name, meta in _pcfg().items():
-        repo = os.path.join(HOME, name)
+        # The card name is not always the folder: "Mission Control" lives in ~/maintenance.
+        # Joining the display name gave ~/Mission Control, so the card read "no repo".
+        repo = os.path.expanduser(meta.get("path") or os.path.join(HOME, name))
+        if not os.path.isdir(repo) and name == "Mission Control":
+            repo = os.path.join(HOME, "maintenance")
         p = {"name": name, "desc": meta.get("desc", ""), "next": meta.get("next", ""),
              "last_commit": None, "subject": "", "dirty": None, "activity": ""}
         if os.path.isdir(os.path.join(repo, ".git")):
@@ -1250,7 +1254,8 @@ def projects():
                 p["dirty"] = len([l for l in dirty.splitlines() if l.strip()])
             except Exception:
                 pass
-        auto = _BO_STATUS.get(name) or _BO_STATUS.get(name.replace(" ", "-"))
+        auto = (_BO_STATUS.get(name) or _BO_STATUS.get(name.replace(" ", "-"))
+                or _BO_STATUS.get(os.path.basename(repo)))
         if auto:
             p["auto"] = auto.get("summary", "")
             p["auto_at"] = auto.get("at")
@@ -2048,6 +2053,42 @@ def overview():
     return data
 
 
+# The timetable modules (tt_*.py): the Now / Fleet / Compute / System views. Imported on
+# first use and RELOADED when their file changes, so a data module can be iterated on without
+# restarting the server that sentinel, daily-log and sweep-brief also import. Each view is a
+# function taking the query dict and returning JSON-able data; a failure comes back as
+# {"error": ...} so a panel says why it is empty instead of silently drawing nothing.
+TT_ROUTES = {
+    "/api/timeline": ("tt_now", "timeline"),
+    "/api/status":   ("tt_now", "status"),
+    "/api/fleet":    ("tt_fleet", "fleet"),
+    "/api/heat":     ("tt_fleet", "heat"),
+    "/api/system":   ("tt_system", "system_view"),
+    "/api/sessions": ("tt_sessions", "sessions"),
+}
+_TT_MODS = {}
+
+
+def _tt_call(path):
+    import importlib
+    from urllib.parse import urlparse, parse_qs
+    u = urlparse(path)
+    mod_name, fn_name = TT_ROUTES[u.path]
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    try:
+        f = os.path.join(BASE, mod_name + ".py")
+        mt = os.path.getmtime(f)
+        m, seen = _TT_MODS.get(mod_name, (None, 0))
+        if m is None:
+            m = importlib.import_module(mod_name)
+        elif mt != seen:
+            m = importlib.reload(m)
+        _TT_MODS[mod_name] = (m, mt)
+        return getattr(m, fn_name)(q)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -2106,7 +2147,16 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/bus"):
             self._send(200, json.dumps(bus()).encode(), "application/json")
         elif self.path.startswith("/api/dailylog"):
-            self._send(200, json.dumps(dailylog()).encode(), "application/json")
+            # ?n=N: the newest N days only. The Now view wants yesterday's one line, not the
+            # 395 KB month (30 days x 76 jobs) the archive reads.
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            days = dailylog()
+            try:
+                n = int((q.get("n") or ["0"])[0])
+            except ValueError:
+                n = 0
+            self._send(200, json.dumps(days[:n][::-1] if n > 0 else days).encode(), "application/json")
         elif self.path.startswith("/api/usage"):
             import usage as usage_mod
             data = usage_mod.usage()
@@ -2136,19 +2186,30 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/claude"):
             import claudecfg
             self._send(200, json.dumps(claudecfg.claude()).encode(), "application/json")
-        elif re.match(r"^/vendor/[\w.-]+\.js$", self.path):
+        elif re.match(r"^/vendor/[\w.-]+\.(js|woff2)$", self.path):
+            # Vendor files are immutable-cached for a week: a changed file needs a NEW name.
             p = os.path.join(BASE, "vendor", os.path.basename(self.path))
+            ctype = "font/woff2" if p.endswith(".woff2") else "application/javascript"
             if os.path.exists(p):
-                self._send(200, open(p, "rb").read(), "application/javascript",
+                self._send(200, open(p, "rb").read(), ctype,
                            cache="public, max-age=604800, immutable")
             else:
                 self._send(404, b"not found", "text/plain")
-        elif self.path in ("/", "/index.html"):
+        elif self.path.split("?")[0] in TT_ROUTES:
+            self._send(200, json.dumps(_tt_call(self.path)).encode(), "application/json")
+        elif self.path in ("/", "/index.html") or re.match(r"^/next(/[\w-]+)?/?$", self.path):
             # Stamp the page with the build it was served from. A tab left open across a
             # deploy keeps polling happily — the header clock stays live — while its
             # JavaScript is hours old, and the first symptom is a panel that quietly does
             # nothing. With this the page can say "I am older than the server" instead.
-            p = os.path.join(BASE, "index.html")
+            # /next[/name] serves dashboard/next/<name>.html the same way: a preview of a
+            # page being built, so the live one is never the half-written one.
+            m = re.match(r"^/next(?:/([\w-]+))?/?$", self.path)
+            p = (os.path.join(BASE, "next", (m.group(1) or "index") + ".html") if m
+                 else os.path.join(BASE, "index.html"))
+            if not os.path.exists(p):
+                self._send(404, b"not found", "text/plain")
+                return
             html = open(p, "rb").read().replace(b"__BUILD__", _build_id().encode())
             # The catalog SUMMARY ships inside the page. It is ~10 kB, the server already
             # has it, and inlining it means the tab draws with no request at all — so it

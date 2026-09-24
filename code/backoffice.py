@@ -529,7 +529,7 @@ def census():
         c["catalog"] = {"error": str(e)[:160]}
     _record_cron_seen(c["crons"])
     # the Claude layer — plugins/skills that load into every session on the box.
-    # The dashboard's Claude tab is the live view; the census copy is what the
+    # The dashboard's Sessions › New sessions is the live view; the census copy is what the
     # audit rules read, same as everything else here.
     try:
         sys.path.insert(0, os.path.join(MC, "dashboard"))
@@ -631,6 +631,79 @@ def _finding(out, kind, sev, title, detail, project="", fix="human"):
     fid = f"{kind}:{project}:{re.sub(r'[^a-z0-9]+', '-', title.lower())[:60]}"
     out.append({"id": fid, "kind": kind, "sev": sev, "title": title, "detail": detail,
                 "project": project, "fix": fix})
+
+
+# The armed-check registry (2026-09-23): what rule 16 (`guardrail-inert`) proves, as data.
+# One row per control the box relies on, the check that proves it is live, and the exact
+# finding titles that check files when it is NOT ("{}" stands for an f-string field). A row
+# with no titles is a control nothing proves yet: a declared gap, drawn as a gap. Read by the
+# dashboard's Box › Guardrails (dashboard/tt_system.py), which calls a control armed when the last
+# pass left none of its titles open. audit() below does not read this table, so an armed-check
+# added there needs its row here in the same commit; `dashboard/tt_system.py selftest` parses
+# this file and fails on a guardrail-inert title with no row, or a row whose title is gone.
+# `requires` are paths under ~/maintenance the check executes (a missing one is reported).
+ARMED_CHECKS = (
+    {"id": "claude-headless", "control": "claude-headless wrapper", "layer": "preventive",
+     "standard": "§2a.3", "check": "headless token present · `claude-headless --selftest defaults`",
+     "requires": ("bin/claude-headless",),
+     "titles": ("claude-headless is installed but has no token — it is a no-op",
+                "claude-headless no longer applies the default model/effort")},
+    {"id": "spawn-guard", "control": "PreToolUse claude-spawn guard", "layer": "preventive",
+     "standard": "§2a.3", "check": None, "requires": ("bin/hook-guard-claude.py",),
+     "titles": (), "gap": "no armed-check; `claudeq.py audit` (C26) names spawns after the fact"},
+    {"id": "claudeq", "control": "claudeq box slot", "layer": "preventive",
+     "standard": "§2a.3", "check": None, "requires": ("bin/claudeq.py",),
+     "titles": (), "gap": "no armed-check in the daily pass; C26 (`claudeq.py audit`) is manual"},
+    {"id": "notify", "control": "notify.sh + notify_policy.json", "layer": "preventive",
+     "standard": "§1", "check": "policy parses · `notify_policy.py selftest`",
+     "requires": ("bin/notify.sh", "bin/notify_policy.py", "config/notify_policy.json"),
+     "titles": ("notify_policy.json is unreadable — push tiering is off",
+                "notify_policy selftest fails — a tiering rule no longer does what was agreed")},
+    {"id": "memo-inbox", "control": "SessionStart memo-inbox hook", "layer": "preventive",
+     "standard": "§6", "check": "listed under hooks.SessionStart · executable",
+     "requires": ("bin/hook-memo-inbox.py",),
+     "titles": ("the memo-inbox SessionStart hook is not armed",)},
+    {"id": "schedule-check", "control": "PreToolUse schedule-check hook", "layer": "preventive",
+     "standard": "§2a", "check": "listed under hooks.PreToolUse · executable · `schedule-check.py --audit` runs",
+     "requires": ("bin/hook-guard-schedule.py", "bin/schedule-check.py"),
+     "titles": ("the schedule-check PreToolUse hook is not armed",
+                "schedule-check.py does not run — the crontab hook is calling a broken checker")},
+    {"id": "session-ledger", "control": "SessionStart/End session ledger", "layer": "preventive",
+     "standard": "—", "check": None, "requires": ("bin/claude-session-notify.sh",),
+     "titles": (), "gap": "no armed-check; a dropped hook shows only as a quiet session ledger"},
+    {"id": "models-require", "control": "models.require() roles", "layer": "preventive",
+     "standard": "§3", "check": None, "requires": ("bin/models.py",),
+     "titles": (), "gap": "no armed-check; detective: model-role-dead, model-fallback"},
+    {"id": "gpu-slot", "control": "gpu.slot() priority queue", "layer": "preventive",
+     "standard": "§3a", "check": None, "requires": ("bin/gpu.py",),
+     "titles": (), "gap": "no armed-check; detective: gpu-unmanaged"},
+    {"id": "publish-scan", "control": "publish.py leak scanner", "layer": "preventive",
+     "standard": "§5", "check": None, "requires": ("bin/publish.py",),
+     "titles": (), "gap": "no armed-check; detective: public-leak re-runs the scan daily"},
+    {"id": "backup-refusal", "control": "backup.py credential refusal", "layer": "preventive",
+     "standard": "—", "check": "`backup.py selftest`", "requires": ("bin/backup.py",),
+     "titles": ("backup selftest fails — a credential could reach an archive",)},
+    {"id": "sudoers", "control": "update-path sudoers grant", "layer": "preventive",
+     "standard": "—", "check": "config/91-spark-updates verbs appear in `sudo -n -l`",
+     "requires": ("config/91-spark-updates",),
+     "titles": ("the sudoers grant on disk is not the one installed",)},
+    {"id": "catalog", "control": "data-catalog rules", "layer": "detective",
+     "standard": "§7", "check": "catalog compiles · `catalog.py selftest`",
+     "requires": ("bin/catalog.py",),
+     "titles": ("the data catalog did not compile — every catalog rule is off",
+                "catalog selftest fails — a data-catalog rule no longer fires")},
+    {"id": "dashboard", "control": "dashboard tab tests + check.py", "layer": "detective",
+     "standard": "—", "check": "`node test_*_tab.js` · `dashboard/check.py`",
+     "requires": ("dashboard/test_overview_tab.js", "dashboard/test_claude_tab.js",
+                  "dashboard/test_catalog_tab.js", "dashboard/check.py"),
+     "titles": ("dashboard {} tab test fails", "a dashboard check is failing")},
+    {"id": "deadunits", "control": "dead-unit rule", "layer": "detective",
+     "standard": "—", "check": "`deadunits.py selftest`", "requires": ("bin/deadunits.py",),
+     "titles": ("deadunits selftest fails — the dead-unit rule no longer fires",)},
+    {"id": "sentinel", "control": "sentinel page recheck", "layer": "detective",
+     "standard": "—", "check": "`sentinel.py selftest`", "requires": ("bin/sentinel.py",),
+     "titles": ("sentinel selftest fails — it can page on a job that already recovered",)},
+)
 
 
 def audit(c=None):
@@ -752,7 +825,7 @@ def audit(c=None):
                  c["models_check"]["out"][:200], "maintenance")
 
     # 9. an AI cron with no display name / no load weight is invisible in the dashboard's
-    #    cost view — the Usage tab silently under-reports the box.
+    #    cost view — Agents › Usage silently under-reports the box.
     for job in c["crons"]:
         # "spawns Claude" includes python launchers (ops.py, loop.py, vp.py …) — the
         # crontab-literal `claude -` test missed all of them, which is how six trading
@@ -766,7 +839,7 @@ def audit(c=None):
         if not any(w and w in job["cmd"] for w in d["weights"]):
             _finding(f, "weight-missing", "low",
                      f"Claude job has no token weight: {(job['scripts'] or [job['cmd'][:30]])[0]}",
-                     "config/job_weights.json — measure it from the Usage tab, then add it",
+                     "config/job_weights.json — measure it from Agents › Usage, then add it",
                      job["project"])
     for job in c["crons"]:
         if not any(n and n in job["cmd"] for n in d["names"]):
@@ -805,7 +878,7 @@ def audit(c=None):
                      f"a design memo is ready to read"
                      + (f" (waiting {x['days']:.0f}d)" if x["days"] >= 1 else ""),
                      f"{x['memo']} — the ladder is stalled at the one rung that needs David: "
-                     "read it in the Memos tab, then either ask a session to build it or "
+                     "read it in Sessions › Memos, then either ask a session to build it or "
                      "let it drop to the graveyard", "maintenance")
 
     # 11a. diagrams that have gone out of date with the code they describe
@@ -1013,6 +1086,20 @@ def audit(c=None):
                  "~/.claude/headless-token is missing, putting every headless job back on "
                  "the rotating credential (the 08-27/28/29 box-wide auth deaths). Re-auth "
                  "from the phone (Mission Control -> Claude -> Headless auth) writes it.")
+
+    # claude-headless's default --model/--effort (2026-09-23, David: every automated Claude
+    # job on Opus 5.5 at high effort). If the wrapper stops appending them nothing fails: the
+    # jobs that pass no flag quietly go back to Sonnet at medium. So the wrapper's own argv
+    # selftest runs here every morning (<1s, zero tokens).
+    _hl_st = sh([os.path.join(MC, "bin", "claude-headless"), "--selftest", "defaults"],
+                timeout=20) or ""
+    if "FAIL" in _hl_st or "OK" not in _hl_st:
+        _finding(f, "guardrail-inert", "high",
+                 "claude-headless no longer applies the default model/effort",
+                 "run `~/maintenance/bin/claude-headless --selftest defaults`; each FAIL line "
+                 "shows the argv a headless job would hand the CLI. Without the defaults, a job "
+                 "that passes no --model runs on Sonnet at medium effort, not Opus 5.5 at high: "
+                 + _hl_st.strip().replace("\n", " | ")[:300])
 
     # The sudoers grant the update path depends on: config/91-spark-updates is the SOURCE,
     # /etc/sudoers.d/ is what actually applies. They drifted (2026-08-29): the repo file had
@@ -1328,6 +1415,20 @@ def audit(c=None):
                  "misses (09-08 user units, 09-21 system unit) plus the WorkingDirectory "
                  "'!'/'-' prefixes that false-positived 14 healthy desktop units on the first "
                  "draft. Output: " + _du_st.strip().replace("\n", " | ")[-300:])
+
+    # 22c. the sentinel re-reads a flagged job's newest run before paging (memo 2026-09-23,
+    #      stocks): its snapshot is taken before a GPU wait that ran 1905 s on 09-23, and it
+    #      paged CRITICAL on a mcp_sync DNS failure two clean runs after it had recovered.
+    #      The selftest replays that incident; if the recheck stops firing, this says so.
+    _sn_st = sh([sys.executable, os.path.join(MC, "bin", "sentinel.py"), "selftest"],
+                timeout=60) or ""
+    if "ALL PASS" not in _sn_st:
+        _finding(f, "guardrail-inert", "high",
+                 "sentinel selftest fails — it can page on a job that already recovered",
+                 "run `python3 ~/maintenance/bin/sentinel.py selftest`; it replays the 09-23 "
+                 "mcp_sync page (14:15 failure read at 14:20, paged 14:51 after clean 14:30/14:45 "
+                 "runs) and two cases that must still page. Output: "
+                 + _sn_st.strip().replace("\n", " | ")[-300:])
 
     uniq = {}
     for x in f:

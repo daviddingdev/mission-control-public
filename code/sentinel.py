@@ -33,6 +33,42 @@ def _miss_count(tail):
     return int(m.group(1)) if m else None
 
 
+def _job_key(desc):
+    return "job:" + re.sub(r"[^a-z0-9]+", "-", desc.lower())[:40]
+
+
+# memo 2026-09-23 (stocks): the snapshot the model judges is taken BEFORE the GPU wait, and at
+# maintenance's tier that wait is bounded only by ageing (~40 min). On 09-23 the sentinel read
+# the 14:15 mcp_sync DNS failure at 14:20, queued 1905 s behind Stocks' judges, and paged
+# CRITICAL at 14:51 — after the 14:30 and 14:45 runs had both succeeded. So the job's newest
+# run is re-read right before paging. A line that reads like any of these is still a failure.
+_FAILED = re.compile(r"traceback|error|exception|fail|fatal|alert|refused|denied|timed? ?out|"
+                     r"abort|crash|killed|unreachable|no such|not found|errno", re.I)
+
+
+def _recovered(issue, before, jobs_now):
+    """-> unix time of a clean run the model never saw, or None (page as usual).
+
+    Only a job-keyed issue can recover: every cron line behind that key must have written its
+    log since the snapshot, and the newest line must not read as a failure. Anything short of
+    that — no new run, a new failure, an ambiguous line, a job missing from the snapshot —
+    pages exactly as before. The fix can only remove a page about a run the model never saw."""
+    key = issue.get("key", "")
+    if not key.startswith("job:"):
+        return None
+    rows = [j for j in jobs_now if _job_key(j["desc"]) == key and j.get("log")]
+    if not rows:
+        return None
+    for j in rows:
+        ident = (j["desc"], j["log"])
+        if ident not in before:
+            return None
+        if (not j.get("last_run") or j["last_run"] <= (before[ident] or 0)
+                or _FAILED.search(j.get("tail") or "")):
+            return None
+    return max(j["last_run"] for j in rows)
+
+
 def _rekey(issues, jobs, below=()):
     """Cooldown keys by IDENTITY, never by model phrasing. The model invents a new key string
     every run ('clientco-snapshot-fail', 'clientco-monthly-cycle-fail', ... 12 variants for ONE
@@ -49,7 +85,7 @@ def _rekey(issues, jobs, below=()):
         if job is not None:
             if job["desc"] in below:
                 continue
-            i["key"] = "job:" + re.sub(r"[^a-z0-9]+", "-", job["desc"].lower())[:40]
+            i["key"] = _job_key(job["desc"])
         else:
             projects = sorted({j["project"] for j in jobs}, key=len, reverse=True)
             proj = next((p for p in projects
@@ -85,6 +121,7 @@ def main():
             below.add(j["desc"])
             line += "  <- lab-mode skip by design (Stocks mode.py said not to run): NOT an issue"
         lines.append(line)
+    before = {(j["desc"], j.get("log")): j.get("last_run") for j in jobs}   # what the model sees
     w = server.watchdog()
     # memo 2026-09-04 (stocks): health.state is written on CHANGE only; the model read a quiet
     # file as a dead watchdog. The log mtime is the "last ran" fact.
@@ -131,19 +168,98 @@ def main():
     fresh = [i for i in issues
              if isinstance(i, dict) and i.get("key")
              and now - state.get(i["key"], 0) > COOLDOWN]
+    # Re-read each flagged job's newest run NOW, not at snapshot time (memo 2026-09-23). A
+    # recovered issue is not stamped into the cooldown, so a relapse still pages.
+    back = []
+    if any(i["key"].startswith("job:") for i in fresh):
+        try:
+            jobs_now = server.cron_jobs()
+        except Exception:
+            jobs_now = []
+        for i in fresh:
+            at = _recovered(i, before, jobs_now)
+            if at:
+                i["recovered_at"] = at
+                back.append(i)
+        fresh = [i for i in fresh if "recovered_at" not in i]
     for i in fresh:
         state[i["key"]] = now
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     json.dump(state, open(STATE, "w"))
 
+    if back:
+        # "at most put it in the digest": held, never pushed; the 23:00 rollup's HELD line names it.
+        rmsg = "; ".join(f"{i['summary'][:100]} — recovered, newest run "
+                         f"{time.strftime('%H:%MZ', time.gmtime(i['recovered_at']))} clean"
+                         for i in back[:4])
+        subprocess.run([f"{HOME}/maintenance/bin/notify.sh", "--tier", "digest", "maintenance",
+                        "Sentinel recovered", rmsg], timeout=30)
+        print(f"{time.strftime('%F %T')} RECOVERED before paging: {rmsg}")
     if fresh:
         msg = "; ".join(i["summary"][:120] for i in fresh[:4])
         subprocess.run([f"{HOME}/maintenance/bin/notify.sh", "alerts",
                         "Sentinel (local model)", msg], timeout=30)
         print(f"{time.strftime('%F %T')} ALERT: {msg}")
-    else:
+    elif not back:
         print(f"{time.strftime('%F %T')} clear ({len(issues)} known/cooldown)")
 
 
+# ---------- selftest: `sentinel.py selftest` (back office runs it daily, rule guardrail-inert) ----
+# Replays the 2026-09-23 incident through main() with the model, the job table, the state
+# file and notify.sh stubbed. Tails and times are the real agent_sync.log lines (account
+# mask and balance removed).
+def _selftest(target=None):
+    import calendar, contextlib, io, tempfile, types
+    t = target or sys.modules[__name__]
+    at = lambda hms: calendar.timegm(time.strptime(f"2026-09-23 {hms}", "%Y-%m-%d %H:%M:%S"))
+    dns = "urllib.error.URLError: <urlopen error [Errno -3] Temporary failure in name resolution>"
+    ok = "2026-09-23T14:45:08Z code-sync: 4 positions · orders: 25 updated, 0 new"  # figures cut
+    retried = "2026-09-23T15:00:14Z code-sync FAILED (network, after retries): name resolution"
+    verdict = {"issues": [{"key": "mcp-sync-dns", "summary": "MCP sync job failing with DNS "
+               "resolution errors (Temporary failure in name resolution) across multiple cadences"}]}
+
+    def rows(last_run, tail):
+        return [{"project": "Stocks", "desc": "Mcp sync", "log": "/replay/agent_sync.log",
+                 "schedule": s, "expect_min": 15, "age_min": 5, "last_run": last_run, "tail": tail}
+                for s in ("30,45 13 * * 1-5", "*/15 14-19 * * 1-5", "20 10 * * *")]
+
+    snap = rows(at("14:15:04"), dns)                    # what the 14:20 run read
+    cases = [  # (name, table at page time, expect a critical page?)
+        ("09-23 replay: 14:30/14:45 runs clean by the time the slot came", rows(at("14:45:08"), ok), False),
+        ("newest run failed again", rows(at("15:00:14"), retried), True),
+        ("no run since the snapshot", snap, True),
+    ]
+    saved = {k: getattr(t, k) for k in ("server", "ask_json", "subprocess", "STATE")}
+    argv, bad = sys.argv, []
+    with tempfile.TemporaryDirectory() as tmp:
+        for n, (name, later, want_page) in enumerate(cases):
+            calls, tables = [], iter([snap, later])
+            t.server = types.SimpleNamespace(
+                cron_jobs=lambda: next(tables, later),
+                watchdog=lambda: {"ok": True, "state": "", "last_check": time.time()})
+            t.ask_json = lambda *a, **k: json.loads(json.dumps(verdict))
+            t.subprocess = types.SimpleNamespace(run=lambda cmd, **k: calls.append(cmd))
+            t.STATE = os.path.join(tmp, f"sentinel{n}.json")
+            sys.argv = ["sentinel.py"]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    t.main()
+            finally:
+                sys.argv = argv
+                for k, v in saved.items():
+                    setattr(t, k, v)
+            paged = any("alerts" in c for c in calls)
+            held = any("--tier" in c and "digest" in c for c in calls)
+            stamped = "job:mcp-sync" in json.load(open(os.path.join(tmp, f"sentinel{n}.json")))
+            good = paged == want_page and stamped == want_page and (want_page or held)
+            print(f"{'PASS' if good else 'FAIL'}  {name}: paged={paged} held={held} "
+                  f"cooldown={stamped} (want paged={want_page})")
+            bad += [] if good else [name]
+    print("ALL PASS" if not bad else f"{len(bad)} FAIL")
+    return not bad
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["selftest"]:
+        sys.exit(0 if _selftest() else 1)
     main()
