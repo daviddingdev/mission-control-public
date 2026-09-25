@@ -180,14 +180,29 @@ def _private_paths(project_dir):
     return out
 
 
+def _secret_rule(why):
+    """Rules whose match IS a secret: a hit on one says where and why, never what."""
+    return why.startswith("credential") or "ntfy topic" in why
+
+
 def scan_text(text, pats, where=""):
+    """Every denylisted string, as {where, line, why, match, text}. A credential or ntfy-topic
+    hit is reported as `<redacted>` and masked inside `text` too (2026-09-24): the scan's own
+    output carried the sudo password into the janitor's census and findings, /api/status and
+    the Overview for a day — the scanner that guards the secret was the thing echoing it. The
+    location and the rule are all anyone needs to act on a hit."""
+    secret = [rx for rx, why in pats if _secret_rule(why)]
     hits = []
     for i, line in enumerate(text.splitlines(), 1):
         for rx, why in pats:
             m = rx.search(line)
             if m:
-                hits.append({"where": where, "line": i, "why": why, "match": m.group(0)[:40],
-                             "text": line.strip()[:110]})
+                shown = line
+                for srx in secret:
+                    shown = srx.sub("<redacted>", shown)
+                hits.append({"where": where, "line": i, "why": why,
+                             "match": "<redacted>" if _secret_rule(why) else m.group(0)[:40],
+                             "text": shown.strip()[:110]})
     return hits
 
 
@@ -484,6 +499,15 @@ def selftest():
     for why, v in creds:
         check(f"scan: {why} caught mid-line", bool(scan_text(f"x={v};", denylist(), "t")), True)
         check(f"this file carries no {why}", v in open(os.path.abspath(__file__)).read(), False)
+        # ...and the hit that catches it never repeats it (not in match, not in text)
+        check(f"scan: a {why} hit never echoes the value",
+              any(v in json.dumps(h) for h in scan_text(f"x={v}; y={v}", denylist(), "t")), False)
+    fake = [(re.compile(re.escape("PLANTED-fake-9c1e")), "credential from ~/.secrets/fake"),
+            (re.compile(r"/home/user"), "absolute home path")]
+    h = scan_text("token = 'PLANTED-fake-9c1e'  # /home/user/x", fake, "t")
+    check("scan: a credential hit is <redacted> in match and text, the other rules still name theirs",
+          [(x["why"].split()[0], x["match"], "PLANTED" in x["text"]) for x in h],
+          [("credential", "<redacted>", False), ("absolute", "/home/user", False)])
 
     bad = [c for c in cases if not c[1]]
     for name, ok, got in cases:

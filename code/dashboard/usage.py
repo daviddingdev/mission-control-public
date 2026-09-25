@@ -7,11 +7,15 @@ and cloud-hosted Code sessions never touch this disk and are invisible — say s
 in the UI, don't pretend.
 
 Incremental: per-file aggregates cached by (mtime,size) in state/usage_cache.json,
-so only new/updated transcripts are re-parsed on each call.
+so only new/updated transcripts are re-parsed on each call — and since 2026-09-24 only the
+bytes APPENDED to them: an entry remembers how far into its file it has read (`off`), so a
+live 50 MB session transcript costs a seek and its newest lines, not a full re-read on every
+refresh. The cache is also kept in memory between calls (reloaded only if another process
+rewrote the file), instead of re-parsing its 330 KB each time.
 
 Metric: "processed" = input + output + cache_creation (real work; excludes
 cache_read, which is bulk-but-cheap replay and reported separately)."""
-import json, os, time, glob
+import json, os, time, glob, threading
 
 HOME = os.path.expanduser("~")
 CACHE = f"{HOME}/maintenance/state/usage_cache.json"
@@ -57,48 +61,91 @@ def _classify(first_user, proj):
     return "interactive", f"interactive · {proj}", f"Sessions — {nice}"
 
 
-def _parse_file(path, proj):
-    """-> {'kind','label','days':{date:{'in','out','cc','cr','msgs'}}}"""
-    days, first_user = {}, None
+def _parse_file(path, proj, prev=None):
+    """-> {'kind','label','group','days':{date:{'in','out','cc','cr','msgs'}},'off','fu'}
+
+    With `prev` (this file's entry, parsed up to prev['off']), only the bytes after it are
+    read. `fu` says whether the first user message has been seen: the classification is fixed
+    by it, so once it is, the label never changes. Only complete lines are read; a line still
+    being written is picked up on the next call."""
+    days, fu, cls, off = {}, False, None, 0
+    if prev and "off" in prev and isinstance(prev.get("days"), dict):
+        off = prev["off"]
+        days = {d: dict(u) for d, u in prev["days"].items()}
+        fu = bool(prev.get("fu"))
+        if fu:
+            cls = (prev.get("kind"), prev.get("label"), prev.get("group"))
+    first_user = None
     try:
-        with open(path, errors="replace") as fh:
-            for line in fh:
-                try:
-                    j = json.loads(line)
-                except Exception:
-                    continue
-                t = j.get("type")
-                if t == "user" and first_user is None:
-                    c = j.get("message", {}).get("content")
-                    if isinstance(c, list):
-                        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
-                    first_user = (c or "")[:120]
-                elif t == "assistant":
-                    u = j.get("message", {}).get("usage") or {}
-                    if not u:
-                        continue
-                    ts = j.get("timestamp")
-                    try:
-                        day = ts[:10] if isinstance(ts, str) else time.strftime("%Y-%m-%d")
-                    except Exception:
-                        day = time.strftime("%Y-%m-%d")
-                    d = days.setdefault(day, {"in": 0, "out": 0, "cc": 0, "cr": 0, "msgs": 0})
-                    d["in"] += u.get("input_tokens", 0) or 0
-                    d["out"] += u.get("output_tokens", 0) or 0
-                    d["cc"] += u.get("cache_creation_input_tokens", 0) or 0
-                    d["cr"] += u.get("cache_read_input_tokens", 0) or 0
-                    d["msgs"] += 1
+        with open(path, "rb") as fh:
+            fh.seek(off)
+            data = fh.read()
     except Exception:
-        pass
-    kind, label, group = _classify(first_user, proj)
-    return {"kind": kind, "label": label, "group": group, "days": days}
+        data = b""
+    nl = data.rfind(b"\n")
+    body = data[:nl + 1] if nl >= 0 else b""
+    for raw in body.split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            j = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        try:
+            t = j.get("type")
+            if t == "user" and not fu:
+                c = j.get("message", {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+                first_user = (c or "")[:120]
+                fu = True
+            elif t == "assistant":
+                u = j.get("message", {}).get("usage") or {}
+                if not u:
+                    continue
+                ts = j.get("timestamp")
+                try:
+                    day = ts[:10] if isinstance(ts, str) else time.strftime("%Y-%m-%d")
+                except Exception:
+                    day = time.strftime("%Y-%m-%d")
+                d = days.setdefault(day, {"in": 0, "out": 0, "cc": 0, "cr": 0, "msgs": 0})
+                d["in"] += u.get("input_tokens", 0) or 0
+                d["out"] += u.get("output_tokens", 0) or 0
+                d["cc"] += u.get("cache_creation_input_tokens", 0) or 0
+                d["cr"] += u.get("cache_read_input_tokens", 0) or 0
+                d["msgs"] += 1
+        except Exception:
+            continue
+    kind, label, group = cls or _classify(first_user, proj)
+    return {"kind": kind, "label": label, "group": group, "days": days,
+            "off": off + len(body), "fu": fu}
+
+
+_MEM = {"sig": None, "cache": None}
+_LOCK = threading.Lock()
+
+
+def _file_sig(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 def usage(days_back=30):
-    try:
-        cache = json.load(open(CACHE))
-    except Exception:
-        cache = {}
+    with _LOCK:
+        return _usage(days_back)
+
+
+def _usage(days_back):
+    if _MEM["cache"] is not None and _MEM["sig"] == _file_sig(CACHE):
+        cache = _MEM["cache"]
+    else:
+        try:
+            cache = json.load(open(CACHE))
+        except Exception:
+            cache = {}
     changed = False
     for d in glob.glob(f"{HOME}/.claude/projects/*/"):
         proj = os.path.basename(d.rstrip("/")).replace("-home-user", "").strip("-") or "home"
@@ -110,12 +157,19 @@ def usage(days_back=30):
                 continue
             key = f
             sig = f"{int(st.st_mtime)}:{st.st_size}"
-            if cache.get(key, {}).get("sig") != sig:
-                cache[key] = {"sig": sig, **_parse_file(f, proj)}
+            prev = cache.get(key) or {}
+            if prev.get("sig") != sig:
+                # grown: carry on from where the last read stopped; shrunk or unknown: re-read
+                grew = isinstance(prev.get("off"), int) and st.st_size >= prev["off"]
+                cache[key] = {"sig": sig, **_parse_file(f, proj, prev if grew else None)}
                 changed = True
     if changed:
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-        json.dump(cache, open(CACHE, "w"))
+        tmp = f"{CACHE}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(cache, fh)
+        os.replace(tmp, CACHE)              # a reader never sees half a file
+    _MEM.update(sig=_file_sig(CACHE), cache=cache)
     # aggregate
     cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - days_back * 86400))
     daily, jobs = {}, {}

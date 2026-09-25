@@ -28,7 +28,11 @@ Design rules, in case a later session wants to extend it:
   * Findings are durable and fingerprinted, so "new" is a real event and a known-accepted
     deviation can be muted in config/backoffice_mute.json instead of nagging forever.
 
-CLI: backoffice.py [census|audit|fix|brief|run|show] [--dry]
+    decide   David's answers from the dashboard that the janitor finishes: a mute goes
+             into config/backoffice_mute.json with its reason, an in-dev label's new expiry
+             into config/dev.json, and a "I'll do it myself" answer is checked and closed
+
+CLI: backoffice.py [census|audit|fix|brief|run|show|selftest] [--dry]
 """
 import json
 import os
@@ -79,12 +83,49 @@ def load(path, default):
         return default
 
 
+# The publish scanner's hit shape, `path:line  [credential from ~/.secrets/<f>] <match>`: what
+# follows the tag is the secret itself, even one already rotated out of ~/.secrets.
+_CRED_TAG = re.compile(r"(\[credential[^\]]*\])\s+(?!<redacted>)[^\s;|,]+")
+
+
+def _secret_values():
+    try:
+        from publish import _secret_values as sv
+        return sorted({v for _, v in sv()}, key=len, reverse=True)
+    except Exception:
+        return []
+
+
+def _scrub_secrets(o, vals=None):
+    """Every string with the ~/.secrets values, and whatever follows a scanner credential tag,
+    replaced by <redacted>. Run on census.json and findings.json at every write (2026-09-24):
+    the public-leak finding had stored the sudo password verbatim, resolved records keep their
+    detail forever, and backup.py archives state/ nightly — so the stored copies are cleaned
+    the next time the janitor writes them, not only the new ones."""
+    if vals is None:
+        vals = _secret_values()
+    if isinstance(o, str):
+        for v in vals:
+            if v in o:
+                o = o.replace(v, "<redacted>")
+        return _CRED_TAG.sub(r"\1 <redacted>", o) if "[credential" in o else o
+    if isinstance(o, list):
+        return [_scrub_secrets(x, vals) for x in o]
+    if isinstance(o, dict):
+        return {k: _scrub_secrets(v, vals) for k, v in o.items()}
+    return o
+
+
 def save(path, obj, indent=1):
     """indent=2 for the hand-edited config files — matching their existing style keeps the
-    janitor's diffs readable instead of reformatting the whole file every time."""
+    janitor's diffs readable instead of reformatting the whole file every time. UTF-8 as
+    written, not \\u escapes (fix round 2026-09-24): the first answer David gave rewrote every
+    '—' in config/backoffice_mute.json — the record of what the box lives with — as \\u2014."""
+    if path in (CENSUS, FINDINGS):
+        obj = _scrub_secrets(obj)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=indent)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=indent, ensure_ascii=False)
         f.write("\n")
     os.replace(tmp, path)
 
@@ -444,13 +485,24 @@ def _diagram_state():
         arch = os.path.join(MC, "architecture")
         proj_of = {"stocks": "Stocks", "clientco": "clientco-db", "poker": "poker",
                    "mission-control": "maintenance"}
+        # architecture/_style.d2 (2026-09-24) is the shared look a diagram spread-imports with a
+        # line reading exactly `...@_style`. Files starting with `_` are imports, never diagrams
+        # (no .svg of their own, so they would read as unrendered forever); and a styled
+        # diagram's .svg is stale when the style changes, not only when its own source does.
+        style = os.path.join(arch, "_style.d2")
+        style_mt = os.path.getmtime(style) if os.path.exists(style) else 0
         for f in sorted(os.listdir(arch)) if os.path.isdir(arch) else []:
-            if not f.endswith(".d2"):
+            if not f.endswith(".d2") or f.startswith("_"):
                 continue
             d2 = os.path.join(arch, f)
             svg = d2[:-3] + ".svg"
             out["diagrams"] += 1
-            if not os.path.exists(svg) or os.path.getmtime(svg) < os.path.getmtime(d2):
+            try:
+                styled = any(l.strip() == "...@_style" for l in open(d2, errors="replace"))
+            except OSError:
+                styled = False
+            if (not os.path.exists(svg) or os.path.getmtime(svg) < os.path.getmtime(d2)
+                    or (styled and os.path.getmtime(svg) < style_mt)):
                 out["unrendered"].append(f)
             proj = next((v for k, v in proj_of.items() if k in f), None)
             if proj and os.path.isdir(os.path.join(HOME, proj, ".git")):
@@ -488,9 +540,27 @@ def _public_state():
         r = subprocess.run([sys.executable, os.path.join(MC, "bin/publish.py"), "scan"],
                            capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
-            out["leaks"] = [l for l in r.stdout.splitlines() if l and not l.startswith("   ")][:10]
+            out["leaks"] = _leak_lines(r.stdout)[:10]
     except Exception as e:
         out["error"] = str(e)[:120]
+    return out
+
+
+_LEAK_LINE = re.compile(r"^(\S+:\d+)\s+\[([^\]]+)\]")
+
+
+def _leak_lines(stdout):
+    """The scan's hits as `file:line [why]` — WHERE and WHY, never the matched text. Until
+    2026-09-24 the raw lines were kept, and a credential hit put the sudo password into
+    census.json, findings.json, /api/status and the Overview. The file and the rule are all
+    anyone needs to act on a hit; the summary line ("N leak(s)") is kept as it is."""
+    out = []
+    for l in (stdout or "").splitlines():
+        m = _LEAK_LINE.match(l)
+        if m:
+            out.append(f"{m.group(1)} [{m.group(2)}]")
+        elif re.match(r"^\d+ leak", l.strip()):
+            out.append(l.strip())
     return out
 
 
@@ -627,9 +697,36 @@ def _record_plugins_seen(installed):
         save(path, seen)
 
 
-def _finding(out, kind, sev, title, detail, project="", fix="human"):
+def _key(s):
+    """The status layer's key normaliser (dashboard/tt_now.py `_key`), so a finding's key and
+    the key David's answer is stored under are the same string."""
+    s = re.sub(r"[^a-z0-9._@:+-]+", "-", str(s or "").lower()).strip("-")
+    return re.sub(r"-{2,}", "-", s)[:200] or "item"
+
+
+def _digitless(fid):
+    return re.sub(r"\d+", "#", fid or "")
+
+
+def _legacy_of(f, fid):
+    """True when a record stored BEFORE findings had keys (2026-09-24), under `fid`, is the same
+    problem as the fresh finding `f` — its id differs only in the numbers. Only a finding with
+    an explicit key qualifies: those are exactly the ones whose titles carry a count or an age
+    ("12d old" -> "13d old"); a finding keyed by its id (a port number, a unit) never merges
+    with another number. Used for the one transition pass, and for an answer David gave in the
+    hours between deploy and that pass (keyed on the old id)."""
+    return bool(f.get("key") and f["key"] != _key(f["id"]) and fid and fid != f["id"]
+                and _digitless(fid) == _digitless(f["id"]))
+
+
+def _finding(out, kind, sev, title, detail, project="", fix="human", key=None):
+    """`id` is unchanged (mutes by id keep working). `key` (2026-09-24) is what stays the SAME
+    when a title carries a count or an age — "has not run in 89h" / "96h" were two findings, a
+    new one every morning — so a mute or an answer from the dashboard outlives the number. No
+    `key` given: the id is already stable, and the key is the id, normalised."""
     fid = f"{kind}:{project}:{re.sub(r'[^a-z0-9]+', '-', title.lower())[:60]}"
-    out.append({"id": fid, "kind": kind, "sev": sev, "title": title, "detail": detail,
+    k = _key(":".join(p for p in (kind, str(project).lower(), str(key)) if p)) if key is not None else _key(fid)
+    out.append({"id": fid, "key": k, "kind": kind, "sev": sev, "title": title, "detail": detail,
                 "project": project, "fix": fix})
 
 
@@ -706,6 +803,22 @@ ARMED_CHECKS = (
 )
 
 
+def _catalog_key(r):
+    """Stable keys for the catalog rules whose titles carry a count or an age (bin/catalog.py
+    builds the rows; the key is derived here so that file needs no change): the dataset id for
+    a stale feed, the project for the per-project counts. None = the id is already stable."""
+    k, t = r.get("key"), r.get("title") or ""
+    if k:
+        return k
+    if r["kind"] == "catalog-stale":
+        m = re.match(r"^(\S+) is \d+d old", t)
+        return m.group(1) if m else None
+    if r["kind"] in ("catalog-source-uncategorised", "catalog-undeclared", "catalog-undeclared-cold",
+                     "catalog-orphan-empty", "catalog-conflict"):
+        return ""
+    return None
+
+
 def audit(c=None):
     c = c or load(CENSUS, None) or census()
     f = []
@@ -773,11 +886,11 @@ def audit(c=None):
                 continue
             _finding(f, "log-missing", "med",
                      f"{name} ({job['sched']}) has never written its log",
-                     f"expected at {job['log']}", job["project"])
+                     f"expected at {job['log']}", job["project"], key=f"{name}:{job['sched']}")
         elif age > max(gap * 3, gap + 24):
             _finding(f, "job-silent", "high", f"{name} has not run in {age:.0f}h",
                      f"schedule `{job['sched']}` expects output every ~{gap:.0f}h — "
-                     f"{job['log']}", job["project"])
+                     f"{job['log']}", job["project"], key=f"{name}:{job['sched']}")
 
     # 5. a listening port nobody declared (PROJECT_STANDARDS §4 wants it in three places)
     ignore_ports = {53, 631, 5355, 11000, 19999, 3493, 4317, 8125, 22, 41641, 5353}
@@ -811,10 +924,10 @@ def audit(c=None):
         g = p["git"]
         if g.get("unpushed", 0) >= 5:
             _finding(f, "unpushed", "med", f"{name} has {g['unpushed']} unpushed commits",
-                     f"branch {g.get('branch', '?')} — the offsite copy is behind", name)
+                     f"branch {g.get('branch', '?')} — the offsite copy is behind", name, key="")
         if g.get("dirty", 0) >= 20:
             _finding(f, "dirty-tree", "low", f"{name} has {g['dirty']} uncommitted files",
-                     "long-lived working tree — either commit it or add it to .gitignore", name)
+                     "long-lived working tree — either commit it or add it to .gitignore", name, key="")
 
     # 8. local-model roles
     if c.get("models_check", {}).get("exit", 0) >= 2:
@@ -879,7 +992,7 @@ def audit(c=None):
                      + (f" (waiting {x['days']:.0f}d)" if x["days"] >= 1 else ""),
                      f"{x['memo']} — the ladder is stalled at the one rung that needs David: "
                      "read it in Sessions › Memos, then either ask a session to build it or "
-                     "let it drop to the graveyard", "maintenance")
+                     "let it drop to the graveyard", "maintenance", key=x["memo"])
 
     # 11a. diagrams that have gone out of date with the code they describe
     dia = c.get("diagrams", {})
@@ -896,7 +1009,8 @@ def audit(c=None):
         _finding(f, "diagram-unrendered", "low",
                  f"{len(dia['unrendered'])} diagram source(s) edited but not re-rendered",
                  ", ".join(dia["unrendered"]) + " — the .svg the dashboard serves is older "
-                 "than its .d2 source", "maintenance", fix="auto")
+                 "than its .d2 source (or than architecture/_style.d2, for a diagram that imports "
+                 "it)", "maintenance", fix="auto", key="")
 
     pub = c.get("public", {})
     q = load(os.path.join(STATE, "publish_refresh.json"), {}).get("quarantined", [])
@@ -904,8 +1018,9 @@ def audit(c=None):
         _finding(f, "public-quarantine", "high",
                  f"{len(q)} published file(s) started leaking and were pulled",
                  "; ".join(f"{x['file']} [{x['why']}]" for x in q[:3])[:200]
-                 + " — the daily refresh removed them rather than republishing", "maintenance")
+                 + " — the daily refresh removed them rather than republishing", "maintenance", key="")
     if pub.get("leaks"):
+        # file:line [why] only — _leak_lines() never keeps the matched text
         _finding(f, "public-leak", "high", "a public repo would leak private content",
                  "publish.py scan: " + "; ".join(pub["leaks"][:3])[:200], "maintenance")
     for r in pub.get("repos", []):
@@ -920,7 +1035,7 @@ def audit(c=None):
                      f"{r['repo']} is {r['commits_since_readme']} commits behind the project",
                      "the public overview describes work that has moved on — refresh the "
                      "authored README (it is written, not mirrored, so this is a judgement call)",
-                     r["project"])
+                     r["project"], key=r["repo"])
 
     # 12. backup coverage (PROJECT_STANDARDS §5.6). Driven by config/backups.json so this
     #     asks once per project and then stops: a project is covered, delegated, or
@@ -943,7 +1058,7 @@ def audit(c=None):
         elif age > max(limit * 3, 72):
             _finding(f, "backup-stale", "high", f"{name} backup is {age / 24:.1f} days old",
                      f"limit is {limit}h; the watchdog alerts too, so this one is already loud",
-                     name)
+                     name, key="")
 
     # 13. the Claude layer. A plugin loads into EVERY session — one that never fires
     #     is context tax plus attack surface for nothing. First-seen stamps give a new
@@ -957,7 +1072,7 @@ def audit(c=None):
             _finding(f, "claude-plugin-unused", "low",
                      f"Claude plugin {pid} idle for {idle_d:.0f} days",
                      f"{p.get('uses', 0)} recorded fires; it still loads into every "
-                     "session (context + surface) — uninstall it or mute this")
+                     "session (context + surface) — uninstall it or mute this", key=pid)
     # 14. the PROTECTED window (PROJECT_STANDARDS §2, David 2026-08-28): 20:00-04:00 UTC
     #     is HBS prep — no scheduled Claude session may START in it. The trigger engine
     #     is exempt (event-driven, market-hours). Checks the cron HOUR field only; a
@@ -1302,7 +1417,7 @@ def audit(c=None):
         import catalog as _catalog
         for r in _catalog.audit():
             _finding(f, r["kind"], r["sev"], r["title"], r["detail"], r["project"],
-                     fix=r.get("fix", "human"))
+                     fix=r.get("fix", "human"), key=_catalog_key(r))
     except Exception as e:
         _finding(f, "guardrail-inert", "high",
                  "the data catalog did not compile — every catalog rule is off",
@@ -1329,7 +1444,17 @@ def audit(c=None):
     # and test_claude_tab.js had been throwing for weeks unnoticed — a guardrail nobody
     # executes is the `guardrail-inert` case applied to a test.
     _dash = os.path.join(MC, "dashboard")
-    if shutil.which("node"):
+    _spid, _snewer = _dashboard_stale(_dash)
+    if _snewer:
+        _finding(f, "dashboard-broken", "high",
+                 "the dashboard is running older code than its files",
+                 f"{', '.join(_snewer)} changed after the server started (pid {_spid}), and the "
+                 f"server reads {'it' if len(_snewer) == 1 else 'them'} only at start — while the page "
+                 f"itself is read fresh on every request, so the phone gets the new page against "
+                 f"the old API. Restart it: `~/maintenance/dashboard/serve.sh start`. The tab tests "
+                 f"and dashboard/check.py were skipped this pass: against a half-updated server they "
+                 f"report only this mismatch, under the wrong names.", project="maintenance")
+    if shutil.which("node") and not _snewer:
         for _t, _lbl in (("test_overview_tab.js", "Overview"), ("test_claude_tab.js", "Claude"),
                          ("test_catalog_tab.js", "Catalog")):
             _tp = os.path.join(_dash, _t)
@@ -1355,7 +1480,8 @@ def audit(c=None):
     #     a panel that silently renders nothing is worse than a missing one, because the page
     #     still looks alive. dashboard/check.py executes the SERVED page and walks the catalog
     #     click path; a syntax check cannot catch a name collision or a dead render.
-    _dash = sh([sys.executable, os.path.join(MC, "dashboard", "check.py")], timeout=180) or ""
+    _dash = ("ALL GREEN (skipped: server restart pending)" if _snewer else
+             sh([sys.executable, os.path.join(MC, "dashboard", "check.py")], timeout=180) or "")
     if "ALL GREEN" not in _dash:
         _finding(f, "dashboard-broken", "high",
                  "a dashboard check is failing",
@@ -1442,14 +1568,35 @@ def merge_findings(fresh):
     is recorded as resolved rather than forgotten."""
     store = load(FINDINGS, {})
     muted = set(load(MUTE, {}).get("muted", []))
+    # an open record under the same KEY is the same problem whose title's number moved on
+    # ("89h" -> "96h"): it is updated in place, keeping its id and first_seen, instead of
+    # resolving and re-opening as "new" — which pushed the same finding every morning.
+    open_by_key = {}
+    for fid, x in store.items():
+        if x.get("state") == "open":
+            open_by_key.setdefault(x.get("key") or _key(fid), fid)
+    # records written before keys existed, and not found under their own id today: the first
+    # keyed pass matches each (once) to today's finding whose id differs only in its numbers,
+    # instead of resolving it and re-opening the same problem as "new" (_legacy_of)
+    fresh_ids = {f["id"] for f in fresh}
+    legacy = [fid for fid, x in store.items()
+              if x.get("state") == "open" and not x.get("key") and fid not in fresh_ids]
     seen, new = set(), []
     for f in fresh:
-        if f["id"] in muted or f["kind"] in muted:
+        if f["id"] in muted or f["kind"] in muted or f.get("key") in muted:
             continue
-        seen.add(f["id"])
-        old = store.get(f["id"])
+        sid = f["id"] if (store.get(f["id"]) or {}).get("state") == "open" else \
+            open_by_key.get(f.get("key"), f["id"])
+        if sid == f["id"] and (store.get(sid) or {}).get("state") != "open":
+            old_id = next((x for x in legacy if _legacy_of(f, x)), None)
+            if old_id:
+                legacy.remove(old_id)
+                sid = old_id
+        seen.add(sid)
+        old = store.get(sid)
         if old and old.get("state") == "open":
-            old.update(title=f["title"], detail=f["detail"], sev=f["sev"], last_seen=now())
+            old.update(title=f["title"], detail=f["detail"], sev=f["sev"], last_seen=now(),
+                       key=f.get("key") or old.get("key"))
         else:
             f.update(first_seen=now(), last_seen=now(), state="open")
             store[f["id"]] = f
@@ -1535,9 +1682,24 @@ def fix(open_findings, dry=False):
                 done.append((f, "reaped a finished research process's stale 'running' state"))
 
         elif f["kind"] == "diagram-unrendered":
-            if not dry:
-                sh([os.path.join(MC, "bin/render-diagrams.sh")], timeout=180)
-            done.append((f, "re-rendered the architecture diagrams"))
+            # A repair is claimed only when it happened (critic C5, 2026-09-24): this used to
+            # record "re-rendered" whatever the render did, so a diagram d2 refused stayed
+            # unrendered while the janitor reported a fix every morning.
+            if dry:
+                done.append((f, "would re-render the architecture diagrams"))
+                continue
+            try:
+                rr = subprocess.run([os.path.join(MC, "bin/render-diagrams.sh")],
+                                    capture_output=True, text=True, timeout=180)
+                rc, tail = rr.returncode, (rr.stdout + rr.stderr).strip().splitlines()[-1:]
+            except Exception as e:
+                rc, tail = -1, [f"{type(e).__name__}: {e}"]
+            left = _diagram_state().get("unrendered", [])
+            if rc == 0 and not left:
+                done.append((f, "re-rendered the architecture diagrams"))
+            else:
+                print(f"  render did not repair it (exit {rc}; still unrendered: "
+                      f"{', '.join(left) or 'none'}) {' '.join(tail)[:160]}")
 
         elif f["kind"] == "name-missing":
             script = f["title"].split(":")[-1].strip()
@@ -1634,22 +1796,242 @@ def _append_registry_row(reg_path, job, script):
 def dirty_before(paths):
     """Files already modified in the working tree before this pass touched them."""
     out = set()
+    # sh() strips its output, which took the leading space off the FIRST porcelain line
+    # (" M CRON_REGISTRY.md" -> "M CRON_REGISTRY.md"), so line[3:] cut a letter off that path
+    # and another session's edit to it went unnoticed (2026-09-24): parse the status code off
+    # instead of slicing a fixed width.
     for line in sh(["git", "-C", MC, "status", "--porcelain"]).splitlines():
-        f = line[3:].strip()
+        f = re.sub(r"^\s*\S{1,2}\s+", "", line).split(" -> ")[-1].strip().strip('"')
         if f in paths:
             out.add(f)
     return out
 
 
 def _commit(paths, msg, skip=()):
-    paths = [p for p in paths if p not in skip]
+    """-> the new commit's short sha, or "" when nothing was committed.
+
+    Commits ONLY `paths` (`git commit -- <paths>`, 2026-09-24): a bare `git commit` takes
+    whatever else is staged, and other sessions share this working tree."""
+    paths = [p for p in paths if p not in skip and os.path.exists(os.path.join(MC, p))]
     if not paths:
-        return
-    sh(["git", "-C", MC, "add"] + [p for p in paths if os.path.exists(os.path.join(MC, p))])
-    if sh(["git", "-C", MC, "diff", "--cached", "--name-only"]):
+        return ""
+    sh(["git", "-C", MC, "add", "--"] + paths)
+    if sh(["git", "-C", MC, "diff", "--cached", "--name-only", "--"] + paths):
+        before = sh(["git", "-C", MC, "rev-parse", "--short", "HEAD"])
         sh(["git", "-C", MC, "commit", "-q", "-m", msg + "\n\nCo-Authored-By: Claude Opus 5 "
-            "<noreply@anthropic.com>"])
+            "<noreply@anthropic.com>", "--"] + paths)
+        sha = sh(["git", "-C", MC, "rev-parse", "--short", "HEAD"])
+        if not sha or sha == before:        # the commit failed: HEAD did not move — claim no sha
+            return ""
         sh(["git", "-C", MC, "push", "-q", "origin", "master"], timeout=60)
+        return sha
+    return ""
+
+
+# ---------------------------------------------------------------- David's answers
+
+def _decide_mod():
+    """dashboard/tt_decide.py, the one reader/writer of state/decisions.jsonl."""
+    d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dashboard")
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    import tt_decide
+    return tt_decide
+
+
+def _verify_david(e, fresh, store):
+    """A "I'll do it myself" answer, checked against the box. -> a result sentence when it is
+    verified, else None (it stays queued; the daily check reports it)."""
+    rec = store.get(e.get("finding_id") or "") or next(
+        (x for x in store.values() if x.get("key") == e["key"]), {})
+    if e.get("option") == "rotated":
+        m = re.search(r"~/\.secrets/([\w.-]+)", rec.get("detail") or "")
+        p = os.path.join(HOME, ".secrets", m.group(1)) if m else None
+        # rewritten AFTER HE ANSWERED — what the option's consequence and the daily check's
+        # prompt both promise — not merely after the leak was found: on 09-24 the password was
+        # changed and then restored to the leaked value (~/.secrets/sudo rewritten at 17:00Z,
+        # after the finding's 11:35Z first_seen), which that test would have closed as rotated
+        base = int(e.get("at") or 0)
+        if p and base and os.path.exists(p) and os.path.getmtime(p) > base:
+            return (f"verified: ~/.secrets/{m.group(1)} was rewritten "
+                    f"{dt_from(os.path.getmtime(p))}Z, after your answer")
+        return None
+    if e.get("option") == "purge":
+        m = re.search(r"([\w-]+-public)/", rec.get("detail") or "")
+        d = os.path.join(HOME, "public", m.group(1)) if m else None
+        if d and os.path.isdir(os.path.join(d, ".git")):
+            local = sh(["git", "-C", d, "rev-parse", "HEAD"])
+            remote = (sh(["git", "-C", d, "ls-remote", "origin", "refs/heads/main"], timeout=30) or "").split()
+            if local and remote and remote[0] == local:
+                return f"verified: {m.group(1)} on GitHub matches the cleaned local history"
+        return None
+    # gone = found today under neither its key, nor its id, nor (an answer given before findings
+    # had keys) the id that differs from today's only in its numbers — keyed on the key alone,
+    # every answer from before the first keyed pass read as "no longer found"
+    fid = e.get("finding_id")
+    if fid and not any(f.get("key") == e["key"] or f["id"] == fid or _legacy_of(f, fid) for f in fresh):
+        return "verified: the janitor no longer finds it"
+    return None
+
+
+def apply_decisions(fresh, dry=False):
+    """Finish what David answered on the dashboard that belongs to the janitor.
+
+    * mute (code): the item was hidden the moment he tapped; here it becomes a line in
+      config/backoffice_mute.json with a `_reasons` entry quoting his answer — rule 7: the mute
+      list, not a code path, is the record of what the box lives with. Keyed on the finding's
+      stable key, so it outlives a number in the title.
+    * extend-dev (code): the in-dev label's new expiry goes into config/dev.json.
+    * david: an answer that says he will do it himself is checked against the box (the file
+      changed, the remote matches, the finding is gone) and closed when it holds.
+    Claude answers are not touched: they belong to the daily check (bin/decisions.py).
+    -> [(event, what happened)]"""
+    try:
+        td = _decide_mod()
+        lat = td.latest()
+    except Exception as e:
+        print(f"  decisions unreadable: {type(e).__name__}: {e}")
+        return []
+    store = load(FINDINGS, {})
+    dev_path = os.path.join(CONFIG, "dev.json")
+    mute_cfg, dev_cfg = load(MUTE, {}), load(dev_path, {})
+    touched, out, file_of = set(), [], {}
+    # whatever another session already had open stays theirs to commit — asked BEFORE this
+    # pass writes anything (2026-09-24: asked after, our own write read as "another session's",
+    # so the mute list and dev.json were never committed and every answer claimed otherwise)
+    theirs = set() if dry else dirty_before({"config/backoffice_mute.json", "config/dev.json"})
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    vals = _secret_values()
+    for key, e in sorted(lat.items(), key=lambda kv: kv[1].get("at") or 0):
+        st, ex, act = e.get("status"), e.get("exec"), e.get("action")
+        note = _scrub_secrets((e.get("note") or "").replace("\n", " "), vals)[:300]
+        if ex == "code" and st == "applied" and act == "mute":
+            f = next((x for x in fresh if x.get("key") == key or x["id"] == e.get("finding_id")
+                      or x["id"].lower() == key), None) or next(
+                (x for x in fresh if _legacy_of(x, e.get("finding_id"))), None)
+            entry = (f or {}).get("key") or key
+            mute_cfg.setdefault("muted", [])
+            if entry not in mute_cfg["muted"]:
+                mute_cfg["muted"].append(entry)
+            mute_cfg.setdefault("_reasons", {})[entry] = (
+                f"David via Mission Control {stamp} (decision:{e['id']}): {e.get('label') or 'mute'} — "
+                + (note or "no reason given") + f" [{e.get('title') or key}]")
+            touched.add("config/backoffice_mute.json")
+            file_of[e["id"]] = "config/backoffice_mute.json"
+            out.append((e, f"muted {entry} in config/backoffice_mute.json"))
+        elif ex == "code" and st == "applied" and act == "extend-dev":
+            ent = next((x for x in dev_cfg.get("entries", []) if x.get("label") == e.get("dev_label")), None)
+            if not ent or not e.get("expires"):
+                out.append((e, None))
+                continue
+            ent["expires"] = e["expires"]
+            ent["why"] = (ent.get("why") or "").rstrip() + (
+                f" Extended to {e['expires']} by David via Mission Control {stamp} (decision:{e['id']})"
+                + (f": {note}" if note else "") + ".")
+            touched.add("config/dev.json")
+            file_of[e["id"]] = "config/dev.json"
+            out.append((e, f"in-dev label {e.get('dev_label')} now expires {e['expires']} (config/dev.json)"))
+        elif ex == "david" and st == "queued":
+            res = _verify_david(e, fresh, store)
+            if res:
+                out.append((e, res))
+    if dry or not out:
+        return out
+    if "config/backoffice_mute.json" in touched:
+        save(MUTE, mute_cfg, indent=1)
+    if "config/dev.json" in touched:
+        save(dev_path, dev_cfg, indent=2)
+    sha = _commit(sorted(touched), "Back office: David's answers from Mission Control — "
+                  + "; ".join(w for _, w in out if w)[:160], skip=theirs) if touched else ""
+    if theirs & touched:
+        print("  left uncommitted (another session has them open): " + ", ".join(sorted(theirs & touched)))
+    for e, what in out:
+        if what is None:
+            td.set_status(e["id"], "failed", "the in-dev entry is gone from config/dev.json", by="janitor")
+        elif file_of.get(e["id"]) in theirs or (file_of.get(e["id"]) and not sha):
+            td.set_status(e["id"], "done", what + " (written, not committed: "
+                          + ("another session has the file open)" if file_of[e["id"]] in theirs
+                             else "the commit did not happen)"), by="janitor")
+        else:
+            td.set_status(e["id"], "done", what, sha if file_of.get(e["id"]) else "", by="janitor")
+    return out
+
+
+# The dashboard files the running server reads ONCE, at start (fix round 2026-09-24). index.html
+# is read on every request and tt_*.py hot-reload, so after a merge without a restart the phone
+# gets the NEW page against the OLD API: the tab tests and check.py then fail with 404s, and the
+# janitor filed two high findings (and a push) blaming the tabs instead of the missing restart.
+_READ_AT_START = ("server.py", "usage.py", "claudecfg.py")
+
+
+def _proc_start(pid):
+    """Epoch the process started (/proc/<pid>/stat field 22 + btime), or None."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat") as f:
+            btime = next(int(ln.split()[1]) for ln in f if ln.startswith("btime"))
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+
+def _dashboard_stale(dash=None):
+    """(pid, [files changed since that process started]) for the running dashboard — found the
+    way dashboard/serve.sh finds it — or (None, []) when it is not running or cannot be read."""
+    dash = dash or os.path.join(MC, "dashboard")
+    app = os.path.join(dash, "server.py")
+    pids = [int(x) for x in sh(["pgrep", "-f", f"python3 {app}"]).split() if x.isdigit()]
+
+    def is_server(p):
+        # the server itself — `python3 <app>` — not a shell whose command line merely mentions it
+        try:
+            argv = open(f"/proc/{p}/cmdline", "rb").read().decode(errors="replace").split("\0")
+        except OSError:
+            return False
+        return len(argv) >= 2 and "python" in os.path.basename(argv[0]) and argv[1] == app
+    started = [(p, _proc_start(p)) for p in pids if is_server(p)]
+    started = [(p, t) for p, t in started if t]
+    if not started:
+        return None, []
+    pid, t0 = max(started, key=lambda x: x[1])
+    newer = []
+    for n in _READ_AT_START:
+        try:
+            if os.path.getmtime(os.path.join(dash, n)) > t0 + 2:
+                newer.append(n)
+        except OSError:
+            pass
+    return pid, newer
+
+
+def _clean_stale_pyc(dirs=None):
+    """Delete byte-code caches whose source has changed since they were compiled — exactly the
+    test CPython itself applies (the source mtime recorded in the .pyc header), so nothing is
+    removed that Python would not rewrite on the next import anyway. 2026-09-24: a stale
+    bin/__pycache__/publish.cpython-312.pyc still held the pre-09-23 publish.py, credential
+    literal included. -> the removed paths."""
+    import struct
+    gone = []
+    for d in dirs or (os.path.join(MC, "bin"), os.path.join(MC, "dashboard")):
+        cache = os.path.join(d, "__pycache__")
+        for fn in (sorted(os.listdir(cache)) if os.path.isdir(cache) else []):
+            if not fn.endswith(".pyc"):
+                continue
+            src, pyc = os.path.join(d, fn.split(".")[0] + ".py"), os.path.join(cache, fn)
+            try:
+                with open(pyc, "rb") as fh:
+                    head = fh.read(16)
+                flags = struct.unpack("<I", head[4:8])[0]
+                if flags:                 # hash-based pyc: not the mtime scheme, leave it alone
+                    continue
+                mt = struct.unpack("<I", head[8:12])[0]
+                if not os.path.exists(src) or int(os.path.getmtime(src)) & 0xFFFFFFFF != mt:
+                    os.unlink(pyc)
+                    gone.append(pyc)
+            except (OSError, struct.error):
+                continue
+    return gone
 
 
 # ---------------------------------------------------------------- brief
@@ -1727,6 +2109,8 @@ def file_memos(new_findings, dry=False):
 def run(dry=False):
     c = census()
     fresh = audit(c)
+    # David's dashboard answers first, so a mute he chose skips this very pass's merge
+    decided = apply_decisions(fresh, dry=dry)
     new, resolved, open_f = merge_findings(fresh)
     fixed = fix(open_f, dry=dry)
     filed = file_memos(new, dry=dry)
@@ -1738,12 +2122,17 @@ def run(dry=False):
     print(f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} {line}")
     for f, what in fixed:
         print(f"  fixed: {what}")
+    for e, what in decided:
+        print(f"  decided: {what or 'could not apply'} (decision:{e['id']})")
+    if not dry:
+        for p in _clean_stale_pyc():
+            print(f"  removed a stale byte-code cache: {os.path.relpath(p, MC)}")
     for f in new:
         print(f"  new [{f['sev']}] {f['title']}")
     with open(HISTORY, "a") as fh:
         fh.write(json.dumps({"at": now(), "new": len(new), "fixed": len(fixed),
                              "resolved": len(resolved), "open": len(still_open),
-                             "briefed": len(status)}) + "\n")
+                             "briefed": len(status), "decided": len(decided)}) + "\n")
     # state-change doctrine: push only when something actually changed
     if not dry and (new or fixed or filed):
         head = [f"{f['title']}" for f in sorted(new, key=lambda x: SEV[x["sev"]])[:3]]
@@ -1762,11 +2151,329 @@ def show():
     for f in open_f:
         age = (now() - f.get("first_seen", now())) / 86400
         print(f"  [{f['sev']:>4}] {f['title']}")
-        print(f"         {f['detail'][:110]}")
+        print(f"         {_scrub_secrets(f['detail'])[:110]}")      # the monthly sweep runs this
         print(f"         {f['kind']} · {f['project'] or 'box'} · open {age:.0f}d · fix={f['fix']}")
     fixed = [f for f in store.values() if f.get("state") == "fixed"]
     if fixed:
         print(f"\n{len(fixed)} auto-fixed to date")
+
+
+def selftest():
+    """The 2026-09-24 paths, on throwaway fixtures: stable keys, merge and mute by key, David's
+    answers (mute / extend-dev / verified), the leak lines that never carry the match, the
+    stored-copy scrub, the diagram rules and the render that must not claim a false repair.
+    Nothing here touches the live state, config or git."""
+    import tempfile
+    global FINDINGS, MUTE, CONFIG, MC, _commit
+    ok = True
+
+    def check(name, cond, info=""):
+        nonlocal ok
+        print(("PASS " if cond else "FAIL ") + name + (f"  — {info}" if info and not cond else ""))
+        ok = ok and bool(cond)
+
+    saved = (FINDINGS, MUTE, CONFIG, MC, _commit, os.environ.get("MC_DECISIONS_FILE"))
+    t = tempfile.mkdtemp(prefix="backoffice-selftest.")
+    try:
+        FINDINGS, MUTE, CONFIG, MC = f"{t}/findings.json", f"{t}/config/mute.json", f"{t}/config", t
+        os.makedirs(f"{t}/config")
+        os.makedirs(f"{t}/bin")
+        os.environ["MC_DECISIONS_FILE"] = f"{t}/decisions.jsonl"
+        commits = []
+        _commit = lambda paths, msg, skip=(): commits.append((tuple(paths), msg)) or "abc1234"
+        save(MUTE, {"muted": []})
+
+        # keys
+        a, b = [], []
+        job = {"sched": "20 8 * * *", "scripts": ["memo-process.py"], "log": "x.log", "project": "maintenance"}
+        _finding(a, "job-silent", "high", "memo-process.py has not run in 89h", "d", "maintenance",
+                 key="memo-process.py:20 8 * * *")
+        _finding(b, "job-silent", "high", "memo-process.py has not run in 96h", "d", "maintenance",
+                 key="memo-process.py:20 8 * * *")
+        check("key: a number in the title changes the id, never the key",
+              a[0]["id"] != b[0]["id"] and a[0]["key"] == b[0]["key"] and not re.search(r"\d+h", a[0]["key"]),
+              (a[0]["key"], b[0]["key"]))
+        c = []
+        _finding(c, "port-undeclared", "med", "port 8797 is listening but undeclared", "d")
+        check("key: with no key given it is the id, normalised the way the status layer does it",
+              c[0]["key"] == _key(c[0]["id"]) and c[0]["key"] == c[0]["id"].lower())
+        check("key: a catalog-stale key is the dataset, not its age",
+              _catalog_key({"kind": "catalog-stale", "title": "stocks/nav_snapshots is 12d old"})
+              == _catalog_key({"kind": "catalog-stale", "title": "stocks/nav_snapshots is 13d old"})
+              == "stocks/nav_snapshots")
+
+        # merge by key: the same problem a day later is not "new"
+        n1, _, _ = merge_findings(a)
+        n2, r2, o2 = merge_findings(b)
+        st = load(FINDINGS, {})
+        check("merge: the same key a day later updates the open record instead of a new one",
+              len(n1) == 1 and n2 == [] and r2 == [] and len(o2) == 1
+              and o2[0]["title"].endswith("96h") and o2[0]["id"] == a[0]["id"], (n2, r2))
+        save(MUTE, {"muted": [a[0]["key"]]})
+        n3, r3, o3 = merge_findings(b)
+        check("mute: a mute by key silences it (and the open record resolves)",
+              n3 == [] and len(r3) == 1 and o3 == [], (n3, r3, o3))
+        save(MUTE, {"muted": []})
+
+        # David's answers
+        td = _decide_mod()
+        leak = []
+        _finding(leak, "public-leak", "high", "a public repo would leak private content",
+                 "publish.py scan: r-public/code/p.py:91 [credential from ~/.secrets/nope]", "maintenance")
+        cat = []
+        _finding(cat, "catalog-unbacked", "high", "hbs/x is written here and backed up nowhere", "d", "hbs")
+        merge_findings(leak + cat)
+        now_ = now()
+        td.append({"id": "m0000001", "at": now_, "key": cat[0]["key"], "kind": "catalog-unbacked",
+                   "title": cat[0]["title"], "option": "mute", "label": "Accept it — mute with a reason",
+                   "exec": "code", "action": "mute", "status": "applied", "by": "david",
+                   "note": "regenerable; losing it is fine", "finding_id": cat[0]["id"]})
+        save(f"{CONFIG}/dev.json", {"entries": [{"label": "JustinDesk", "expires": "2026-09-29", "why": "WIP."}]}, 2)
+        td.append({"id": "x0000002", "at": now_, "key": "service-dev:8790", "kind": "service-dev",
+                   "option": "extend-14", "label": "Extend the in-dev label 2 weeks", "exec": "code",
+                   "action": "extend-dev", "dev_label": "JustinDesk", "expires": "2026-10-13",
+                   "until": now_ + 20 * 86400, "status": "applied", "by": "david"})
+        gone = []
+        _finding(gone, "unit-dead", "med", "x.service (system) is looping or cannot start", "d")
+        td.append({"id": "v0000003", "at": now_, "key": gone[0]["key"], "kind": "unit-dead",
+                   "option": "disable", "label": "I'll disable the unit", "exec": "david",
+                   "status": "queued", "by": "david", "finding_id": gone[0]["id"]})
+        td.append({"id": "c0000004", "at": now_, "key": "job-failed:1234abcd", "kind": "job-failed",
+                   "option": "fix", "label": "Fix it", "exec": "claude", "status": "queued", "by": "david"})
+        dry = apply_decisions(leak + cat, dry=True)
+        check("decide --dry: reports, writes nothing", len(dry) == 3 and load(MUTE, {}).get("muted") == []
+              and not commits, [w for _, w in dry])
+        got = apply_decisions(leak + cat)
+        mc = load(MUTE, {})
+        lat = td.latest()
+        check("decide: a mute answer becomes a mute-list line, keyed, with his note as the reason",
+              cat[0]["key"] in mc["muted"] and "regenerable; losing it is fine" in mc["_reasons"][cat[0]["key"]]
+              and "decision:m0000001" in mc["_reasons"][cat[0]["key"]])
+        check("decide: the in-dev label moves in config/dev.json with the reason",
+              load(f"{CONFIG}/dev.json", {})["entries"][0]["expires"] == "2026-10-13"
+              and "decision:x0000002" in load(f"{CONFIG}/dev.json", {})["entries"][0]["why"])
+        check("decide: one commit, of those two files only",
+              len(commits) == 1 and set(commits[0][0]) == {"config/backoffice_mute.json", "config/dev.json"},
+              commits)
+        check("decide: both code answers are marked done with the commit",
+              lat[cat[0]["key"]]["status"] == "done" and lat[cat[0]["key"]].get("commit") == "abc1234"
+              and lat["service-dev:8790"]["status"] == "done")
+        check("decide: 'I'll do it myself' closes once the finding is gone; Claude answers are left alone",
+              lat[gone[0]["key"]]["status"] == "done" and lat["job-failed:1234abcd"]["status"] == "queued")
+        n4, r4, _ = merge_findings(leak + cat)
+        check("decide: the muted finding resolves on the same pass",
+              all(x["id"] != cat[0]["id"] for x in load(FINDINGS, {}).values() if x.get("state") == "open"))
+
+        # fix round 2026-09-24: hand-edited config keeps its UTF-8 through a janitor write
+        hand = '{\n "_doc": "what we live with \u2014 put the reason next to it",\n "muted": []\n}\n'
+        open(MUTE, "w", encoding="utf-8").write(hand)
+        save(MUTE, load(MUTE, {}), indent=1)
+        check("save: a hand-edited file with '\u2014' round-trips byte for byte (no \\u escapes)",
+              open(MUTE, encoding="utf-8").read() == hand, open(MUTE, encoding="utf-8").read()[:80])
+        save(MUTE, {"muted": []})
+
+        # fix round 2026-09-24: a merge without a restart is named as that, not as broken tabs
+        import subprocess as _sp
+        sd = f"{t}/dash"
+        os.makedirs(sd)
+        for n in ("server.py", "usage.py"):
+            open(f"{sd}/{n}", "w").write("import time\ntime.sleep(60)\n")
+        old_t = time.time() - 600
+        for n in ("server.py", "usage.py"):
+            os.utime(f"{sd}/{n}", (old_t, old_t))
+        proc = _sp.Popen(["python3", f"{sd}/server.py"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        try:
+            time.sleep(0.3)
+            decoy = _sp.Popen(["bash", "-c", f"sleep 30 # python3 {sd}/server.py"], stdout=_sp.DEVNULL)
+            time.sleep(0.2)
+            pid0, nw0 = _dashboard_stale(sd)
+            os.utime(f"{sd}/server.py", (time.time() + 60, time.time() + 60))
+            pid1, nw1 = _dashboard_stale(sd)
+            check("stale server: the server's own process (not a shell naming it); files older than it are "
+                  "fine; a newer server.py is named",
+                  pid0 == proc.pid and nw0 == [] and pid1 == proc.pid and nw1 == ["server.py"], (pid0, nw0, pid1, nw1))
+        finally:
+            proc.kill()
+            proc.wait()
+            decoy.kill()
+            decoy.wait()
+        check("stale server: no process, no claim", _dashboard_stale(sd) == (None, []))
+
+        # leak lines and the stored-copy scrub
+        out = _leak_lines("mc-public/code/p.py:91  [credential from ~/.secrets/sudo] s3cretVALUE\n"
+                          "   x = 's3cretVALUE'\nmc-public/README.md:3  [absolute home path] /home/q\n1 leak(s)\n")
+        check("leaks: file:line [why] only, never the match or the text",
+              out == ["mc-public/code/p.py:91 [credential from ~/.secrets/sudo]",
+                      "mc-public/README.md:3 [absolute home path]", "1 leak(s)"], out)
+        old_store = {"public-leak:maintenance:x": {"state": "resolved", "detail":
+                     "publish.py scan: r/code/p.py:91 [credential from ~/.secrets/sudo] oldValue77; 1 leak(s)",
+                     "nested": ["token planted-VALUE-42 here"]}}
+        save(FINDINGS, _scrub_secrets(old_store, ["planted-VALUE-42"]))
+        raw = open(FINDINGS).read()
+        check("scrub: a stored detail loses a live value and a rotated one after the scanner's tag",
+              "oldValue77" not in raw and "planted-VALUE-42" not in raw and raw.count("<redacted>") == 2, raw)
+        sv = _secret_values()
+        if sv:
+            save(FINDINGS, {"x": {"detail": "a " + sv[0] + " b"}})
+            check("scrub: save() of findings.json redacts a live ~/.secrets value on its own",
+                  sv[0] not in open(FINDINGS).read())
+
+        # diagrams
+        arch = f"{t}/architecture"
+        os.makedirs(arch)
+        for n, body in (("_style.d2", "vars: {}\n"), ("a.d2", "...@_style\nx -> y\n"), ("b.d2", "x -> y\n")):
+            open(f"{arch}/{n}", "w").write(body)
+        for n in ("a.svg", "b.svg"):
+            open(f"{arch}/{n}", "w").write("<svg/>")
+        tt = time.time()
+        for n, m in (("a.d2", tt - 300), ("b.d2", tt - 300), ("a.svg", tt - 200), ("b.svg", tt - 200),
+                     ("_style.d2", tt - 100)):
+            os.utime(f"{arch}/{n}", (m, m))
+        ds = _diagram_state()
+        check("diagrams: _*.d2 is an import, never a diagram; a styled svg older than _style.d2 is stale",
+              ds["unrendered"] == ["a.d2"] and ds["diagrams"] == 2, ds)
+        open(f"{t}/bin/render-diagrams.sh", "w").write("#!/bin/sh\necho refused >&2\nexit 1\n")
+        os.chmod(f"{t}/bin/render-diagrams.sh", 0o755)
+        dfix = []
+        _finding(dfix, "diagram-unrendered", "low", "1 diagram source(s) edited but not re-rendered", "a.d2",
+                 "maintenance", fix="auto", key="")
+        done = fix([dict(dfix[0], state="open")])
+        check("fix: a render that fails claims no repair", done == [], done)
+        open(f"{t}/bin/render-diagrams.sh", "w").write(f"#!/bin/sh\ntouch {arch}/a.svg\nexit 0\n")
+        done = fix([dict(dfix[0], state="open")])
+        check("fix: a render that works and leaves nothing stale is claimed",
+              [w for _, w in done] == ["re-rendered the architecture diagrams"], done)
+
+        # stale byte-code
+        import py_compile
+        pk = f"{t}/pyc"
+        os.makedirs(pk)
+        open(f"{pk}/m.py", "w").write("X = 1\n")
+        open(f"{pk}/n.py", "w").write("Y = 1\n")
+        py_compile.compile(f"{pk}/m.py", cfile=f"{pk}/__pycache__/m.cpython-312.pyc")
+        py_compile.compile(f"{pk}/n.py", cfile=f"{pk}/__pycache__/n.cpython-312.pyc")
+        os.utime(f"{pk}/m.py", (tt + 5, tt + 5))
+        gone_p = _clean_stale_pyc([pk])
+        check("pyc: a cache compiled from an older source is removed, a current one kept",
+              [os.path.basename(x) for x in gone_p] == ["m.cpython-312.pyc"]
+              and os.path.exists(f"{pk}/__pycache__/n.cpython-312.pyc"), gone_p)
+
+        # the transition: records stored before findings had keys (verifier, 2026-09-24)
+        save(MUTE, {"muted": []})
+        store = {"catalog-stale:stocks:stocks-nav-snapshots-is-12d-old": {
+                     "id": "catalog-stale:stocks:stocks-nav-snapshots-is-12d-old", "kind": "catalog-stale",
+                     "sev": "med", "title": "stocks/nav_snapshots is 12d old", "detail": "d", "project": "stocks",
+                     "fix": "human", "state": "open", "first_seen": 1000},
+                 "port-undeclared::port-8797-is-listening-but-undeclared": {
+                     "id": "port-undeclared::port-8797-is-listening-but-undeclared", "kind": "port-undeclared",
+                     "sev": "med", "title": "port 8797 is listening but undeclared", "detail": "d", "project": "",
+                     "fix": "human", "state": "open", "first_seen": 1000}}
+        save(FINDINGS, store)
+        fr = []
+        _finding(fr, "catalog-stale", "med", "stocks/nav_snapshots is 13d old", "d", "stocks",
+                 key=_catalog_key({"kind": "catalog-stale", "title": "stocks/nav_snapshots is 13d old"}))
+        _finding(fr, "port-undeclared", "med", "port 9000 is listening but undeclared", "d")
+        n5, r5, o5 = merge_findings(fr)
+        st5 = load(FINDINGS, {})
+        leg = st5["catalog-stale:stocks:stocks-nav-snapshots-is-12d-old"]
+        check("legacy: a keyless record whose id differs only in its numbers is updated in place, not "
+              "re-opened as new",
+              leg["state"] == "open" and leg["key"] == fr[0]["key"] and leg["title"].endswith("13d old")
+              and [x["id"] for x in n5] == [fr[1]["id"]], ([x["id"] for x in n5], leg))
+        check("legacy: a finding keyed by its own id (a port) never merges with another number",
+              st5["port-undeclared::port-8797-is-listening-but-undeclared"]["state"] == "resolved"
+              and st5[fr[1]["id"]]["state"] == "open")
+        td.append({"id": "l0000005", "at": now_, "key": _key("catalog-stale:stocks:stocks-nav-snapshots-is-12d-old"),
+                   "kind": "catalog-stale", "option": "mute", "label": "Accept it", "exec": "code",
+                   "action": "mute", "status": "applied", "by": "david",
+                   "finding_id": "catalog-stale:stocks:stocks-nav-snapshots-is-12d-old"})
+        td.append({"id": "l0000006", "at": now_, "key": "unpushed:stocks:stocks-has-5-unpushed-commits",
+                   "kind": "unpushed", "option": "later", "label": "I'll push it", "exec": "david",
+                   "status": "queued", "by": "david", "finding_id": "unpushed:stocks:stocks-has-5-unpushed-commits"})
+        up = []
+        _finding(up, "unpushed", "med", "stocks has 6 unpushed commits", "d", "stocks", key="")
+        commits.clear()
+        got = dict((e["id"], w) for e, w in apply_decisions(fr + up))
+        check("legacy: a mute answered on the old id lands in the mute list under today's stable key",
+              fr[0]["key"] in load(MUTE, {}).get("muted", []), load(MUTE, {}).get("muted"))
+        check("legacy: 'I'll do it myself' on an old id is NOT closed while its finding is still found",
+              "l0000006" not in got and td.latest()["unpushed:stocks:stocks-has-5-unpushed-commits"]["status"]
+              == "queued", got)
+
+        # "I rotated it": the secret file must change AFTER he answered, not merely after the leak
+        # was found (09-24: changed, then restored to the leaked value)
+        sec = f"{t}/secret-file"
+        open(sec, "w").write("x")
+        rec = {"public-leak:maintenance:x": {"detail": "publish.py scan: r/p.py:9 [credential from ~/.secrets/zz]",
+                                             "first_seen": int(tt) - 3600}}
+        saved_home = HOME
+        try:
+            globals()["HOME"] = t
+            os.makedirs(f"{t}/.secrets", exist_ok=True)
+            open(f"{t}/.secrets/zz", "w").write("x")
+            os.utime(f"{t}/.secrets/zz", (tt - 60, tt - 60))
+            ev = {"id": "r0000007", "key": "public-leak:maintenance:x", "option": "rotated", "exec": "david",
+                  "finding_id": "public-leak:maintenance:x", "at": int(tt) - 30}
+            check("rotated: a secret rewritten before the answer (after the leak) is not verified",
+                  _verify_david(ev, [], rec) is None)
+            os.utime(f"{t}/.secrets/zz", (tt + 5, tt + 5))
+            check("rotated: rewritten after the answer is verified", bool(_verify_david(ev, [], rec)))
+        finally:
+            globals()["HOME"] = saved_home
+
+        # a real git tree: our own writes are not "another session's", and another session's
+        # dirty file — even on the first porcelain line, which sh() strips — is left alone
+        g = f"{t}/git"
+        os.makedirs(f"{g}/config")
+        MC, CONFIG, MUTE = g, f"{g}/config", f"{g}/config/backoffice_mute.json"
+        _commit = saved[4]
+        genv = {k: os.environ.get(k) for k in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+                                                "GIT_COMMITTER_EMAIL")}
+        os.environ.update(GIT_AUTHOR_NAME="selftest", GIT_AUTHOR_EMAIL="selftest@localhost",
+                          GIT_COMMITTER_NAME="selftest", GIT_COMMITTER_EMAIL="selftest@localhost")
+        try:
+            save(MUTE, {"muted": []})
+            save(f"{CONFIG}/dev.json", {"entries": [{"label": "JustinDesk", "expires": "2026-09-29", "why": "WIP."}]}, 2)
+            open(f"{g}/AAA.md", "w").write("a\n")
+            sh(["git", "-C", g, "init", "-q"])
+            sh(["git", "-C", g, "add", "-A"])
+            sh(["git", "-C", g, "commit", "-qm", "init"])
+            open(f"{g}/AAA.md", "a").write("another session\n")          # sorts first: " M AAA.md"
+            check("dirty_before: the first porcelain line is read whole", dirty_before({"AAA.md"}) == {"AAA.md"})
+            os.environ["MC_DECISIONS_FILE"] = f"{t}/decisions-git.jsonl"
+            td.append({"id": "g0000008", "at": now_, "key": cat[0]["key"], "kind": "catalog-unbacked",
+                       "title": cat[0]["title"], "option": "mute", "label": "Accept it", "exec": "code",
+                       "action": "mute", "status": "applied", "by": "david", "finding_id": cat[0]["id"]})
+            td.append({"id": "g0000009", "at": now_, "key": "service-dev:8790", "kind": "service-dev",
+                       "option": "extend-14", "label": "Extend", "exec": "code", "action": "extend-dev",
+                       "dev_label": "JustinDesk", "expires": "2026-10-13", "until": now_ + 20 * 86400,
+                       "status": "applied", "by": "david"})
+            apply_decisions(cat)
+            lg = sh(["git", "-C", g, "show", "--stat", "--format=%s", "HEAD"])
+            dirty = sh(["git", "-C", g, "status", "--porcelain"])
+            lat = td.latest()
+            check("decide: our own two writes are committed together; the other session's file is not",
+                  "backoffice_mute.json" in lg and "dev.json" in lg and "AAA.md" not in lg
+                  and dirty.strip() == "M AAA.md", (lg, dirty))
+            check("decide: each answer records the real commit, and none claims 'left uncommitted'",
+                  all(lat[k].get("commit") and "not committed" not in lat[k].get("result", "")
+                      for k in (cat[0]["key"], "service-dev:8790"))
+                  and lat[cat[0]["key"]]["commit"] == sh(["git", "-C", g, "rev-parse", "--short", "HEAD"]),
+                  [(lat[k].get("commit"), lat[k].get("result")) for k in (cat[0]["key"], "service-dev:8790")])
+        finally:
+            for k, v in genv.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    finally:
+        FINDINGS, MUTE, CONFIG, MC, _commit = saved[:5]
+        if saved[5] is None:
+            os.environ.pop("MC_DECISIONS_FILE", None)
+        else:
+            os.environ["MC_DECISIONS_FILE"] = saved[5]
+    print("ALL PASS" if ok else "SOME FAILED")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
@@ -1787,5 +2494,12 @@ if __name__ == "__main__":
             print(f"{k}: {v['summary']}")
     elif cmd == "show":
         show()
+    elif cmd == "decide":
+        # a preview against the last pass's open findings (the real run uses a fresh audit)
+        last = [f for f in load(FINDINGS, {}).values() if f.get("state") == "open"]
+        for e, what in apply_decisions(last, dry=dry):
+            print(("would: " if dry else "done: ") + (what or "could not apply") + f" (decision:{e['id']})")
+    elif cmd == "selftest":
+        sys.exit(selftest())
     else:
         sys.exit(run(dry=dry))

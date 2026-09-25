@@ -4,9 +4,22 @@
 Stdlib only (no deps to rot). Read-only aggregation of netdata, crontab, logs, git,
 ntfy history, watchdog state — plus two actions: run a green-lit experiment, and
 update the Spark's packages. Serves on :8900 (tailnet-only box).
+
+The request path does not build (2026-09-24, David: "the dashboard also takes some time to
+load"). Every polled payload lives in the hot cache (`_hot`, below the overview section): a
+request is answered from memory, a background refresher rebuilds what is about to go stale —
+but only while somebody has asked for something in the last ten minutes, so an unwatched
+dashboard costs nothing. A caller that finds nothing worth serving waits for the build already
+in flight instead of starting a second one. Slow probes (apt, ntfy, the catalog's cold sweep,
+nvidia-smi -q) run off the request path on their own clocks. `python3 server.py selftest`
+proves the parts that must not drift (next_run, the POST guard, the hot cache).
 """
+import functools
 import glob
-import json, os, re, subprocess, sys, time, threading
+import gzip
+import hashlib
+import ipaddress
+import json, os, re, socket, subprocess, sys, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen
 
@@ -17,7 +30,8 @@ import gpu     # noqa: E402  — the GPU queue, rendered next to it
 BASE = os.path.dirname(os.path.abspath(__file__))
 CFG = f"{HOME}/maintenance/config"
 NETDATA = "http://127.0.0.1:19999"
-PORT = 8900
+PORT = int(os.environ.get("MC_PORT") or 8900)          # MC_PORT/MC_BIND: a test copy beside the live one
+BIND = os.environ.get("MC_BIND") or "0.0.0.0"
 _cache = {"t": 0.0, "data": None, "lock": threading.Lock()}
 _slow = {}   # slow probes cached with their own TTLs
 
@@ -46,6 +60,62 @@ def _slow_get(key, ttl, fn, default=None):
     return v
 
 
+_SLOW_RUNNING = set()
+_SLOW_LOCK = threading.Lock()
+
+
+def _slow_bg(key, ttl, fn, default=None):
+    """_slow_get without the wait: whatever the last run found (None before the first one
+    finishes), and a refresh on a background thread once that is older than ttl.
+
+    For probes too slow for a build and slow to change: `apt-get -s` twice is 1.4 s and the
+    answer moves hourly at most; the ntfy poll is five HTTPS round trips. Before 2026-09-24
+    both ran inline, so the first page after a restart or a quiet spell paid for them."""
+    e = _slow.get(key)
+    if not e or time.time() - e[0] >= ttl:
+        with _SLOW_LOCK:
+            start = key not in _SLOW_RUNNING
+            _SLOW_RUNNING.add(key)
+        if start:
+            def run():
+                try:
+                    _slow_get(key, 0, fn, default)
+                finally:
+                    with _SLOW_LOCK:
+                        _SLOW_RUNNING.discard(key)
+            threading.Thread(target=run, daemon=True).start()
+    return e[1] if e else default
+
+
+def _sig(*paths):
+    """(mtime_ns, size) per path: the cheap "has this file changed" key for anything derived
+    from a file. A missing file is None, so a file appearing or vanishing is a change too."""
+    out = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+_SIGMEMO = {}
+
+
+def _by_sig(key, paths, fn, max_age=None, extra=None):
+    """fn(), recomputed only when one of `paths` changed on disk (or `extra`, any other input,
+    changed) — or, with max_age, when the answer also depends on the clock (a 48-hour window,
+    a 30-day cut) and is that old. One slot per key, so memory stays bounded."""
+    s = (_sig(*paths), extra)
+    hit = _SIGMEMO.get(key)
+    if hit and hit[0] == s and (max_age is None or time.time() - hit[1] < max_age):
+        return hit[2]
+    v = fn()
+    _SIGMEMO[key] = (s, time.time(), v)
+    return v
+
+
 # ---------- system ----------
 
 def _netdata_latest(chart):
@@ -61,31 +131,100 @@ def _gpu_stats():
     alarming depending on where the throttle point is. So we also read T.Limit (the
     driver reports *headroom to throttle*, not the limit itself) and the slowdown
     counters, which say whether the card has ever actually been held back.
+
+    Two nvidia-smi spawns per build became none (2026-09-24). The live numbers come from
+    netdata, whose nvidia_smi collector already samples the card every second; the slow
+    half (max clock, throttle limit, slowdown counters) is one `-q` spawn every 10 minutes
+    (_gpu_detail). nvidia-smi is the fallback whenever netdata cannot say.
     """
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,"
-             "temperature.gpu,power.draw,clocks.sm,clocks.max.sm",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=4).stdout.strip().splitlines()[0]
-        f = [x.strip() for x in out.split(",")]
-        num = lambda x: float(x) if x.replace(".", "", 1).replace("-", "", 1).isdigit() else None
-        util, mused, mtotal = num(f[0]), num(f[1]), num(f[2])
-        mem = round(100.0 * mused / mtotal, 1) if mused is not None and mtotal else None
-        therm = {"temp_c": num(f[3]), "power_w": num(f[4]),
-                 "sm_mhz": num(f[5]), "sm_max_mhz": num(f[6])}
+        live = _gpu_live_netdata()
+        if live is None:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,"
+                 "temperature.gpu,power.draw,clocks.sm,clocks.max.sm",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=4).stdout.strip().splitlines()[0]
+            f = [x.strip() for x in out.split(",")]
+            num = lambda x: float(x) if x.replace(".", "", 1).replace("-", "", 1).isdigit() else None
+            util, mused, mtotal = num(f[0]), num(f[1]), num(f[2])
+            live = {"util": util, "mem": round(100.0 * mused / mtotal, 1)
+                    if mused is not None and mtotal else None,
+                    "temp_c": num(f[3]), "power_w": num(f[4]), "sm_mhz": num(f[5]),
+                    "sm_max_mhz": num(f[6])}
+        d = _gpu_detail()
+        therm = {"temp_c": live["temp_c"], "power_w": live["power_w"],
+                 "sm_mhz": live["sm_mhz"],
+                 "sm_max_mhz": live.get("sm_max_mhz") or d.get("sm_max_mhz")}
+        # T.Limit is headroom = limit - current temperature. The limit is what is stable, so
+        # the sample keeps limit (= headroom + temp at the time) and today's headroom is that
+        # limit minus the temperature right now.
+        lim = d.get("limit_c")
+        therm["headroom_c"] = (int(round(lim - therm["temp_c"]))
+                               if lim is not None and therm["temp_c"] is not None
+                               else d.get("headroom_c"))
+        for key in ("thermal_slowdown_us", "power_capped_us"):
+            therm[key] = d.get(key)
+        therm["throttling"] = bool(d.get("throttling"))
+        return live["util"], live["mem"], therm
+    except Exception:
+        return None, None, {}
+
+
+def _gpu_live_netdata():
+    """Utilisation, memory, temperature, power and SM clock from netdata's nvidia_smi charts,
+    one HTTP call. None when netdata is down or its collector has stopped updating (then the
+    caller spawns nvidia-smi, as it always did)."""
+    try:
+        d = _get_json(f"{NETDATA}/api/v1/allmetrics?format=json&filter=nvidia_smi.*", timeout=2)
+    except Exception:
+        return None
+    now = time.time()
+
+    def dims(suffix):
+        for k, v in d.items():
+            if k.endswith(suffix):
+                if now - (v.get("last_updated") or 0) > 60:
+                    return None                     # a stalled collector is not a reading
+                return {n: x.get("value") for n, x in (v.get("dimensions") or {}).items()}
+        return None
+
+    def val(suffix, name):
+        x = (dims(suffix) or {}).get(name)
+        return float(x) if isinstance(x, (int, float)) else None
+
+    util, temp = val("_gpu_utilization", "gpu"), val("_temperature", "temperature")
+    if util is None or temp is None:
+        return None
+    fb = dims("_frame_buffer_memory_usage") or {}
+    used = fb.get("used")
+    total = sum(x for x in fb.values() if isinstance(x, (int, float)))
+    return {"util": util, "temp_c": temp, "power_w": val("_power_draw", "power_draw"),
+            "sm_mhz": val("_clock_freq", "sm"),
+            "mem": round(100.0 * used / total, 1) if isinstance(used, (int, float)) and total else None}
+
+
+def _gpu_detail():
+    """The slow-moving half of the GPU picture, from one `nvidia-smi -q` every 10 minutes."""
+    def build():
         q = subprocess.run(["nvidia-smi", "-q", "-d", "TEMPERATURE,PERFORMANCE"],
                            capture_output=True, text=True, timeout=6).stdout
+        mx = subprocess.run(["nvidia-smi", "--query-gpu=clocks.max.sm",
+                             "--format=csv,noheader,nounits"],
+                            capture_output=True, text=True, timeout=4).stdout.strip()
+        out = {"sm_max_mhz": float(mx.splitlines()[0]) if mx and
+               mx.splitlines()[0].replace(".", "", 1).isdigit() else None}
         m = re.search(r"GPU T\.Limit Temp\s*:\s*(\d+)", q)
-        therm["headroom_c"] = int(m.group(1)) if m else None
+        t = re.search(r"GPU Current Temp\s*:\s*(\d+)", q)
+        out["headroom_c"] = int(m.group(1)) if m else None
+        out["limit_c"] = int(m.group(1)) + int(t.group(1)) if m and t else None
         for key, label in (("thermal_slowdown_us", "SW Thermal Slowdown"),
                            ("power_capped_us", "SW Power Capping")):
             m = re.search(re.escape(label) + r"\s*:\s*(\d+) us", q)
-            therm[key] = int(m.group(1)) if m else None
-        therm["throttling"] = bool(re.search(r"HW Thermal Slowdown\s*:\s*Active", q))
-        return util, mem, therm
-    except Exception:
-        return None, None, {}
+            out[key] = int(m.group(1)) if m else None
+        out["throttling"] = bool(re.search(r"HW Thermal Slowdown\s*:\s*Active", q))
+        return out
+    return _slow_get("gpu_detail", 600, build, {}) or {}
 
 
 _THERM = f"{HOME}/maintenance/state/thermal.jsonl"
@@ -96,26 +235,17 @@ def _thermal_history(now_c, keep_h=48, _gpu_w=None):
 
     The question "is it strong enough to run this 24/7" is about the STEADY STATE and
     about whether load temperature ever approaches the throttle point — neither of which
-    a single sample shows. Sampled here on the dashboard's own cadence; cheap enough that
-    it needs no job of its own.
+    a single sample shows.
+
+    READ-ONLY since 2026-09-24. healthcheck.sh samples the card into this file every 15
+    minutes (672 rows in the 7 days before the change, every gap 900-902 s, always at :00/
+    :15/:30/:45). The dashboard's own extra sample every 5 minutes added nothing — and it was
+    worse than nothing: watchdog() reads this file's mtime as "the watchdog last ran", so a
+    polled page made a dead watchdog look alive, and a background refresher would have made
+    that permanent. now_c and _gpu_w are kept for callers; they no longer write anything.
     """
-    out = {}
-    try:
-        if now_c is not None:
-            last = 0.0
-            if os.path.exists(_THERM):
-                with open(_THERM, "rb") as f:      # cheap tail: last line only
-                    f.seek(max(0, os.path.getsize(_THERM) - 400))
-                    tail = f.read().decode(errors="replace").splitlines()
-                if tail:
-                    try:
-                        last = json.loads(tail[-1]).get("at", 0)
-                    except Exception:
-                        pass
-            if time.time() - last > 300:           # at most one sample per 5 min
-                with open(_THERM, "a") as f:
-                    f.write(json.dumps({"at": int(time.time()), "c": now_c,
-                                        "gpu_w": _gpu_w}) + "\n")
+    def build():
+        out = {}
         cutoff = time.time() - keep_h * 3600
         rows = []
         if os.path.exists(_THERM):
@@ -130,9 +260,12 @@ def _thermal_history(now_c, keep_h=48, _gpu_w=None):
         if rows:
             out = {"min_c": min(rows), "max_c": max(rows),
                    "avg_c": round(sum(rows) / len(rows), 1), "samples": len(rows)}
+        return out
+    try:
+        # the file only grows every 15 min; the 48 h window also moves with the clock
+        return dict(_by_sig(("thermal", keep_h), (_THERM,), build, max_age=300))
     except Exception:
-        pass
-    return out
+        return {}
 
 
 def _apt_updates():
@@ -186,18 +319,23 @@ def system_stats():
         s["uptime_days"] = round(float(open("/proc/uptime").read().split()[0]) / 86400, 1)
     except Exception:
         pass
-    s["updates_available"] = _slow_get("apt", 3600, _apt_updates, None)
-    s["updates_applicable"] = _slow_get("apt_applicable", 3600, _apt_applicable, None)
+    # The two apt dry-runs cost 1.4 s and change hourly at most: counted on a background
+    # thread, null until the first count lands (the page already says "unknown" for null).
+    s["updates_available"] = _slow_bg("apt", 3600, _apt_updates, None)
+    s["updates_applicable"] = _slow_bg("apt_applicable", 3600, _apt_applicable, None)
     s["reboot_required"] = os.path.exists("/var/run/reboot-required")
     # update-run status
     st = _exp_state().get("__update__", {})
     s["update_running"] = bool(st.get("pid")) and _pid_alive(st.get("pid", -1))
-    s["update_tail"] = ""
     ulog = f"{HOME}/maintenance/logs/update.log"
-    if os.path.exists(ulog):
+
+    def tail():
+        if not os.path.exists(ulog):
+            return "", ""
         lines = [l for l in open(ulog, errors="replace").read().splitlines() if l.strip()]
-        s["update_tail"] = lines[-1][-120:] if lines else ""
-    s["update_last"] = _update_summary(ulog)
+        return (lines[-1][-120:] if lines else ""), _update_summary(ulog)
+    # a 320 KB log read twice per build, for a line that changes when an update runs
+    s["update_tail"], s["update_last"] = _by_sig("update_log", (ulog,), tail)
     return s
 
 
@@ -238,6 +376,28 @@ def _update_summary(ulog):
 _SPAWNS = re.compile(r'subprocess\.\w+\(\s*\[\s*["\']claude|runner\.launch|"claude",\s*"-p"')
 
 
+_SPAWN_MEMO = {}
+
+
+def _script_spawns(path):
+    """Does this script launch Claude? Memoised on the file's (mtime, size): schedule_week
+    asked it of every job's source on every build, ~60 ms of re-reading unchanged files.
+    None when the file cannot be read."""
+    s = _sig(path)[0]
+    if s is None:
+        return None
+    hit = _SPAWN_MEMO.get(path)
+    if hit and hit[0] == s:
+        return hit[1]
+    try:
+        text = open(path, errors="replace").read()
+    except OSError:
+        return None
+    v = bool(_SPAWNS.search(text))
+    _SPAWN_MEMO[path] = (s, v)
+    return v
+
+
 def _kind_of(cmd):
     if re.search(r"(^|[|&;\s])claude\s+-", cmd):
         return "claude"
@@ -246,11 +406,7 @@ def _kind_of(cmd):
         if not os.path.isabs(path):
             cd = re.search(r"cd\s+(\S+)", cmd)
             path = os.path.join((cd.group(1) if cd else HOME).replace("~", HOME), tok)
-        try:
-            text = open(path, errors="replace").read()
-        except OSError:
-            continue
-        if _SPAWNS.search(text):
+        if _script_spawns(path):
             return "claude"
     return "local" if _is_local_ai(cmd) else "code"
 
@@ -262,7 +418,18 @@ def _measured_runtimes(jobs=None):
     session is logged start-to-end by the session hook, and a local-model job leaves a
     string of GPU slot releases that cluster into runs (a gap over ten minutes starts a
     new one). Anything with no trace reports no duration rather than a guess.
+
+    Recomputed only when either ledger or the job list changes (2026-09-24): it re-read both
+    files on every schedule_week, ~40 ms, for an answer that moves when a session ends.
     """
+    jobs = jobs if jobs is not None else cron_jobs()
+    key = tuple((j.get("schedule", ""), j.get("cmd", "")) for j in jobs)
+    return dict(_by_sig("runtimes", (f"{HOME}/maintenance/state/claude_sessions.jsonl",
+                                     f"{HOME}/maintenance/state/gpu/events.jsonl"),
+                        lambda: _measured_runtimes_build(jobs), extra=key))
+
+
+def _measured_runtimes_build(jobs):
     import statistics
     out = {}
     try:
@@ -278,7 +445,7 @@ def _measured_runtimes(jobs=None):
         # almost any minute and would claim the first session it saw — which is exactly what
         # it did, attributing a 20-minute interactive session to the Remote Control watchdog.
         scheds = []
-        for j in (jobs if jobs is not None else cron_jobs()):
+        for j in jobs:
             sc = j.get("schedule", "")
             f = sc.split()
             if len(f) != 5 or sc.startswith("@"):
@@ -451,7 +618,10 @@ CRON_RE = re.compile(r"^(@\w+|(?:\S+\s+){4}\S+)\s+(.*)$")
 LOG_RE = re.compile(r">>\s*(\S+)")
 
 
+@functools.lru_cache(maxsize=65536)
 def _field_match(field, v):
+    """One cron field against one value. Pure, so memoised: schedule_week and next_run ask
+    the same few thousand (field, value) pairs on every build, each a handful of regexes."""
     for part in field.split(","):
         if part == "*":
             return True
@@ -511,12 +681,32 @@ def _et_hm(hour_utc, minute):
     return f"{h}:{d.minute:02d}{'am' if d.hour < 12 else 'pm'}", d.strftime("%Z")
 
 
-def next_run(sched, within_days=40):
+def _cron_dow(day):
+    """Cron's day of week for a date: Monday 1 .. Saturday 6, Sunday 0."""
+    return (day.weekday() + 1) % 7
+
+
+def _dow_match(field, day):
+    """Sunday is 0 in cron and 7 is accepted as Sunday too.
+
+    Until 2026-09-24 next_run computed Sunday as `t.weekday() == 6 and 0 or t.weekday() + 1`,
+    which is 7 (the `and 0` is falsy), so a field of `0` never matched a Sunday: every one of
+    the twelve Sunday-only jobs (`* * * * 0`) had next_run None, and the Overview's "up next"
+    list and fleet's next_run_server silently skipped them. schedule_week and
+    _measured_runtimes already used (weekday + 1) % 7."""
+    wd = _cron_dow(day)
+    return _field_match(field, wd) or (wd == 0 and _field_match(field, 7))
+
+
+def next_run(sched, within_days=40, now=None):
     """When this cron line fires next, as a UTC epoch. None for @reboot or unparseable.
 
-    Minute-by-minute walk rather than a dependency: at most ~58k cheap field matches for a
-    monthly job, well inside the dashboard's 8s cache, and it reuses the same _field_match
-    the load calculator already trusts.
+    Day, then hour, then minute (2026-09-24): the matching minutes and hours are listed once,
+    and only days whose day-of-month, month and weekday match are opened. The minute-by-minute
+    walk it replaces made up to 57,600 x 5 field matches per job — 725 ms of every overview
+    build for 76 jobs — for the same answer (server.py selftest compares the two on every live
+    schedule and the edge cases). Same window: [the next whole minute, + within_days days).
+    Day-of-month AND day-of-week, as before (no live line restricts both). `now` is for tests.
     """
     if sched.startswith("@"):
         return None
@@ -524,11 +714,45 @@ def next_run(sched, within_days=40):
     if len(f) != 5:
         return None
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-    t = _dt.now(_tz.utc).replace(second=0, microsecond=0) + _td(minutes=1)
+    mins = [m for m in range(60) if _field_match(f[0], m)]
+    hrs = [h for h in range(24) if _field_match(f[1], h)]
+    if not mins or not hrs:
+        return None
+    base = _dt.now(_tz.utc) if now is None else _dt.fromtimestamp(now, _tz.utc)
+    t0 = base.replace(second=0, microsecond=0) + _td(minutes=1)
+    end = t0 + _td(days=within_days)
+    day = t0.replace(hour=0, minute=0)
+    while day < end:
+        if (_field_match(f[2], day.day) and _field_match(f[3], day.month)
+                and _dow_match(f[4], day)):
+            for h in hrs:
+                for m in mins:
+                    c = day.replace(hour=h, minute=m)
+                    if c < t0:
+                        continue
+                    return int(c.timestamp()) if c < end else None
+        day += _td(days=1)
+    return None
+
+
+def _next_run_walk(sched, within_days=40, now=None, sunday_fix=True):
+    """The minute-by-minute walk next_run replaced, kept ONLY as the selftest's reference.
+    sunday_fix=False is the pre-2026-09-24 code verbatim (Sunday computed as 7)."""
+    if sched.startswith("@"):
+        return None
+    f = sched.split()
+    if len(f) != 5:
+        return None
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    base = _dt.now(_tz.utc) if now is None else _dt.fromtimestamp(now, _tz.utc)
+    t = base.replace(second=0, microsecond=0) + _td(minutes=1)
     for _ in range(within_days * 1440):
+        wd = (t.weekday() + 1) % 7                  # computed here, not with _dow_match, so a
+        dow_ok = ((_field_match(f[4], wd) or (wd == 0 and _field_match(f[4], 7)))  # bug there
+                  if sunday_fix                     # cannot hide in both sides of the test
+                  else _field_match(f[4], t.weekday() == 6 and 0 or t.weekday() + 1))
         if (_field_match(f[0], t.minute) and _field_match(f[1], t.hour)
-                and _field_match(f[2], t.day) and _field_match(f[3], t.month)
-                and _field_match(f[4], t.weekday() == 6 and 0 or t.weekday() + 1)):
+                and _field_match(f[2], t.day) and _field_match(f[3], t.month) and dow_ok):
             return int(t.timestamp())
         t += _td(minutes=1)
     return None
@@ -621,6 +845,13 @@ def _pcfg():
 _WCFG = _cfg("job_weights.json", {"weights": [], "experiment_tokens_per_run": 250000})
 
 
+def _wcfg():
+    """config/job_weights.json as it is NOW. It was read once at import, so a weight added by
+    the back office (or v2.1's `when: trigger`) reached the running dashboard only on the next
+    restart. _WCFG stays for anything that imported it."""
+    return _cfg_live("job_weights.json", {"weights": [], "experiment_tokens_per_run": 250000})
+
+
 def _ncfg():
     return _cfg_live("job_names.json", {"names": []}, "names")
 
@@ -658,7 +889,7 @@ def _local_markers():
 
 def _tokens_per_run(cmd, desc):
     hay = cmd + " " + desc
-    for w in _WCFG["weights"]:
+    for w in _wcfg().get("weights", []):
         if w["match"] in hay:
             return w["tokens_per_run"]
     return 150000 if "claude -p" in cmd else 0
@@ -859,7 +1090,9 @@ def notifications():
     into the ledger so history accumulates from every source.
 
     The ledger read is local and fresh on every call, so a notify.sh push shows up
-    immediately; only the remote poll is cached.
+    immediately; only the remote poll is cached — and since 2026-09-24 it never runs on the
+    caller's time: the poll (0.7-3 s) happens on a background thread and its messages join
+    the ledger on the next call after it lands.
     """
     ledger = _ledger_tail(NOTIF_LEDGER, NOTIF_KEEP)
     seen = {(m["time"], m.get("title", "")) for m in ledger if "time" in m}
@@ -868,10 +1101,10 @@ def notifications():
     # window, but a burst could shrink it — anything older than the tail is left alone
     # rather than re-appended as "new".
     floor = min((m["time"] for m in ledger if "time" in m), default=0)
-    polled = _slow_get("ntfy", NTFY_POLL_TTL, _ntfy_poll, []) or []
+    polled = _slow_bg("ntfy", NTFY_POLL_TTL, _ntfy_poll, []) or []
     new = [m for m in polled
            if m["time"] >= floor and (m["time"], m.get("title", "")) not in seen]
-    if new:
+    if new and not TEST:          # a test copy reads the live ledger; it never writes it
         try:
             os.makedirs(os.path.dirname(NOTIF_LEDGER), exist_ok=True)
             with open(NOTIF_LEDGER, "a") as f:
@@ -1012,7 +1245,18 @@ def backoffice():
     cen = _load_json(f"{HOME}/maintenance/state/census.json", {})
     out["census"] = {"at": cen.get("at"), "projects": len(cen.get("projects", {})),
                      "crons": len(cen.get("crons", [])), "ports": len(cen.get("ports", []))}
-    return out
+    # 2026-09-24 (integration): the stored findings carried the live sudo password verbatim in
+    # the public-leak detail, and this route handed it to Box › Janitor. tt_now's _scrub is the
+    # one backstop every other payload goes through (~/.secrets values, the scanner's credential
+    # tag, home paths, emails); if it cannot load, fail closed — no finding detail leaves.
+    try:
+        return _tt_fn("tt_now", "_scrub")(out)
+    except Exception as e:
+        print(f"[dashboard] backoffice scrub unavailable, details withheld: {e}", flush=True)
+        for f in out["open"] + out["fixed"]:
+            f["detail"] = "(detail withheld — the secrets scrubber did not load)"
+        out["history"], out["last"] = [], None
+        return out
 
 
 def _build_id():
@@ -1150,12 +1394,66 @@ def catalog_project(slug):
             "bytes": sum(x["bytes"] or 0 for x in owns)}
 
 
+# The catalog's cold sweep (catalog.py rules 9-11) walks every project's data_roots: 7,000
+# os.walk steps, ~430 ms. It ran inside catalog_view() on EVERY page load and every Catalog
+# poll until 2026-09-24, because audit() sweeps when it is not handed sweeps — the docstring
+# below said "no walk happens per request" and had been false since the rules were added. Now
+# the refresher runs the sweep at most hourly, only while someone watches; until its first
+# run, the three sweep-only rules are taken from the janitor's last pass (state/findings.json)
+# so the Catalog tab shows the same findings either way.
+SWEEP_EVERY = 3600
+SWEEP_KINDS = ("catalog-undeclared-cold", "catalog-orphan-empty", "catalog-conflict")
+_SWEEP = {"t": 0.0, "sweeps": None, "ms": None}
+
+
+def _catalog_sweep():
+    """Run the cold sweep now (background only) and keep its per-project results."""
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import catalog as cat
+        t = time.time()
+        sw = [s for s in (cat.sweep(d) for d in cat.project_dirs()) if s]
+        _SWEEP.update(t=time.time(), sweeps=sw, ms=int((time.time() - t) * 1000))
+    except Exception as e:
+        print(f"[dashboard] catalog sweep failed: {type(e).__name__}: {e}", flush=True)
+        _SWEEP["t"] = time.time()          # do not retry every tick; try again next hour
+
+
+def _catalog_findings(cat, st):
+    """audit() over the compiled snapshot, never walking the filesystem on the caller's time."""
+    if _SWEEP["sweeps"] is not None:
+        return cat.audit(st, sweeps=_SWEEP["sweeps"])
+    out = cat.audit(st, sweeps=[])
+    have = {(f["kind"], f.get("project")) for f in out}
+    store = _load_json(f"{HOME}/maintenance/state/findings.json", {})
+    extra = [{k: f.get(k) for k in ("kind", "sev", "title", "detail", "project", "fix")}
+             for f in store.values()
+             if f.get("state") == "open" and f.get("kind") in SWEEP_KINDS
+             and (f.get("kind"), f.get("project")) not in have]
+    extra.sort(key=lambda f: (f.get("project") or "", SWEEP_KINDS.index(f["kind"])))
+    return out + extra
+
+
 def catalog_view():
+    """The Catalog tab's payload (see _catalog_view_build), rebuilt only when an input moved:
+    the compiled catalog, the read ledger, the janitor's findings, the last cold sweep, or the
+    page itself (its build id is in the payload). Five minutes at most, because two rules and
+    the 30-day read window also move with the clock."""
+    paths = [f"{HOME}/maintenance/state/{x}" for x in
+             ("catalog.json", "catalog_reads.jsonl", "findings.json")]
+    paths.append(os.path.join(BASE, "index.html"))
+    return _by_sig("catalog_view", paths, _catalog_view_build, max_age=300,
+                   extra=_SWEEP["t"])
+
+
+def _catalog_view_build():
     """The Catalog tab's payload: an inventory, its sources, and its lineage.
 
     Shaped the way a data catalog is normally browsed — a landing page of counts and
     sources, then a domain (here: a project), then one asset — rather than as one flat
-    table. Everything is read from the compiled snapshot; no walk happens per request.
+    table. Everything is read from the compiled snapshot; the filesystem sweep's findings come
+    from the background sweep or the janitor's last pass (_catalog_findings), never a walk on
+    the request's time.
 
     COUNTS AND SIZES ONLY. The per-dataset rows are computed here to derive the per-project
     totals and the cross-project links, and then thrown away — they are ~92% of the bytes and
@@ -1228,8 +1526,77 @@ def catalog_view():
            "sources": st.get("sources", {}), "order": order,
            "errors": st.get("errors", []),
            "links": sorted(links.values(), key=lambda x: -x["n"]),
-           "findings": cat.audit(st)}
+           "findings": _catalog_findings(cat, st)}
     return out
+
+
+def _gitdir(repo):
+    """(gitdir, commondir) for a repo, following a worktree's `.git` file."""
+    g = os.path.join(repo, ".git")
+    if os.path.isfile(g):
+        try:
+            txt = open(g).read().strip()
+        except OSError:
+            return None, None
+        if txt.startswith("gitdir:"):
+            g = os.path.join(repo, txt.split(":", 1)[1].strip())
+            common = g
+            try:
+                c = open(os.path.join(g, "commondir")).read().strip()
+                common = os.path.normpath(os.path.join(g, c))
+            except OSError:
+                pass
+            return g, common
+        return None, None
+    return (g, g) if os.path.isdir(g) else (None, None)
+
+
+def _git_sig(repo):
+    """What changes when a repo's answers change: HEAD (checkout), the index (add/commit), the
+    reflog (every commit, reset, merge), packed refs, and the branch ref HEAD points at."""
+    g, common = _gitdir(repo)
+    if not g:
+        return None
+    paths = [os.path.join(g, x) for x in ("HEAD", "index", "logs/HEAD")]
+    paths.append(os.path.join(common, "packed-refs"))
+    try:
+        head = open(os.path.join(g, "HEAD")).read().strip()
+        if head.startswith("ref:"):
+            paths.append(os.path.join(common, head[4:].strip()))
+    except OSError:
+        pass
+    return _sig(*paths)
+
+
+_GITMEMO = {}
+GIT_MAX_AGE = 300
+
+
+def _gitmemo(repo, key, fn, max_age=GIT_MAX_AGE):
+    """A git fact, re-asked only when the repo's refs or index moved — or after max_age,
+    because two answers also move without them: an edited file makes `status` dirty without
+    touching the index, and "commits in the last 7 days" moves with the clock. Git facts cost
+    2 spawns per project per overview build and 3 per system build before this (2026-09-24)."""
+    s = _git_sig(repo)
+    k = (repo, key)
+    hit = _GITMEMO.get(k)
+    if hit and hit[0] == s and time.time() - hit[1] < max_age:
+        return hit[2]
+    v = fn()
+    _GITMEMO[k] = (s, time.time(), v)
+    return v
+
+
+def _git_out(repo, args, timeout=5, max_age=GIT_MAX_AGE):
+    """stdout of `git -C repo <args>` through _gitmemo; None when git fails."""
+    def run():
+        try:
+            r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                               timeout=timeout)
+            return r.stdout
+        except Exception:
+            return None
+    return _gitmemo(repo, tuple(args), run, max_age)
 
 
 def projects():
@@ -1244,14 +1611,13 @@ def projects():
              "last_commit": None, "subject": "", "dirty": None, "activity": ""}
         if os.path.isdir(os.path.join(repo, ".git")):
             try:
-                last = subprocess.run(["git", "-C", repo, "log", "-1", "--format=%ct|%s"],
-                                      capture_output=True, text=True, timeout=5).stdout.strip()
+                last = (_git_out(repo, ["log", "-1", "--format=%ct|%s"]) or "").strip()
                 if last:
                     ct, subj = last.split("|", 1)
                     p["last_commit"], p["subject"] = int(ct), subj[:90]
-                dirty = subprocess.run(["git", "-C", repo, "status", "-s"],
-                                       capture_output=True, text=True, timeout=5).stdout
-                p["dirty"] = len([l for l in dirty.splitlines() if l.strip()])
+                dirty = _git_out(repo, ["status", "-s"])
+                if dirty is not None:
+                    p["dirty"] = len([l for l in dirty.splitlines() if l.strip()])
             except Exception:
                 pass
         auto = (_BO_STATUS.get(name) or _BO_STATUS.get(name.replace(" ", "-"))
@@ -1332,7 +1698,7 @@ def experiments():
             status = "memo ready"
         out.append({"slug": slug, "title": re.sub(r"^[\d-]+\s*·\s*", "", title),
                     "target": tgt, "project": _project_of(tgt),
-                    "tokens_per_run": _WCFG.get("experiment_tokens_per_run", 250000),
+                    "tokens_per_run": _wcfg().get("experiment_tokens_per_run", 250000),
                     "freq": "one-shot", "status": status, "memo": memo.group(1) if memo else None,
                     "started": st.get("started"), "tail": tail})
     return out
@@ -1398,11 +1764,37 @@ def attention():
 # experiments pipeline). This is the box-wide inbox+ledger bus every project drops into.
 MEMOBUS = f"{HOME}/memos"
 LEDGER = f"{MEMOBUS}/LEDGER.md"
-# project slug -> (working dir for its processing session, human label). Extend as projects register.
-BUS_PROJECTS = {
-    "maintenance": (f"{HOME}/maintenance", "Mission Control"),   # slug = folder name, like every other project (was "mission-control" until 2026-09-01: two inboxes for one project)
-    "stocks": (f"{HOME}/Stocks", "Stocks"),
-}
+def bus_projects():
+    """slug -> (working dir for its processing session, human label), one per REAL inbox.
+
+    Derived from ~/memos/inbox/<slug>/ on every call (2026-09-24). This was a hand-kept dict of
+    two — maintenance and Stocks — while six projects had inboxes, so hbs, clientco-db, poker and
+    thesis memos never showed as pending, could not be sent to, dispatched or ignored from the
+    Memos tab, and tt_system counted inboxes itself to get the right number. The slug is the
+    folder name (lowercase, like every project; Mission Control's is `maintenance`); the
+    working dir is the top-level folder with that name in any case (`stocks` -> ~/Stocks);
+    the label is the project's card name from config/projects.json."""
+    out = {}
+    ib = f"{MEMOBUS}/inbox"
+    try:
+        slugs = sorted(d for d in os.listdir(ib) if os.path.isdir(os.path.join(ib, d)))
+    except OSError:
+        slugs = []
+    try:
+        tops = {d.lower(): d for d in os.listdir(HOME) if os.path.isdir(os.path.join(HOME, d))}
+    except OSError:
+        tops = {}
+    cfg = _pcfg() or {}
+    for slug in slugs:
+        folder = tops.get(slug.lower())
+        if not folder:
+            continue                    # an inbox for a folder that is not on the box
+        label = next((k for k, v in cfg.items() if k.lower() == slug.lower()
+                      or folder in (v.get("match") or [])), folder)
+        out[slug] = (os.path.join(HOME, folder), label)
+    # Mission Control first, then Stocks, as before; the rest alphabetically
+    first = [k for k in ("maintenance", "stocks") if k in out]
+    return {k: out[k] for k in first + [k for k in out if k not in first]}
 
 
 def parse_ledger():
@@ -1425,7 +1817,7 @@ def parse_ledger():
 
 def bus_pending():
     out = []
-    for slug in BUS_PROJECTS:
+    for slug in bus_projects():
         d = f"{MEMOBUS}/inbox/{slug}"
         if os.path.isdir(d):
             out += [{"project": slug, "name": f} for f in sorted(os.listdir(d)) if f.endswith(".md")]
@@ -1433,13 +1825,13 @@ def bus_pending():
 
 
 def bus():
-    return {"projects": [{"slug": s, "label": l} for s, (_, l) in BUS_PROJECTS.items()],
+    return {"projects": [{"slug": s, "label": l} for s, (_, l) in bus_projects().items()],
             "ledger": parse_ledger(), "pending": bus_pending()}
 
 
 def bus_process(target):
     """Launch the target project's headless session to work its inbox per the LEDGER protocol."""
-    root, label = BUS_PROJECTS[target]
+    root, label = bus_projects()[target]
     prompt = (f"You are a {label} session. Process the cross-project memo inbox per the protocol in "
               f"~/memos/LEDGER.md: for each file in ~/memos/inbox/{target}/ — read it, assess honestly, "
               f"then implement it in this project OR reject it with clear reasoning. Update its row in "
@@ -1461,7 +1853,7 @@ def bus_process(target):
 
 
 def bus_send(target, title, body, launch):
-    if target not in BUS_PROJECTS:
+    if target not in bus_projects():
         return {"ok": False, "msg": f"unknown project '{target}'"}
     if not title.strip() or not body.strip():
         return {"ok": False, "msg": "title and body required"}
@@ -1513,24 +1905,39 @@ def _tmux_env():
             "PATH": f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin", "TERM": "xterm-256color"}
 
 
-def _ledger_set_status(slug, status, evidence=None):
-    """Rewrite the status (and optionally evidence) cell of the ledger row for slug."""
+def _bus_slug(x):
+    """A ledger Target/Source cell as an inbox slug: the pre-09-01 'mission-control' and the
+    card name are both Mission Control's `maintenance`; everything else is its folder name."""
+    low = (x or "").strip().lower()
+    return "maintenance" if low in ("mission-control", "mission control", "mc") else low
+
+
+def _ledger_set_status(slug, status, evidence=None, target=None):
+    """Rewrite the status (and optionally evidence) cell of ONE ledger row: the newest row for
+    this memo slug (and, when given, this target).
+
+    It rewrote EVERY row with the slug until 2026-09-24. A memo slug is its title's words, so
+    two memos to different projects on different days can share one ("fix-the-readme"), and
+    ignoring or re-dispatching the new one silently rewrote the old one's verdict too."""
     try:
         lines = open(LEDGER, errors="replace").read().splitlines()
     except Exception:
         return False
-    hit = False
+    hit = None
     for i, ln in enumerate(lines):
         cells = [c.strip() for c in ln.strip("|").split("|")] if ln.startswith("|") else []
-        if len(cells) >= 6 and cells[1] == slug:
-            cells[4] = status
-            if evidence:
-                cells[5] = evidence
-            lines[i] = "| " + " | ".join(cells) + " |"
-            hit = True
-    if hit:
-        open(LEDGER, "w").write("\n".join(lines) + "\n")
-    return hit
+        if (len(cells) >= 6 and cells[1] == slug
+                and (target is None or _bus_slug(cells[3]) == _bus_slug(target))):
+            hit = i                                # keep going: the newest row wins
+    if hit is None:
+        return False
+    cells = [c.strip() for c in lines[hit].strip("|").split("|")]
+    cells[4] = status
+    if evidence:
+        cells[5] = evidence
+    lines[hit] = "| " + " | ".join(cells) + " |"
+    open(LEDGER, "w").write("\n".join(lines) + "\n")
+    return True
 
 
 def bus_dispatch(target, title, body, source_file="", interactive=True):
@@ -1540,9 +1947,10 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     join it from claude.ai/code / the mobile app. interactive=False -> headless -p.
     source_file: dispatch an existing design memo (~/maintenance/proposals/<file>) instead
     of composed text; it is copied into the bus inbox for the paper trail."""
-    if target not in BUS_PROJECTS:
+    projs = bus_projects()
+    if target not in projs:
         return {"ok": False, "msg": f"unknown project '{target}'"}
-    root, label = BUS_PROJECTS[target]
+    root, label = projs[target]
     today = time.strftime("%Y-%m-%d")
     if source_file:
         src = f"{HOME}/maintenance/proposals/{os.path.basename(source_file)}"
@@ -1562,7 +1970,8 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     open(f"{d}/{fname}", "w").write(body_txt)
     mode = "interactive tmux session" if interactive else "headless session"
     row = f"| {today} | {slug} | dashboard (David) | {target} | proposed | inbox/{target}/{fname} · dispatched: {mode} |\n"
-    if not _ledger_set_status(slug, "proposed", f"inbox/{target}/{fname} · re-dispatched: {mode}"):
+    if not _ledger_set_status(slug, "proposed", f"inbox/{target}/{fname} · re-dispatched: {mode}",
+                              target=target):
         try:
             cur = open(LEDGER, errors="replace").read().rstrip() + "\n"
         except Exception:
@@ -1601,8 +2010,8 @@ def bus_ignore(slug):
         slug = slug[:-3]
     today = time.strftime("%Y-%m-%d")
     status = f"rejected (ignored by David, {today})"
-    moved = []
-    for proj in BUS_PROJECTS:
+    moved, targets = [], []
+    for proj in bus_projects():
         d = f"{MEMOBUS}/inbox/{proj}"
         if os.path.isdir(d):
             for f in os.listdir(d):
@@ -1610,46 +2019,83 @@ def bus_ignore(slug):
                     os.makedirs(f"{MEMOBUS}/processed", exist_ok=True)
                     os.rename(f"{d}/{f}", f"{MEMOBUS}/processed/{f}")
                     moved.append(f)
-    if not _ledger_set_status(slug, status):
+                    targets.append(proj)
+    # The inbox a file sat in IS its target: that target's newest row, or a new row for it —
+    # never another project's row with the same slug (the fallback used to rewrite the newest
+    # row for the slug whatever its target). With no file moved, the newest row for the slug.
+    if targets:
+        new = [t for t in sorted(set(targets)) if not _ledger_set_status(slug, status, target=t)]
+    else:
+        new = [] if _ledger_set_status(slug, status) else ["—"]
+    if new:
         try:
             cur = open(LEDGER, errors="replace").read().rstrip() + "\n"
         except Exception:
             cur = ""
-        open(LEDGER, "w").write(cur + f"| {today} | {slug} | dashboard (David) | — | {status} | dashboard ignore |\n")
+        open(LEDGER, "w").write(cur + "".join(
+            f"| {today} | {slug} | dashboard (David) | {t} | {status} | dashboard ignore |\n"
+            for t in new))
     return {"ok": True, "msg": f"Ignored — ledger updated" + (f", {len(moved)} inbox file(s) archived" if moved else "")}
 
 
+# Which project a diagram describes, by a word in its file name (longest first). The drawing
+# carries "N commits since it was drawn" from that project's repo. `mission-control` and
+# `thesis` were missing until 2026-09-24, so the Mission Control and thesis diagrams never said
+# how far their project had moved on.
+ARCH_PROJECTS = (("mission-control", "maintenance"), ("maintenance", "maintenance"),
+                 ("clientco", "clientco-db"), ("stocks", "Stocks"), ("poker", "poker"),
+                 ("thesis", "thesis"))
+
+
 def architecture():
-    """Pre-rendered D2 SVGs (bin/render-diagrams.sh); title from '# title:' in the .d2."""
+    """Pre-rendered D2 SVGs (bin/render-diagrams.sh); title from '# title:' in the .d2.
+
+    Cached until a diagram file or one of the repos it counts commits in moves (2026-09-24):
+    it read 300 KB of SVG and ran ten git commands on every call."""
+    d = f"{HOME}/maintenance/architecture"
+    try:
+        names = sorted(f for f in os.listdir(d) if f.endswith((".svg", ".d2")))
+    except OSError:
+        names = []
+    repos = [f"{HOME}/maintenance"] + sorted({f"{HOME}/{p}" for _, p in ARCH_PROJECTS})
+    extra = (tuple(_git_sig(r) for r in repos), int(time.time() // GIT_MAX_AGE))
+    return _by_sig("architecture", [os.path.join(d, f) for f in names], _architecture_build,
+                   extra=(tuple(names), extra))
+
+
+def _architecture_build():
     d = f"{HOME}/maintenance/architecture"
     out = []
     for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-        if f.endswith(".svg"):
+        if f.endswith(".svg") and not f.startswith("_"):
             title, src = f[:-4], os.path.join(d, f[:-4] + ".d2")
+            styled = False
             if os.path.exists(src):
-                t = re.search(r"#\s*title:\s*([^\n]+)", open(src, errors="replace").read())
+                txt = open(src, errors="replace").read()
+                t = re.search(r"#\s*title:\s*([^\n]+)", txt)
                 if t:
                     title = t.group(1).strip()
+                # drawn in the dashboard's own look: the .d2 spread-imports architecture/_style.d2
+                # (a line that is `...@_style`, whitespace aside — the same test render-diagrams.sh
+                # and the janitor use since 263c363; d2 compiles a padded or CRLF line fine)
+                styled = any(ln.strip() == "...@_style" for ln in txt.splitlines())
             # A diagram is a point-in-time statement about a system that keeps moving, so
             # it carries the date it was drawn and how far the project has run since. Taken
             # from git rather than mtime — a re-render must not look like a re-think.
             drawn, commits = None, None
-            proj = next((v for k, v in (("stocks", "Stocks"), ("clientco", "clientco-db"),
-                                        ("poker", "poker"), ("maintenance", "maintenance"))
-                         if k in f), None)
+            proj = next((v for k, v in ARCH_PROJECTS if k in f), None)
             try:
-                iso = subprocess.run(["git", "-C", f"{HOME}/maintenance", "log", "-1",
-                                      "--format=%cI", "--", f"architecture/{f[:-4]}.d2"],
-                                     capture_output=True, text=True, timeout=5).stdout.strip()
+                iso = (_git_out(f"{HOME}/maintenance", ["log", "-1", "--format=%cI", "--",
+                                                        f"architecture/{f[:-4]}.d2"]) or "").strip()
                 drawn = iso[:10] or None
-                if drawn and proj and os.path.isdir(f"{HOME}/{proj}/.git"):
-                    commits = len(subprocess.run(
-                        ["git", "-C", f"{HOME}/{proj}", "log", f"--since={iso}", "--oneline"],
-                        capture_output=True, text=True, timeout=8).stdout.splitlines())
+                if drawn and proj and _gitdir(f"{HOME}/{proj}")[0]:
+                    since = _git_out(f"{HOME}/{proj}", ["log", f"--since={iso}", "--oneline"],
+                                     timeout=8)
+                    commits = len(since.splitlines()) if since is not None else None
             except Exception:
                 pass
             out.append({"file": f, "title": title, "drawn": drawn, "project": proj,
-                        "commits_since": commits,
+                        "commits_since": commits, "styled": styled,
                         "svg": open(os.path.join(d, f), errors="replace").read()})
     return out
 
@@ -1976,8 +2422,14 @@ def live_sessions(crons=None):
 
 def catalog_summary():
     """One glance at the data catalog for the Overview tiles. Reads the compiled snapshot
-    only — no walk, no stat storm on an 8-second cache."""
-    st = _load_json(f"{HOME}/maintenance/state/catalog.json", {})
+    only — no walk, no stat storm on an 8-second cache — and only when it changed (it is
+    compiled once a day; parsing its 240 KB on every build was most of this function)."""
+    path = f"{HOME}/maintenance/state/catalog.json"
+    return dict(_by_sig("catalog_summary", (path,), lambda: _catalog_summary_build(path)))
+
+
+def _catalog_summary_build(path):
+    st = _load_json(path, {})
     c = st.get("counts", {})
     projs = st.get("projects", {})
     declared = sum(p.get("declared", 0) for p in projs.values())
@@ -1992,65 +2444,357 @@ def catalog_summary():
             "mixed": c.get("mixed", 0), "read_30d": c.get("read_30d", 0)}
 
 
-OVERVIEW_FRESH = 10    # younger than this: serve it, do nothing
+OVERVIEW_FRESH = 15    # the refresher rebuilds an overview older than this
 OVERVIEW_STALE = 120   # older than this: the caller waits for a rebuild
 
 
 def _overview_build():
     crons = cron_jobs()
-    return {"generated_at": int(time.time()), "system": system_stats(), "crons": crons,
+    data = {"generated_at": int(time.time()), "system": system_stats(), "crons": crons,
             "watchdog": watchdog(), "projects": projects(),
             "experiments": experiments(), "ports": ports(), "localai": localai(),
             "schedule": schedule_week(crons), "sessions": live_sessions(crons),
             "catalog": catalog_summary()}
+    # tt_fleet and tt_now read the last full snapshot from here (crons, schedule, system)
+    with _cache["lock"]:
+        _cache.update(t=time.time(), data=data)
+    return data
 
 
-def _overview_refresh():
-    """Rebuild into the cache. Never raises — it also runs on a background thread,
-    where an exception would only be lost, and a failed rebuild must leave the last
-    good snapshot in place rather than blank the dashboard."""
+def _overview_lite_build():
+    """/api/overview?lite=1: only what the Overview and Box pages read — system, the Claude
+    queue, the catalog tiles and three job counts — 2 KB instead of 18 KB gzipped on every
+    Overview poll, and none of the full build's cron walk, schedule, projects or local-AI
+    work. The full payload stays at /api/overview for Agents › Usage."""
+    return {"generated_at": int(time.time()), "lite": True, "system": system_stats(),
+            "sessions": {"queue": _stocks_queue()}, "catalog": catalog_summary(),
+            "crons_summary": crons_summary()}
+
+
+def _fleet_roster(refresh_after=600):
+    """tt_fleet's job list as it last built it — never built on a caller's time. tt_fleet
+    decides a job's kind from the strongest evidence (declared weights, launch calls in the
+    script, GPU ledger labels), so its counts win whenever it has a roster. On the refresher's
+    own thread an old roster (> refresh_after s) is rebuilt, so the Overview's counts keep one
+    source instead of flipping to the server's rule when nobody has opened Agents lately."""
+    tf = sys.modules.get("tt_fleet")
+    if tf is None:
+        return None
+    data = None
+    peek = getattr(tf, "peek", None)
+    if callable(peek):
+        try:
+            data = peek({"days": "7"})
+        except Exception:
+            data = None
+    else:                                    # a tt_fleet from before peek(): read its cache
+        for k, v in list((getattr(tf, "_C", None) or {}).items()):
+            try:
+                if isinstance(k, tuple) and k[:2] == ("fleet", 7):
+                    data = v[1]
+            except Exception:
+                continue
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        return None
+    if (time.time() - (data.get("generated_at") or 0) > refresh_after
+            and threading.current_thread().name == "mc-refresher"):
+        try:
+            fresh = tf.fleet({"days": "7"})
+            if isinstance(fresh, dict) and isinstance(fresh.get("jobs"), list):
+                data = fresh
+        except Exception:
+            pass
+    return data["jobs"]
+
+
+def _cron_kind(c):
+    """The server's own rule, when tt_fleet has nothing cached: a declared trigger/fallback
+    weight (`when`, config/job_weights.json) is `trigger`; a token weight is `claude`; a
+    registered local-model script is `local`; the rest is code."""
+    hay = (c.get("cmd") or "") + " " + (c.get("desc") or "")
+    w = next((w for w in _wcfg().get("weights", []) if w.get("match") and w["match"] in hay), None)
+    if w and w.get("when") in ("trigger", "fallback"):
+        return "trigger"
+    if c.get("ai"):
+        return "claude"
+    if c.get("local_ai"):
+        return "local"
+    return "code"
+
+
+def crons_summary(crons=None):
+    """{total, claude, trigger, local, code, src}: how many scheduled jobs of each kind."""
+    roster, src = _fleet_roster(), "fleet"
+    if roster is not None:
+        kinds = [j.get("kind") for j in roster]
+    else:
+        kinds, src = [_cron_kind(c) for c in (cron_jobs() if crons is None else crons)], "server"
+    out = {"total": len(kinds), "claude": 0, "trigger": 0, "local": 0, "code": 0}
+    for k in kinds:
+        out[k if k in ("claude", "trigger", "local") else "code"] += 1
+    out["src"] = src
+    return out
+
+
+# ---------------------------------------------------------------- the hot cache
+# Every polled payload is answered from memory. Before 2026-09-24 the page waited on builds:
+# GET / ran the catalog's filesystem sweep (0.44 s) on every load, an idle server rebuilt five
+# payloads at once on the first request (2.3-2.8 s, all fighting over one GIL), and a restart
+# cost 4.4 s. Now:
+#   * a request is served whatever is cached if it is younger than the route's `stale`, and
+#     never builds while it is;
+#   * a background refresher rebuilds entries as they pass `fresh` — ONLY while somebody has
+#     asked for an /api/ route in the last WATCH_S seconds. With no watcher it blocks on an
+#     Event: no timer, no CPU (healthcheck's GET / every 15 minutes does not count);
+#   * a caller that finds nothing worth serving waits for the build already in flight rather
+#     than starting a second one (after a restart, _warm() and the first page used to build
+#     the same overview side by side);
+#   * a POST that changes what a payload says invalidates it, and the next reader waits for
+#     the rebuild — an answered decision never reads as still open.
+WATCH_S = int(os.environ.get("MC_WATCH_S") or 600)   # a page asked within this long: keep warm
+TICK_S = 2.0
+_WATCH = {"t": 0.0, "start": 0.0}
+_WAKE = threading.Event()
+_HOT = {}
+_HOT_LOCK = threading.Lock()
+HOT_MAX = 64          # cached variants at most (a route x its query strings; ~20 in real use)
+_REFRESHER = {"on": False, "builds": 0, "last": None}
+TEST = bool(os.environ.get("MC_TEST"))      # a test copy beside the live one (serve.sh in a worktree)
+
+# route -> (fresh s, stale s, priority). `fresh` is how often it is worth rebuilding while
+# watched, set by how fast the thing really changes (map_perf §4), not by how often the page
+# polls; the tt modules' own caches (status 30 s, fleet 60 s, heat 600 s ...) sit underneath,
+# so a refresh inside them is a free cache hit. `stale` is how old a copy may be and still be
+# served without waiting. Priority orders the refresher's work: the status card first.
+HOT_ROUTES = {
+    "/api/status":          (10, 180, 0),
+    "/api/decisions":       (10, 120, 1),
+    "/api/overview?lite=1": (OVERVIEW_FRESH, OVERVIEW_STALE, 2),
+    "/api/timeline":        (10, 180, 3),
+    "/api/sessions":        (10, 180, 4),
+    "/api/system":          (20, 300, 5),
+    "/api/overview":        (OVERVIEW_FRESH, OVERVIEW_STALE, 6),
+    "/api/fleet":           (20, 300, 7),
+    "/api/flow":            (20, 300, 8),
+    "/api/upkeep":          (30, 600, 9),
+    "/api/heat":            (60, 1800, 10),
+    "/api/notifications":   (30, 600, 11),
+    "/api/usage":           (120, 1800, 12),
+}
+
+
+class _Hot:
+    """One cached payload: the data, its JSON body, a weak ETag and the gzipped body, all made
+    once per change on the builder's thread, so serving it is a dict lookup and a write."""
+    __slots__ = ("key", "build", "fresh", "stale", "prio", "t", "built", "data", "body",
+                 "etag", "gz", "asked", "busy", "gen", "ms")
+
+    def __init__(self, key, build, fresh, stale, prio):
+        self.key, self.build, self.fresh, self.stale, self.prio = key, build, fresh, stale, prio
+        self.t = self.built = self.asked = 0.0
+        self.data = self.body = self.etag = self.gz = None
+        self.busy = None          # a threading.Event while a build is in flight
+        self.gen = 0              # bumped by _hot_invalidate
+        self.ms = None
+
+
+def _etag(body):
+    return 'W/"' + hashlib.sha1(body).hexdigest()[:20] + '"'
+
+
+def _gzip(body):
+    return gzip.compress(body, 6) if len(body) > 1024 else None
+
+
+def _hot_build(e, ev):
+    """Build one entry on the calling thread and publish it. Never raises. A failed build
+    keeps the last good payload (a blank dashboard is worse than a minute-old one); with
+    nothing to keep it publishes {"error": ...} so the panel can say why it is empty."""
+    gen, t0 = e.gen, time.time()
+    err = data = body = None
     try:
-        data = _overview_build()
-        with _cache["lock"]:
-            _cache.update(t=time.time(), data=data)
-    except Exception:
-        pass
-    finally:
-        with _cache["lock"]:
-            _cache["building"] = False
+        data = e.build()
+        body = json.dumps(data).encode()
+    except Exception as x:
+        data, err = None, f"{type(x).__name__}: {str(x)[:200]}"
+        print(f"[dashboard] build {e.key} failed: {err}", flush=True)
+    changed = body is not None and body != e.body
+    etag, gz = (_etag(body), _gzip(body)) if changed else (None, None)
+    with _HOT_LOCK:
+        now = time.time()
+        if body is not None:
+            if changed:
+                e.body, e.etag, e.gz = body, etag, gz
+            e.data, e.built, e.ms = data, now, int((now - t0) * 1000)
+            # invalidated while building: publish it, but the next reader waits for a new one
+            e.t = now if e.gen == gen else 0.0
+        else:
+            if e.data is None:
+                e.data = {"error": err}
+                e.body = json.dumps(e.data).encode()
+                e.etag, e.gz = _etag(e.body), None
+            # still servable, due again in min(fresh, 30) s — not on the refresher's next 2 s
+            # tick, which logged a line every 2 s for as long as a broken module was watched
+            e.t = now - e.fresh + min(e.fresh, 30)
+        e.busy = None
+        _REFRESHER["builds"] += 1
+    ev.set()
+
+
+def _hot(key, build, fresh, stale, prio=50, wait=60, ask=True):
+    """The entry for `key`, ready to serve (e.data None only if a build timed out). ask=False
+    builds without counting as a reader, so the refresher does not keep it warm for nobody."""
+    with _HOT_LOCK:
+        e = _HOT.get(key)
+        if e is None:
+            e = _Hot(key, build, fresh, stale, prio)
+            # Past the cap a new variant is built for this caller and not kept: the key is the
+            # path plus its query, so `?x=1`, `?x=2` ... would otherwise each be cached and
+            # rebuilt by the refresher every `fresh` seconds for as long as they were asked for.
+            if len(_HOT) < HOT_MAX:
+                _HOT[key] = e
+    for _ in range(3):
+        spawn = mine = None
+        with _HOT_LOCK:
+            now = time.time()
+            if ask:
+                e.asked = now
+            age = now - e.t
+            if e.data is not None and age < e.stale:
+                if age >= e.fresh and e.busy is None:
+                    if _REFRESHER["on"]:
+                        _WAKE.set()
+                    else:                    # imported as a module: no refresher, old SWR
+                        spawn = e.busy = threading.Event()
+                if spawn is None:
+                    return e
+            else:
+                ev = e.busy
+                if ev is None:
+                    mine = ev = e.busy = threading.Event()
+        if spawn is not None:
+            threading.Thread(target=_hot_build, args=(e, spawn), daemon=True).start()
+            return e
+        if mine is not None:
+            _hot_build(e, mine)
+        else:
+            ev.wait(wait)
+    return e
+
+
+def _hot_invalidate(*paths):
+    """Every cached variant of these routes must be rebuilt before it is served again."""
+    with _HOT_LOCK:
+        for k, e in _HOT.items():
+            if any(k == p or k.startswith(p + "?") for p in paths):
+                e.gen += 1
+                e.t = 0.0
+
+
+def _hot_due(*paths):
+    """Keep serving what these routes hold, but rebuild them on the refresher's next tick —
+    not on a reader's time. For payloads whose inputs just improved (see _warm)."""
+    with _HOT_LOCK:
+        now = time.time()
+        for k, e in _HOT.items():
+            if e.data is not None and any(k == p or k.startswith(p + "?") for p in paths):
+                e.t = min(e.t, now - e.fresh)
+    _WAKE.set()
+
+
+def _touch():
+    now = time.time()
+    if now - _WATCH["t"] > WATCH_S:
+        _WATCH["start"] = now
+        _WATCH["t"] = now
+        _WAKE.set()
+    else:
+        _WATCH["t"] = now
+
+
+def _refresher():
+    """Keep what is being watched warm; sleep on an Event when nothing is."""
+    _REFRESHER["on"] = True
+    while True:
+        try:
+            if time.time() - _WATCH["t"] > WATCH_S:
+                _WAKE.wait()
+                _WAKE.clear()
+                continue
+            _WAKE.wait(TICK_S)
+            _WAKE.clear()
+            now = time.time()
+            with _HOT_LOCK:
+                due = sorted((e for e in _HOT.values()
+                              if e.busy is None and now - e.asked < WATCH_S
+                              and now - e.t >= e.fresh - TICK_S),
+                             key=lambda e: (e.prio, e.t))
+                for k in [k for k, e in _HOT.items()
+                          if now - max(e.asked, e.built) > 3 * WATCH_S and e.busy is None]:
+                    del _HOT[k]                      # a variant nobody asks for any more
+            for e in due:
+                with _HOT_LOCK:
+                    if e.busy is not None:
+                        continue
+                    ev = e.busy = threading.Event()
+                _hot_build(e, ev)
+            # the catalog's cold sweep: hourly, only while watched, never in the first
+            # half-minute of a visit (that is when the page itself is loading)
+            if (not due and time.time() - _SWEEP["t"] > SWEEP_EVERY
+                    and time.time() - _WATCH["start"] > 30):
+                _catalog_sweep()
+            _REFRESHER["last"] = int(time.time())
+        except Exception as x:
+            print(f"[dashboard] refresher: {type(x).__name__}: {x}", flush=True)
+            time.sleep(TICK_S)
+
+
+def hot_state():
+    """GET /api/hot: what the hot cache holds and whether the refresher is awake — the answer
+    to "what is being kept up to date right now, and how often". Reading it does not count as
+    watching."""
+    now = time.time()
+    with _HOT_LOCK:
+        rows = [{"key": k, "age_s": round(now - e.built, 1) if e.built else None,
+                 "fresh_s": e.fresh, "stale_s": e.stale, "build_ms": e.ms,
+                 "asked_s_ago": round(now - e.asked, 1) if e.asked else None,
+                 "kept_warm": bool(e.asked) and now - e.asked < WATCH_S,
+                 "bytes": len(e.body or b""), "gzip_bytes": len(e.gz) if e.gz else None}
+                for k, e in sorted(_HOT.items(), key=lambda kv: kv[1].prio)]
+    watched = now - _WATCH["t"] < WATCH_S
+    return {"generated_at": int(now), "watched": watched,
+            "last_request_s_ago": round(now - _WATCH["t"], 1) if _WATCH["t"] else None,
+            "watch_window_s": WATCH_S, "refresher": dict(_REFRESHER), "entries": rows,
+            "catalog_sweep": {"at": int(_SWEEP["t"]) or None, "ms": _SWEEP["ms"],
+                              "every_s": SWEEP_EVERY},
+            "slow_probes": {k: int(v[0]) for k, v in list(_slow.items())}}
+
+
+def system_snapshot(max_age=300):
+    """The newest system_stats() either overview build made, or None — for modules that want
+    the box's numbers without paying for them (tt_now's OS-update facts)."""
+    best = None
+    for key in ("/api/overview?lite=1", "/api/overview"):
+        e = _HOT.get(key)
+        if e and isinstance(e.data, dict) and e.data.get("system") and \
+                time.time() - e.built < max_age and (best is None or e.built > best[0]):
+            best = (e.built, e.data["system"])
+    return best[1] if best else None
 
 
 def overview():
-    """Stale-while-revalidate: the page never waits on a rebuild it did not need.
+    """The full overview payload, from the hot cache (stale-while-revalidate).
 
-    The old cache was 8s against a 15s page refresh, so *every* refresh was a miss and
-    every miss paid the full build — which had grown to ~13s. The browser gave up before
-    the response landed (BrokenPipeError in _server.log) and the dashboard looked
-    permanently mid-load. Now a warm entry is returned immediately and a rebuild runs on
-    one background thread; only a cold or genuinely stale cache blocks the caller.
-    """
-    now = time.time()
-    with _cache["lock"]:
-        data, age = _cache["data"], now - _cache["t"]
-        if data and age < OVERVIEW_FRESH:
-            return data
-        if data and age < OVERVIEW_STALE:
-            spawn = not _cache.get("building")
-            if spawn:
-                _cache["building"] = True
-        else:
-            spawn = None            # cold/too stale — build inline, caller waits
-    if spawn is None:
-        with _cache["lock"]:
-            _cache["building"] = True
-        _overview_refresh()
-        with _cache["lock"]:
-            if _cache["data"]:
-                return _cache["data"]
-        return _overview_build()     # nothing cached and the rebuild failed: surface it
-    if spawn:
-        threading.Thread(target=_overview_refresh, daemon=True).start()
-    return data
+    History: the old cache was 8s against a 15s page refresh, so *every* refresh was a miss
+    and every miss paid the full build — which had grown to ~13s. Then SWR with one
+    background rebuild per stale poll (2026-09); since 2026-09-24 the refresher keeps it warm
+    while someone watches and cold callers share one build."""
+    return _hot("/api/overview", _overview_build, *HOT_ROUTES["/api/overview"]).data
+
+
+def overview_lite():
+    return _hot("/api/overview?lite=1", _overview_lite_build,
+                *HOT_ROUTES["/api/overview?lite=1"]).data
 
 
 # The timetable modules (tt_*.py): the Now / Fleet / Compute / System views. Imported on
@@ -2059,236 +2803,617 @@ def overview():
 # function taking the query dict and returning JSON-able data; a failure comes back as
 # {"error": ...} so a panel says why it is empty instead of silently drawing nothing.
 TT_ROUTES = {
-    "/api/timeline": ("tt_now", "timeline"),
-    "/api/status":   ("tt_now", "status"),
-    "/api/fleet":    ("tt_fleet", "fleet"),
-    "/api/heat":     ("tt_fleet", "heat"),
-    "/api/system":   ("tt_system", "system_view"),
-    "/api/sessions": ("tt_sessions", "sessions"),
+    "/api/timeline":  ("tt_now", "timeline"),
+    "/api/status":    ("tt_now", "status"),
+    "/api/fleet":     ("tt_fleet", "fleet"),
+    "/api/heat":      ("tt_fleet", "heat"),
+    "/api/upkeep":    ("tt_fleet", "upkeep"),       # "what is maintaining this?" (v2.1)
+    "/api/system":    ("tt_system", "system_view"),
+    "/api/sessions":  ("tt_sessions", "sessions"),
+    "/api/flow":      ("tt_flow", "flow"),          # who hands work to whom (v2.1)
+    "/api/decisions": ("tt_decide", "state"),       # David's answers to Needs attention (v2.1)
+    "/api/live":      ("tt_live", "live"),          # what runs now, and what it touches (v2.2)
+}
+# Routes that never enter the hot cache (v2.2, 2026-09-24). /api/live is a now-view the page
+# polls every 3 s while something runs: its module keeps its own 2 s cache over incremental file
+# tails (a build is ~1 ms warm), so it goes straight through like a `since=` cursor. As a hot
+# entry the refresher would rebuild it on every 2 s tick for as long as anyone had asked in the
+# last ten minutes, and every `since=` value would be a new key. A request for it still counts
+# as someone watching (_touch): the page it feeds is open.
+DIRECT_ROUTES = {"/api/live"}
+# POSTs into tt modules go through the same loader, so an edit to tt_decide.py is live on the
+# next click without a restart. Body in, {ok, msg, ...} out; HTTP 200 either way.
+TT_POSTS = {
+    "/api/decisions":      ("tt_decide", "answer"),
+    "/api/decisions/undo": ("tt_decide", "undo"),
 }
 _TT_MODS = {}
+_TT_LOCK = threading.Lock()
 
 
-def _tt_call(path):
+def _tt_fn(mod_name, fn_name):
     import importlib
-    from urllib.parse import urlparse, parse_qs
-    u = urlparse(path)
-    mod_name, fn_name = TT_ROUTES[u.path]
-    q = {k: v[0] for k, v in parse_qs(u.query).items()}
-    try:
-        f = os.path.join(BASE, mod_name + ".py")
-        mt = os.path.getmtime(f)
+    f = os.path.join(BASE, mod_name + ".py")
+    if not os.path.exists(f):
+        raise LookupError(f"{mod_name}.py is not there yet")
+    mt = os.path.getmtime(f)
+    with _TT_LOCK:                      # the refresher and a request must not reload at once
         m, seen = _TT_MODS.get(mod_name, (None, 0))
         if m is None:
             m = importlib.import_module(mod_name)
         elif mt != seen:
             m = importlib.reload(m)
         _TT_MODS[mod_name] = (m, mt)
-        return getattr(m, fn_name)(q)
+    return getattr(m, fn_name)
+
+
+def _tt_call(path, strict=False):
+    """strict=True (the hot cache's builds) lets a failure raise, so _hot_build keeps the last
+    good payload instead of caching {"error"} over it — a half-saved tt module edit used to
+    blank its panel until the next rebuild. A direct call answers {"error"} as it always did."""
+    from urllib.parse import urlparse, parse_qs
+    u = urlparse(path)
+    mod_name, fn_name = TT_ROUTES[u.path]
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    try:
+        return _tt_fn(mod_name, fn_name)(q)
     except Exception as e:
+        if strict:
+            raise
         return {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
+def _tt_post(path, body):
+    mod_name, fn_name = TT_POSTS[path]
+    try:
+        r = _tt_fn(mod_name, fn_name)(body)
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:200]}"
+        return {"ok": False, "msg": err, "error": err}
+    return r if isinstance(r, dict) else {"ok": False, "msg": "no answer"}
+
+
+def _usage_build():
+    import usage as usage_mod
+    data = usage_mod.usage()
+    # The local tier is the other half of the same question — what the box spent,
+    # and what it did NOT spend. Same payload so the tab renders in one fetch.
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import localusage
+        data["local"] = {"daily": localusage.daily(30),
+                         "summary": localusage.summarize(days=30),
+                         "pricing": localusage.pricing()["models"]}
+    except Exception as e:
+        data["local"] = {"error": str(e)[:120]}
+    return data
+
+
+def _hot_spec(path):
+    """(cache key, (fresh, stale, prio), build) for a hot route, or None to call it directly.
+    The key is the path plus its sorted query, so equivalent URLs share one entry. `fresh=1`
+    (an explicit rebuild) and `since=` (a cursor, a new key every call) go straight through."""
+    from urllib.parse import urlparse, parse_qsl, urlencode
+    u = urlparse(path)
+    q = sorted(parse_qsl(u.query))
+    if u.path in DIRECT_ROUTES or any(k in ("fresh", "since") for k, _ in q):
+        return None
+    if u.path == "/api/overview":
+        lite = dict(q).get("lite") in ("1", "true")
+        key = "/api/overview?lite=1" if lite else "/api/overview"
+        return key, HOT_ROUTES[key], (_overview_lite_build if lite else _overview_build)
+    if u.path not in HOT_ROUTES:
+        return None
+    key = u.path + ("?" + urlencode(q) if q else "")
+    if u.path in TT_ROUTES:
+        return key, HOT_ROUTES[u.path], functools.partial(_tt_call, key, strict=True)
+    build = {"/api/notifications": notifications, "/api/usage": _usage_build}[u.path]
+    return key, HOT_ROUTES[u.path], build
+
+
+def relogin_status():
+    """What `claude-relogin.py status` prints — its state file, or idle — read here instead of
+    spawning Python on every poll (the page polls it every 5-20 s while a re-auth runs)."""
+    try:
+        with open(f"{HOME}/maintenance/state/relogin.json") as f:
+            return json.load(f)
+    except Exception:
+        return {"phase": "idle"}
+
+
+_PY = sys.executable or "python3"        # empty when launched under `exec -a` (test copies)
+_GZ = {}                                 # etag -> gzipped body, for the big once-a-day payloads
+
+
+def _gz_for(etag, body):
+    hit = _GZ.get(etag)
+    if hit is None:
+        hit = _gzip(body)
+        if len(_GZ) > 24:
+            _GZ.clear()
+        _GZ[etag] = hit
+    return hit
+
+
+_PAGE = {}
+
+
+def _page(p):
+    """(body, etag) for a served page: the file with its build id stamped and the catalog
+    summary inlined, rebuilt only when the file, its build id or the catalog changed.
+
+    The catalog SUMMARY ships inside the page. It is ~20 kB, the server already has it, and
+    inlining it means the tab draws with no request at all — so it cannot sit on "Loading…"
+    because a fetch was slow, blocked by an extension, or answered by a server the page no
+    longer agrees with. Drill-downs still fetch; those are the part that is actually big."""
+    try:
+        cv = catalog_view()
+    except Exception as e:
+        cv = {"error": str(e)[:160]}
+    s, bid = _sig(p), _build_id()
+    hit = _PAGE.get(p)
+    if hit and hit[0] == s and hit[1] is cv and hit[2] == bid:
+        return hit[3], hit[4]
+    html = open(p, "rb").read().replace(b"__BUILD__", bid.encode())
+    boot = json.dumps(cv).replace("</", "<\\/")
+    body = html.replace(b"/*__CATALOG__*/null", boot.encode())
+    _PAGE[p] = (s, cv, bid, body, _etag(body))
+    return body, _PAGE[p][4]
+
+
+MAX_POST = 64 * 1024
+# Who may POST: loopback and Tailscale's 100.64.0.0/10 — the Stocks dashboard's list
+# (~/Stocks/_engine/dashboard/app.py `_ALLOWED_NETS`), read, not imported.
+_POST_NETS = [ipaddress.ip_network(n) for n in ("127.0.0.0/8", "100.64.0.0/10", "::1/128",
+                                                 "fd7a:115c:a1e0::/48")]   # Tailscale's IPv6 range
+
+
+def _peer_ok(addr):
+    try:
+        ip = ipaddress.ip_address(str(addr).split("%")[0])
+    except ValueError:
+        return False
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return any(ip in n for n in _POST_NETS)
+
+
+# Names this dashboard answers to (2026-09-24). A DNS-rebinding page reaches the server from
+# David's own browser (a tailnet peer) with its OWN name in Host and a matching Origin, so the
+# peer and Origin rules both pass it; only the Host can tell. Ours: loopback, the box's
+# hostname, its tailnet name (short and full) and tailnet IPs, and `spark`. An IP literal is ours
+# only if it is loopback or tailnet. A refusal is logged to _server.log, so a name David uses
+# that is missing here shows up as a line there instead of a mystery.
+_HOSTS = None
+_HOSTS_AT = 0.0
+HOSTS_RETRY_S = 60
+
+
+def _host_names():
+    names = {"localhost", "127.0.0.1", "::1", "spark", socket.gethostname().lower()}
+    try:
+        me = json.loads(subprocess.run(["tailscale", "status", "--self", "--json"], capture_output=True,
+                                       text=True, timeout=5).stdout or "{}").get("Self") or {}
+        dns = (me.get("DNSName") or "").rstrip(".").lower()
+        if dns:
+            names |= {dns, dns.split(".")[0]}
+        names |= {str(ip).lower() for ip in me.get("TailscaleIPs") or []}
+    except Exception:
+        pass
+    return names
+
+
+def _host_ok(host):
+    """Resolved on first use and cached. A name that is not in the cache re-resolves it once,
+    at most every HOSTS_RETRY_S (fix round 2026-09-24): the first use is usually healthcheck's
+    `localhost` right after the @reboot start, and if tailscaled was not answering yet the full
+    tailnet name stayed refused (403) until the next restart."""
+    global _HOSTS, _HOSTS_AT
+    h = (host or "").strip().lower()
+    if h.startswith("["):
+        h = h[1:].split("]", 1)[0]
+    elif h.count(":") == 1:
+        h = h.rsplit(":", 1)[0]
+    if not h:
+        return False
+    try:
+        ipaddress.ip_address(h)
+        return _peer_ok(h)
+    except ValueError:
+        pass
+    if _HOSTS is None or (h not in _HOSTS and time.time() - _HOSTS_AT >= HOSTS_RETRY_S):
+        _HOSTS, _HOSTS_AT = _host_names(), time.time()
+    return h in _HOSTS
+
+
 class H(BaseHTTPRequestHandler):
+    # HTTP/1.1: the page's six requests share connections instead of opening one each (every
+    # response already carries Content-Length). An idle kept-alive socket is closed after
+    # `timeout` seconds so it does not hold a thread forever.
+    protocol_version = "HTTP/1.1"
+    timeout = 60
+    # TCP_NODELAY (2026-09-24, frontend F0): headers and body leave in two writes, and on a
+    # kept-alive socket Nagle holds the body until the client ACKs the headers — which Linux delays
+    # ~40 ms. Measured with curl on one connection: the 2nd request took 42 ms against 1 ms for the
+    # 1st; in Chromium every API call on a reused socket finished 40-90 ms after its first byte.
+    disable_nagle_algorithm = True
+
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype, cache="no-store"):
+    def _send(self, code, body, ctype, cache="no-store", etag=None, gz=None):
         # Gzip anything worth gzipping. These payloads are JSON read over the tailnet from
         # a phone; the overview compresses about 8:1, and http.server does none of this for
-        # us. Below ~1KB the header costs more than the saving.
+        # us. Below ~1KB the header costs more than the saving. A body with an ETag is
+        # compressed once per version (hot entries on their builder's thread, the rest in
+        # _GZ), never per request.
+        if etag and self._not_modified(etag):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache)
+            self.end_headers()
+            self._sent = True
+            return
         enc = None
-        if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+        big = len(body) > 1024
+        if big and "gzip" in (self.headers.get("Accept-Encoding") or ""):
             try:
-                import gzip as _gz
-                body, enc = _gz.compress(body, 6), "gzip"
+                z = gz if gz is not None else (_gz_for(etag, body) if etag else _gzip(body))
+                if z is not None:
+                    body, enc = z, "gzip"
             except Exception:
                 enc = None
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", cache)
+        if etag:
+            self.send_header("ETag", etag)
+        if big:
+            self.send_header("Vary", "Accept-Encoding")
         if enc:
             self.send_header("Content-Encoding", enc)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self._sent = True
+        if getattr(self, "_head", False):
+            return
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
-            pass   # the browser navigated away mid-response; not an error worth a traceback
+            self.close_connection = True   # the browser navigated away mid-response
+
+    def _not_modified(self, etag):
+        inm = self.headers.get("If-None-Match")
+        if not inm:
+            return False
+        tags = [t.strip() for t in inm.split(",")]
+        weak = etag[2:] if etag.startswith("W/") else etag
+        return "*" in tags or any((t[2:] if t.startswith("W/") else t) == weak for t in tags)
+
+    def _json(self, obj, code=200, cache="no-store", etag=False):
+        body = json.dumps(obj).encode()
+        self._send(code, body, "application/json", cache=cache,
+                   etag=_etag(body) if etag else None)
+
+    def _daily(self, obj):
+        """A payload that changes about once a day (catalog, diagrams, reports, the janitor's
+        findings): sent with an ETag and `no-cache` — the browser may keep it but must ask
+        first, and gets a 304 with no body when nothing changed."""
+        self._json(obj, cache="no-cache", etag=True)
+
+    def do_HEAD(self):
+        self._head = True
+        self._serve()
 
     def do_GET(self):
-        if self.path.startswith("/api/overview"):
-            self._send(200, json.dumps(overview()).encode(), "application/json")
-        elif self.path.startswith("/api/notifications"):
-            # Split off /api/overview 2026-09-20: 500 notification rows are 139KB of a
-            # 211KB payload, and the feed shows ten at a time. The page pulls this on its
-            # own slower cadence instead of shipping the whole history every 15 seconds.
-            self._send(200, json.dumps(notifications()).encode(), "application/json")
-        elif self.path.startswith("/api/memos"):
-            self._send(200, json.dumps(memos()).encode(), "application/json")
-        elif self.path.startswith("/api/catalog/origin"):
+        self._head = False            # one handler serves every request on a kept-alive socket
+        self._serve()
+
+    def _refuse_any(self):
+        """None if this request may go on; else (status, reason). Every method: the peer must be
+        this box or the tailnet (box rule 5 — the server binds 0.0.0.0 and the Spark also sits on
+        a home LAN and two docker bridges), and the Host must be one of this box's names (a
+        DNS-rebinding page carries its own). Before 2026-09-24 GETs were readable from the LAN."""
+        if not _peer_ok((getattr(self, "client_address", None) or ("",))[0]):
+            return 403, "only from this box or the tailnet"
+        if not _host_ok(self.headers.get("Host")):
+            print(f"[dashboard] refused Host {str(self.headers.get('Host'))[:80]!r} from "
+                  f"{(getattr(self, 'client_address', None) or ('?',))[0]}", flush=True)
+            return 403, "unknown host name"
+        return None
+
+    def _serve(self):
+        self._sent = False
+        bad = self._refuse_any()
+        if bad:
+            self._send(bad[0], bad[1].encode(), "text/plain")
+            return
+        try:
+            self._get()
+        except Exception as x:
+            print(f"[dashboard] GET {self.path[:120]}: {type(x).__name__}: {x}", flush=True)
+            if not self._sent:
+                self._json({"error": f"{type(x).__name__}: {str(x)[:200]}"}, code=500)
+            else:
+                self.close_connection = True
+
+    def _get(self):
+        path = self.path
+        if path == "/api/hot":
+            self._json(hot_state())
+            return
+        if path.startswith("/api/"):
+            _touch()
+        spec = _hot_spec(path) if path.startswith("/api/") else None
+        if spec:
+            key, (fresh, stale, prio), build = spec
+            e = _hot(key, build, fresh, stale, prio)
+            with _HOT_LOCK:                 # body, ETag and gzip of ONE version, never mixed
+                data, body, etag, gz = e.data, e.body, e.etag, e.gz
+            if data is None:
+                self._json({"error": "still building — try again in a moment"}, code=503)
+            else:
+                self._send(200, body, "application/json", etag=etag, gz=gz)
+        elif path.split("?")[0] in TT_ROUTES:        # fresh=1 / since=: straight through
+            self._json(_tt_call(path))
+        elif path.startswith("/api/overview"):        # unreachable: _hot_spec covers it
+            self._json(overview())
+        elif path.startswith("/api/memos"):
+            self._json(memos())
+        elif path.startswith("/api/catalog/origin"):
             from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(catalog_origin((q.get("o") or ["internal"])[0])).encode(),
-                       "application/json")
-        elif self.path == "/api/catalog/sources":
-            self._send(200, json.dumps(catalog_sources()).encode(), "application/json")
-        elif self.path.startswith("/api/catalog/project"):
+            q = parse_qs(urlparse(path).query)
+            self._daily(catalog_origin((q.get("o") or ["internal"])[0]))
+        elif path == "/api/catalog/sources":
+            self._daily(catalog_sources())
+        elif path.startswith("/api/catalog/project"):
             from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(catalog_project((q.get("p") or [""])[0])).encode(),
-                       "application/json")
-        elif self.path == "/api/catalog":
-            self._send(200, json.dumps(catalog_view()).encode(), "application/json")
-        elif self.path == "/api/backoffice":
-            self._send(200, json.dumps(backoffice()).encode(), "application/json")
-        elif self.path == "/api/reports":
-            self._send(200, json.dumps({"reports": reports(), "attention": attention()}).encode(), "application/json")
-        elif self.path.startswith("/api/bus"):
-            self._send(200, json.dumps(bus()).encode(), "application/json")
-        elif self.path.startswith("/api/dailylog"):
+            q = parse_qs(urlparse(path).query)
+            self._daily(catalog_project((q.get("p") or [""])[0]))
+        elif path == "/api/catalog":
+            self._daily(catalog_view())
+        elif path == "/api/backoffice":
+            self._daily(backoffice())
+        elif path == "/api/reports":
+            self._daily({"reports": reports(), "attention": attention()})
+        elif path.startswith("/api/bus"):
+            self._json(bus())
+        elif path.startswith("/api/dailylog"):
             # ?n=N: the newest N days only. The Now view wants yesterday's one line, not the
             # 395 KB month (30 days x 76 jobs) the archive reads.
             from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
+            q = parse_qs(urlparse(path).query)
             days = dailylog()
             try:
                 n = int((q.get("n") or ["0"])[0])
             except ValueError:
                 n = 0
-            self._send(200, json.dumps(days[:n][::-1] if n > 0 else days).encode(), "application/json")
-        elif self.path.startswith("/api/usage"):
-            import usage as usage_mod
-            data = usage_mod.usage()
-            # The local tier is the other half of the same question — what the box spent,
-            # and what it did NOT spend. Same payload so the tab renders in one fetch.
-            try:
-                sys.path.insert(0, f"{HOME}/maintenance/bin")
-                import localusage
-                data["local"] = {"daily": localusage.daily(30),
-                                 "summary": localusage.summarize(days=30),
-                                 "pricing": localusage.pricing()["models"]}
-            except Exception as e:
-                data["local"] = {"error": str(e)[:120]}
-            self._send(200, json.dumps(data).encode(), "application/json")
-        elif self.path.startswith("/api/architecture"):
-            self._send(200, json.dumps(architecture()).encode(), "application/json")
-        elif self.path == "/api/relogin":
-            r = subprocess.run([sys.executable, f"{HOME}/maintenance/bin/claude-relogin.py",
-                                "status"], capture_output=True, text=True, timeout=15)
-            self._send(200, (r.stdout.strip() or "{}").encode(), "application/json")
-        elif self.path.startswith("/api/claude/file"):
+            self._daily(days[:n][::-1] if n > 0 else days)
+        elif path.startswith("/api/architecture"):
+            self._daily(architecture())
+        elif path == "/api/relogin":
+            self._json(relogin_status())
+        elif path.startswith("/api/claude/file"):
             import claudecfg
             from urllib.parse import urlparse, parse_qs, unquote
-            q = parse_qs(urlparse(self.path).query)
+            q = parse_qs(urlparse(path).query)
             p = unquote((q.get("p") or [""])[0])
-            self._send(200, json.dumps(claudecfg.read_file(p)).encode(), "application/json")
-        elif self.path.startswith("/api/claude"):
+            self._json(claudecfg.read_file(p))
+        elif path.startswith("/api/claude"):
             import claudecfg
-            self._send(200, json.dumps(claudecfg.claude()).encode(), "application/json")
-        elif re.match(r"^/vendor/[\w.-]+\.(js|woff2)$", self.path):
+            self._json(claudecfg.claude())
+        elif re.match(r"^/vendor/[\w.-]+\.(js|woff2)$", path):
             # Vendor files are immutable-cached for a week: a changed file needs a NEW name.
-            p = os.path.join(BASE, "vendor", os.path.basename(self.path))
+            p = os.path.join(BASE, "vendor", os.path.basename(path))
             ctype = "font/woff2" if p.endswith(".woff2") else "application/javascript"
             if os.path.exists(p):
                 self._send(200, open(p, "rb").read(), ctype,
                            cache="public, max-age=604800, immutable")
             else:
                 self._send(404, b"not found", "text/plain")
-        elif self.path.split("?")[0] in TT_ROUTES:
-            self._send(200, json.dumps(_tt_call(self.path)).encode(), "application/json")
-        elif self.path in ("/", "/index.html") or re.match(r"^/next(/[\w-]+)?/?$", self.path):
+        elif path in ("/", "/index.html") or re.match(r"^/next(/[\w-]+)?/?$", path):
             # Stamp the page with the build it was served from. A tab left open across a
             # deploy keeps polling happily — the header clock stays live — while its
             # JavaScript is hours old, and the first symptom is a panel that quietly does
             # nothing. With this the page can say "I am older than the server" instead.
             # /next[/name] serves dashboard/next/<name>.html the same way: a preview of a
             # page being built, so the live one is never the half-written one.
-            m = re.match(r"^/next(?:/([\w-]+))?/?$", self.path)
+            # `no-cache` + ETag: the browser keeps the page but asks every time, so an edit to
+            # index.html (edited live) is served on the very next load and an unchanged page
+            # is a 304 with no body.
+            m = re.match(r"^/next(?:/([\w-]+))?/?$", path)
             p = (os.path.join(BASE, "next", (m.group(1) or "index") + ".html") if m
                  else os.path.join(BASE, "index.html"))
             if not os.path.exists(p):
                 self._send(404, b"not found", "text/plain")
                 return
-            html = open(p, "rb").read().replace(b"__BUILD__", _build_id().encode())
-            # The catalog SUMMARY ships inside the page. It is ~10 kB, the server already
-            # has it, and inlining it means the tab draws with no request at all — so it
-            # cannot sit on "Loading…" because a fetch was slow, blocked by an extension,
-            # or answered by a server the page no longer agrees with. Drill-downs still
-            # fetch; those are the part that is actually big.
-            try:
-                boot = json.dumps(catalog_view()).replace("</", "<\\/")
-            except Exception as e:
-                boot = json.dumps({"error": str(e)[:160]})
-            html = html.replace(b"/*__CATALOG__*/null", boot.encode())
-            self._send(200, html, "text/html; charset=utf-8")
+            body, etag = _page(p)
+            self._send(200, body, "text/html; charset=utf-8", cache="no-cache", etag=etag)
         else:
             self._send(404, b"not found", "text/plain")
 
+    def _refuse_post(self):
+        """None if this POST may go on; else (status, reason).
+
+        Every POST here acts: it runs an OS update, starts a Claude session with
+        --dangerously-skip-permissions, writes a memo, or (v2.1) records a decision whose
+        note ends up in a Claude prompt. Before 2026-09-24 any web page open in David's
+        browser could send one (a text/plain POST needs no CORS preflight). The Stocks
+        dashboard's rule (_engine/dashboard/app.py `_net_guard`): a browser sends Origin /
+        Sec-Fetch-Site on every cross-site POST, so a mismatch is refused; curl from the box
+        sends neither and passes. Plus: a body must be JSON (a form or text/plain post is
+        what a cross-site page can send without asking) and small. A bodiless POST (the
+        re-auth start/cancel buttons) has nothing to parse and needs no Content-Type.
+
+        And the first half of that same Stocks guard: the peer must be this box or the tailnet
+        (added in review, 2026-09-24). The server binds 0.0.0.0 and the Spark also sits on a
+        home Wi-Fi LAN (192.168.1.x) and two docker bridges; the Origin rule only stops a
+        BROWSER, so any device on that LAN could curl /api/bus/dispatch and start Claude
+        with --dangerously-skip-permissions. Box rule 5: tailnet or localhost only."""
+        bad = self._refuse_any()
+        if bad:
+            return bad
+        host = (self.headers.get("Host") or "").strip().lower()
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            o = origin.strip().lower()
+            if o == "null" or o.split("//", 1)[-1].rstrip("/") != host:
+                return 403, "cross-origin request refused"
+        sfs = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if sfs and sfs not in ("same-origin", "none"):
+            return 403, "cross-site request refused"
+        if self.headers.get("Transfer-Encoding"):
+            return 411, "send a Content-Length"
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return 400, "bad Content-Length"
+        if n < 0:
+            return 400, "bad Content-Length"
+        if n > MAX_POST:
+            return 413, f"body over {MAX_POST // 1024} KB"
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if n and ctype != "application/json":
+            return 415, "send application/json"
+        return None
+
     def _body(self):
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            return json.loads(self.rfile.read(n).decode()) if n else {}
+            return json.loads(self._raw.decode()) if self._raw else {}
         except Exception:
             return {}
 
+    def _via(self):
+        """Where a POST came from, as this server saw it (fix round 2026-09-24). tt_decide stores
+        it on David's answer, and memo-process / the daily check act on a free-text answer only
+        when `page` is true. A browser sends Origin on every POST, same-origin included, even over
+        plain http (Sec-Fetch-Site is sent only to https or localhost, so on the tailnet IP it is
+        absent); _refuse_post has already refused a foreign one. curl sends neither by default.
+        Defence in depth, not authentication: any local process can forge both headers."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        sfs = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        page = bool(origin and host and origin.split("//", 1)[-1].rstrip("/") == host) or sfs == "same-origin"
+        return {"page": page, "peer": str((getattr(self, "client_address", None) or ("",))[0])[:64],
+                "ua": (self.headers.get("User-Agent") or "")[:60]}
+
     def do_POST(self):
-        m = re.match(r"^/api/experiments/([a-z0-9-]+)/run$", self.path)
+        # _head too: after a HEAD on this kept-alive socket it was still True, so the POST's
+        # headers went out with a Content-Length and no body, and the client hung
+        self._head, self._sent, self._raw = False, False, b""
+        bad = self._refuse_post()
+        if bad:
+            self.close_connection = True        # its body was never read
+            self._json({"ok": False, "msg": bad[1]}, code=bad[0])
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        self._raw = self.rfile.read(n) if n else b""
+        try:
+            self._post()
+        except Exception as x:
+            print(f"[dashboard] POST {self.path[:120]}: {type(x).__name__}: {x}", flush=True)
+            if not self._sent:
+                self._json({"ok": False, "msg": f"{type(x).__name__}: {str(x)[:200]}"}, code=500)
+            else:
+                self.close_connection = True
+
+    def _post(self):
+        path = self.path.split("?")[0]
+        m = re.match(r"^/api/experiments/([a-z0-9-]+)/run$", path)
+        if path in TT_POSTS:
+            body = self._body()
+            if isinstance(body, dict):
+                # the request's own facts; a `_via` the client sent is dropped, never trusted
+                body = dict(body, _via=self._via())
+            r = _tt_post(path, body)
+            if r.get("ok"):
+                # an answered item must never be served as still open: the next status read
+                # waits for the rebuild (tt_decide has already dropped tt_now's own cache)
+                _hot_invalidate("/api/status", "/api/decisions", "/api/timeline")
+            self._json(r)
+            return
         if m:
-            self._send(200, json.dumps(run_experiment(m.group(1))).encode(), "application/json")
-        elif self.path == "/api/system/update":
-            self._send(200, json.dumps(run_update()).encode(), "application/json")
-        elif self.path == "/api/bus/send":
+            r = run_experiment(m.group(1))
+        elif path == "/api/system/update":
+            r = run_update()
+        elif path == "/api/bus/send":
             d = self._body()
-            self._send(200, json.dumps(bus_send(d.get("target", ""), d.get("title", ""),
-                                                d.get("body", ""), bool(d.get("launch")))).encode(),
-                       "application/json")
-        elif self.path == "/api/bus/dispatch":
+            r = bus_send(d.get("target", ""), d.get("title", ""), d.get("body", ""),
+                         bool(d.get("launch")))
+        elif path == "/api/bus/dispatch":
             d = self._body()
-            self._send(200, json.dumps(bus_dispatch(d.get("target", ""), d.get("title", ""),
-                                                    d.get("body", ""), d.get("source_file", ""),
-                                                    bool(d.get("interactive", True)))).encode(),
-                       "application/json")
-        elif self.path in ("/api/relogin/start", "/api/relogin/cancel"):
-            act = self.path.rsplit("/", 1)[1]
-            r = subprocess.run([sys.executable, f"{HOME}/maintenance/bin/claude-relogin.py",
-                                act], capture_output=True, text=True, timeout=60)
-            self._send(200, (r.stdout.strip() or "{}").encode(), "application/json")
-        elif self.path == "/api/relogin/code":
+            r = bus_dispatch(d.get("target", ""), d.get("title", ""), d.get("body", ""),
+                             d.get("source_file", ""), bool(d.get("interactive", True)))
+        elif path in ("/api/relogin/start", "/api/relogin/cancel"):
+            act = path.rsplit("/", 1)[1]
+            out = subprocess.run([_PY, f"{HOME}/maintenance/bin/claude-relogin.py", act],
+                                 capture_output=True, text=True, timeout=60)
+            self._send(200, (out.stdout.strip() or "{}").encode(), "application/json")
+            _hot_invalidate("/api/status")
+            return
+        elif path == "/api/relogin/code":
             d = self._body()
             code = str(d.get("code", "")).strip()
             if not re.fullmatch(r"[\w#%-]{8,600}", code):
-                self._send(200, b'{"ok": false, "msg": "that does not look like a code"}',
-                           "application/json")
+                r = {"ok": False, "msg": "that does not look like a code"}
             else:
                 cf = f"{HOME}/maintenance/state/relogin_code.txt"
                 with open(cf, "w") as fh:
                     fh.write(code)
                 os.chmod(cf, 0o600)
-                self._send(200, b'{"ok": true, "msg": "code handed to the login flow - '
-                                b'watch for the confirmation push"}', "application/json")
-        elif self.path == "/api/bus/ignore":
+                r = {"ok": True, "msg": "code handed to the login flow - watch for the "
+                                        "confirmation push"}
+        elif path == "/api/bus/ignore":
             d = self._body()
-            self._send(200, json.dumps(bus_ignore(d.get("slug", ""))).encode(), "application/json")
-        elif self.path == "/api/bus/process":
+            r = bus_ignore(d.get("slug", ""))
+        elif path == "/api/bus/process":
             d = self._body()
             t = d.get("target", "")
-            r = bus_process(t) if t in BUS_PROJECTS else {"ok": False, "msg": "unknown project"}
-            self._send(200, json.dumps(r).encode(), "application/json")
+            r = bus_process(t) if t in bus_projects() else {"ok": False, "msg": "unknown project"}
         else:
             self._send(404, b"not found", "text/plain")
+            return
+        # what a click changes shows on the next read: memos waiting on David, an update
+        # running, an experiment's status
+        _hot_invalidate("/api/status", "/api/overview", "/api/timeline")
+        self._json(r)
 
 
 def _warm():
-    """Build the overview and poll ntfy once before anyone asks.
+    """Build what the first page asks for before anyone asks, one at a time, status first.
 
     Everything after the first request is served from cache, so without this the one
     person who opens the dashboard after a restart pays the entire cold build — which is
-    exactly the load David would notice. Backgrounded so a slow ntfy cannot delay the
-    port coming up.
+    exactly the load David would notice. In series on one thread: in parallel the builds only
+    fight over the GIL, and the status card waits for all of them. A page that arrives mid-way
+    waits for the build in flight instead of starting its own. The slow probes (apt, ntfy,
+    nvidia-smi -q) start on their own threads so a slow network cannot delay any of it.
     """
-    for fn in (overview, notifications):
-        threading.Thread(target=lambda f=fn: _quiet(f), daemon=True).start()
+    _slow_bg("apt", 3600, _apt_updates, None)
+    _slow_bg("apt_applicable", 3600, _apt_applicable, None)
+    # fleet before the overviews: their job counts come from its roster when it has one, and
+    # a count that switches source a minute after a restart would read as a change
+    for path in ("/api/status", "/api/decisions", "/api/fleet?days=7", "/api/overview?lite=1",
+                 "/api/timeline", "/api/sessions", "/api/system", "/api/overview",
+                 "/api/notifications", "/api/flow?view=edges", "/api/heat?days=30"):
+        try:
+            key, (fresh, stale, prio), build = _hot_spec(path)
+            _hot(key, build, fresh, stale, prio, ask=False)   # warm, but not "watched"
+        except Exception as x:
+            print(f"[dashboard] warm {path}: {type(x).__name__}: {x}", flush=True)
+        if path.startswith("/api/fleet"):
+            # Integration 2026-09-24: status and decisions are warmed before the roster (the
+            # status card comes first), and a page that lands in the first second can get a
+            # lite overview or timeline built before it too — kind counts from the server's
+            # rule (23 claude / 11 local against the fleet's 20 / 19) and the account sync as
+            # the next Claude job. Everything built so far is re-built on the next tick, now
+            # that tt_fleet has a roster; nobody waits for it.
+            _hot_due("/api/status", "/api/decisions", "/api/overview", "/api/timeline")
+    try:
+        body, _ = _page(os.path.join(BASE, "index.html"))
+        _gz_for(_etag(body), body)
+    except Exception:
+        pass
 
 
 def _quiet(fn):
@@ -2298,6 +3423,434 @@ def _quiet(fn):
         pass
 
 
+# ---------------------------------------------------------------- selftest
+
+def selftest():
+    """The parts of this file that must not drift, checked against the live box, read-only.
+    Temp files for anything that writes. `python3 server.py selftest`; exit 0 = all pass."""
+    # a tailnet peer for the tests, computed from Tailscale's range (fix round 2026-09-24): this
+    # file is on the public allowlist, and the literal peer addresses here tripped publish.py's
+    # routable-IP rule, which quarantines the file
+    TNP = str(ipaddress.ip_network("100.64.0.0/10")[23130])
+    import email.message
+    import http.client
+    import tempfile
+    fails = []
+
+    def ok(cond, what):
+        print(("PASS " if cond else "FAIL ") + what)
+        if not cond:
+            fails.append(what)
+
+    # 1. next_run: the day->hour->minute search against the minute walk it replaced, on every
+    #    live schedule and the edge cases, from clock points that cross a month end, a leap
+    #    February, a year end and a Sunday midnight
+    try:
+        raw = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        raw = ""
+    live = sorted({m.group(1) for m in (CRON_RE.match(l.strip()) for l in raw.splitlines()
+                                        if l.strip() and not l.strip().startswith("#")) if m})
+    edge = ["0 4 1-7 * *", "0 0 29 2 *", "0 0 31 * *", "59 23 31 12 *", "*/7 */5 * * *",
+            "0 0 * * 7", "0 12 * * 5-7", "0 0 13 * 5", "30 2 * * 0,6", "0 0 1 1 *",
+            "15 3 30 2 *", "* * * * *", "5 4 * * 2-6", "1-59/7 3-21/4 1-31/3 */2 1-5",
+            "0 9 * * 0", "@reboot", "not a schedule"]
+    t0 = time.time()
+    clocks = [t0, t0 + 3 * 86400 + 1020, 1798761540, 1803859170, 1790553540, 1832976000]
+    same, changed, n = True, set(), 0
+    for now in clocks:
+        for sc in live + edge:
+            a = next_run(sc, now=now)
+            n += 1
+            if a != _next_run_walk(sc, now=now):
+                same = False
+                print(f"     differs: {sc!r} at {now}: {a} vs {_next_run_walk(sc, now=now)}")
+            if a != _next_run_walk(sc, now=now, sunday_fix=False):
+                changed.add(sc)
+    ok(same and len(live) > 0, f"next_run == the minute walk on {len(live)} live + {len(edge)} edge "
+                               f"schedules x {len(clocks)} clocks ({n} comparisons)")
+    sunday0 = {sc for sc in changed if _field_match(sc.split()[4], 0) and not _field_match(sc.split()[4], 7)}
+    ok(changed == sunday0 and bool(changed), f"vs the pre-2026-09-24 code, only Sunday-as-0 lines "
+                                             f"differ ({len(changed)}: it said None for them)")
+    sun = 1790467200                                # Sun 2026-09-27 00:00 UTC
+    sat = sun - 86400 + 3600                        # Sat 2026-09-26 01:00 UTC
+    ok(next_run("5 9 * * 0", now=sat) == sun + 9 * 3600 + 300
+       and next_run("0 3 * * 7", now=sat) == sun + 3 * 3600,
+       "a Sunday line (0 or 7) fires on Sunday")
+    t = time.time()
+    for sc in live:
+        next_run(sc)
+    ms = (time.time() - t) * 1000
+    ok(ms < 50, f"next_run for all {len(live)} live lines in {ms:.1f} ms < 50")
+
+    # 2. the POST guard (Stocks' rule + JSON + size), on a handler with only headers
+    def refused(peer="127.0.0.1", **hd):
+        h = H.__new__(H)
+        h.client_address = (peer, 50000)
+        h.headers = email.message.Message()
+        for k, v in hd.items():
+            h.headers[k.replace("_", "-")] = v
+        r = h._refuse_post()
+        return r[0] if r else None
+    host = {"Host": "spark:8900"}
+    js = {"Content_Type": "application/json", "Content_Length": "12"}
+    ok(refused(**host, **js) is None, "curl from the box (no Origin, no Sec-Fetch-Site) passes")
+    ok(refused(**host, **js, Origin="http://spark:8900", Sec_Fetch_Site="same-origin") is None,
+       "the page itself (same origin) passes")
+    ok(refused(**host, **js, Origin="https://evil.example") == 403, "another origin: 403")
+    ok(refused(**host, **js, Origin="null") == 403, "an opaque origin (null): 403")
+    ok(refused(**host, **js, Sec_Fetch_Site="cross-site") == 403, "Sec-Fetch-Site cross-site: 403")
+    ok(refused(**host, **js, Sec_Fetch_Site="same-site") == 403, "Sec-Fetch-Site same-site: 403")
+    ok(refused(**host, Content_Type="text/plain", Content_Length="12") == 415,
+       "a text/plain body (what a cross-site page can send unasked): 415")
+    ok(refused(**host, Content_Length="0") is None, "a bodiless POST needs no Content-Type")
+    ok(refused(**host, Content_Type="application/json; charset=utf-8",
+               Content_Length=str(MAX_POST + 1)) == 413, "a body over the cap: 413")
+    ok(refused(**host, **{"Transfer_Encoding": "chunked"}) == 411, "chunked with no length: 411")
+    ok(refused(TNP, **host, **js) is None, "a tailnet peer (100.64/10) passes")
+    ok(refused("192.168.1.50", **host, **js) == 403
+       and refused("172.17.0.2", **host, **js) == 403,
+       "a home-LAN or container peer with no Origin (curl from another device): 403")
+    ok(refused(**{"Host": "evil.example:8900"}, **js, Origin="http://evil.example:8900",
+               Sec_Fetch_Site="same-origin") == 403,
+       "DNS rebinding (own name in Host, matching Origin, tailnet peer): 403")
+
+    # 2a. every GET/HEAD: the same peer and Host rules (box rule 5; rebinding reads)
+    def refused_any(peer="127.0.0.1", host_hdr="127.0.0.1:8900"):
+        h = H.__new__(H)
+        h.client_address = (peer, 50000)
+        h.headers = email.message.Message()
+        if host_hdr is not None:
+            h.headers["Host"] = host_hdr
+        r = h._refuse_any()
+        return r[0] if r else None
+    me = sorted(_host_names())
+    ok(all(refused_any(TNP, f"{n}:8900" if ":" not in n else f"[{n}]:8900") is None
+           for n in me), f"every name of this box passes from a tailnet peer ({', '.join(me)})")
+    ok(refused_any(host_hdr="localhost:8900") is None and refused_any(host_hdr="[::1]:8900") is None
+       and refused_any(host_hdr="127.0.0.1") is None, "loopback names, with or without a port")
+    ok(refused_any(TNP, "attacker.example") == 403
+       and refused_any(TNP, "<host>.evil.example:8900") == 403,
+       "a foreign name in Host: 403")
+    ok(refused_any(TNP, "192.168.1.91:8900") == 403, "the LAN address as Host: 403")
+    ok(refused_any("192.168.1.50") == 403 and refused_any("172.17.0.2") == 403,
+       "a GET from the home LAN or a container: 403")
+    ok(refused_any(host_hdr=None) == 403, "no Host at all: 403")
+    # fix round 2026-09-24: tailscale not answering at the first request must not lock the
+    # tailnet name out until a restart
+    G = globals()
+    real_names, saved_hosts = G["_host_names"], (G["_HOSTS"], G["_HOSTS_AT"])
+    fq = "box.example-tailnet.ts.net"          # synthetic: this file is published
+    try:
+        G["_HOSTS"], G["_HOSTS_AT"] = None, 0.0
+        G["_host_names"] = lambda: {"localhost", "127.0.0.1"}                # tailscaled not up yet
+        first = refused_any(TNP, fq + ":8900")
+        G["_host_names"] = lambda: {"localhost", "127.0.0.1", fq}
+        soon = refused_any(TNP, fq + ":8900")
+        G["_HOSTS_AT"] -= HOSTS_RETRY_S
+        later = refused_any(TNP, fq + ":8900")
+        ok(first == 403 and soon == 403 and later is None,
+           f"Host names re-resolve (once a minute at most) when a name is not known yet {first, soon, later}")
+    finally:
+        G["_host_names"] = real_names
+        G["_HOSTS"], G["_HOSTS_AT"] = saved_hosts
+
+    # 2b. at most HOT_MAX cached variants: a new query string past the cap is built for its
+    #     caller and not kept, so junk variants cannot make the refresher rebuild forever
+    global HOT_MAX
+    saved_max, HOT_MAX = HOT_MAX, len(_HOT)
+    try:
+        e = _hot("__t_cap", lambda: {"cap": 1}, 30, 60)
+        ok(e.data == {"cap": 1} and "__t_cap" not in _HOT, "past HOT_MAX: served, not kept")
+    finally:
+        HOT_MAX = saved_max
+        _HOT.pop("__t_cap", None)
+
+    # 3. the hot cache: one build for many cold callers, served warm, invalidation, failure
+    calls = []
+
+    def slow_build():
+        calls.append(1)
+        time.sleep(0.2)
+        return {"n": len(calls)}
+    ths = [threading.Thread(target=_hot, args=("__t_a", slow_build, 30, 60)) for _ in range(6)]
+    [x.start() for x in ths]
+    [x.join() for x in ths]
+    ok(len(calls) == 1, f"6 cold callers at once -> {len(calls)} build")
+    e = _hot("__t_a", slow_build, 30, 60)
+    ok(len(calls) == 1 and e.data == {"n": 1} and e.etag and e.gz is None,
+       "a warm call builds nothing and serves the stored body")
+    _hot_invalidate("__t_a")
+    e = _hot("__t_a", slow_build, 30, 60)
+    ok(len(calls) == 2 and e.data == {"n": 2}, "after invalidation the next reader gets a rebuild")
+
+    def boom():
+        raise RuntimeError("down")
+    _HOT["__t_a"].build = boom
+    _hot_invalidate("__t_a")
+    e = _hot("__t_a", boom, 30, 60)
+    ok(e.data == {"n": 2}, "a failed rebuild keeps the last good payload")
+    e = _hot("__t_b", boom, 30, 60)
+    ok(isinstance(e.data, dict) and "RuntimeError" in e.data.get("error", ""),
+       "a failed first build serves {error}, not a traceback")
+    big = _hot("__t_c", lambda: {"x": "y" * 5000}, 30, 60)
+    ok(big.gz is not None and gzip.decompress(big.gz) == big.body, "gzip made once, at build")
+    # a tt module that breaks (a half-saved edit, a missing file) is a FAILED build, so the
+    # panel keeps its last good payload instead of caching {"error"} over it
+    TT_ROUTES["/api/__selftest_tt"] = ("tt_not_a_module", "x")
+    HOT_ROUTES["/api/__selftest_tt"] = (30, 60, 99)
+    try:
+        key, _, tt_build = _hot_spec("/api/__selftest_tt")
+        _hot(key, lambda: {"good": 1}, 30, 60)
+        _HOT[key].build = tt_build
+        _hot_invalidate(key)
+        e = _hot(key, tt_build, 30, 60)
+        ok(e.data == {"good": 1}, "a tt route whose module breaks keeps its last good payload")
+        ok("not there yet" in _tt_call("/api/__selftest_tt").get("error", ""),
+           "a direct tt call still answers {error} (fresh=1 / since= go straight through)")
+    finally:
+        TT_ROUTES.pop("/api/__selftest_tt", None)
+        HOT_ROUTES.pop("/api/__selftest_tt", None)
+        _HOT.pop("/api/__selftest_tt", None)
+    for k in ("__t_a", "__t_b", "__t_c"):
+        _HOT.pop(k, None)
+    # v2.2: /api/live goes straight through to its module's own 2 s cache — never a hot entry,
+    # never warmed, never rebuilt by the refresher, with or without a since= cursor
+    ok("/api/live" in TT_ROUTES and "/api/live" not in HOT_ROUTES
+       and _hot_spec("/api/live") is None and _hot_spec("/api/live?since=1790000000") is None
+       and not any(k.startswith("/api/live") for k in _HOT),
+       "/api/live is a tt route that bypasses the hot cache")
+
+    # 4. the memo ledger: a status change touches ONE row
+    global LEDGER, MEMOBUS, HOME
+    saved = (LEDGER, MEMOBUS, HOME)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            LEDGER = os.path.join(tmp, "LEDGER.md")
+            rows = ["| Date | Memo | Source | Target | Status | Evidence |", "|---|---|---|---|---|---|",
+                    "| 2026-09-01 | fix-readme | a | stocks | implemented | x |",
+                    "| 2026-09-10 | fix-readme | b | mission-control | implemented | y |",
+                    "| 2026-09-20 | fix-readme | c | maintenance | proposed | z |"]
+            open(LEDGER, "w").write("\n".join(rows) + "\n")
+            _ledger_set_status("fix-readme", "rejected", target="maintenance")
+            got = open(LEDGER).read().splitlines()
+            ok(got[2] == rows[2] and got[3] == rows[3] and "| rejected |" in got[4],
+               "(slug, target) rewrites only the newest matching row")
+            ok(not _ledger_set_status("fix-readme", "x", target="hbs"), "no row for that target: False")
+
+            # 5. bus projects come from the inbox folders that exist
+            HOME = tmp
+            MEMOBUS = os.path.join(tmp, "memos")
+            for d in ("memos/inbox/maintenance", "memos/inbox/stocks", "memos/inbox/hbs",
+                      "memos/inbox/ghost", "maintenance", "Stocks", "hbs"):
+                os.makedirs(os.path.join(tmp, d))
+            bp = bus_projects()
+            ok(list(bp) == ["maintenance", "stocks", "hbs"], f"bus projects from inboxes: {list(bp)}")
+            ok(bp["stocks"][0] == os.path.join(tmp, "Stocks"), "stocks works in ~/Stocks")
+
+            # 5b. ignoring a memo that sat in hbs's inbox, with no hbs row in the ledger, must
+            #     not rewrite the same-slug rows of stocks or maintenance: it gets its own row
+            open(LEDGER, "w").write("\n".join(rows) + "\n")
+            open(os.path.join(MEMOBUS, "inbox/hbs/2026-09-22_fix-readme.md"), "w").write("x")
+            bus_ignore("fix-readme")
+            got = open(LEDGER).read().splitlines()
+            ok(got[2:5] == rows[2:5] and len(got) == 6 and "| hbs | rejected (ignored" in got[5]
+               and os.path.exists(os.path.join(MEMOBUS, "processed/2026-09-22_fix-readme.md")),
+               "ignore from an inbox with no row: a new row for that target, the others untouched")
+    finally:
+        LEDGER, MEMOBUS, HOME = saved
+
+    # 6. counts, diagrams, catalog, relogin
+    cs = crons_summary()
+    ok(cs["total"] == sum(cs[k] for k in ("claude", "trigger", "local", "code")) > 0,
+       f"crons_summary partitions {cs['total']} jobs ({cs['src']})")
+    arch = architecture()
+    d2 = f"{HOME}/maintenance/architecture"
+    ok(bool(arch) and all(a["styled"] == (subprocess.run(
+        ["grep", "-qxE", r"[[:space:]]*\.\.\.@_style[[:space:]]*", os.path.join(d2, a["file"][:-4] + ".d2")]
+        ).returncode == 0) for a in arch),
+       f"styled flag = the render script's whitespace-tolerant `...@_style` line on all {len(arch)} diagrams")
+    proj = {a["file"]: a["project"] for a in arch}
+    ok(all(v == "maintenance" for k, v in proj.items() if "mission-control" in k)
+       and all(v == "thesis" for k, v in proj.items() if "thesis" in k),
+       "mission-control and thesis diagrams map to their projects")
+    # /api/backoffice goes through tt_now's secrets backstop (integration, 2026-09-24): a value
+    # from ~/.secrets planted in a stored finding comes out <redacted>, and the live view is clean.
+    # Never prints a value — only whether one was found.
+    try:
+        sv = _tt_fn("tt_now", "_secret_values")()
+    except Exception:
+        sv = ()
+    ok(bool(sv), "backoffice(): ~/.secrets has values for the backstop to redact")
+    if sv:
+        real_load = _load_json
+
+        def planted(path, default):
+            if path.endswith("/state/findings.json"):
+                return {"x": {"state": "open", "sev": "high", "kind": "public-leak", "title": "t",
+                              "first_seen": 1,
+                              "detail": f"r/x.py:1 [credential from ~/.secrets/f] {sv[0]} and {sv[-1]}"}}
+            return real_load(path, default)
+        globals()["_load_json"] = planted
+        try:
+            blob = json.dumps(backoffice())
+        finally:
+            globals()["_load_json"] = real_load
+        ok(not any(v in blob for v in sv) and "<redacted>" in blob,
+           "backoffice(): a ~/.secrets value planted in a stored finding comes out <redacted>")
+        ok(not any(v in json.dumps(backoffice()) for v in sv),
+           "backoffice(): no ~/.secrets value in the live janitor view")
+    t = time.time()
+    architecture()
+    ok((time.time() - t) * 1000 < 20, "architecture() warm < 20 ms (no git spawn)")
+    t = time.time()
+    cv = catalog_view()
+    cold = (time.time() - t) * 1000
+    t = time.time()
+    catalog_view()
+    warm = (time.time() - t) * 1000
+    ok(cold < 150 and warm < 5, f"catalog_view without the sweep: {cold:.0f} ms, warm {warm:.2f} ms")
+    store = _load_json(f"{HOME}/maintenance/state/findings.json", {})
+    want = {(f.get("kind"), f.get("project")) for f in store.values()
+            if f.get("state") == "open" and f.get("kind") in SWEEP_KINDS}
+    have = {(f["kind"], f.get("project")) for f in cv.get("findings", [])}
+    ok(want <= have, f"the {len(want)} open sweep-only findings are still shown before a sweep")
+    try:
+        out = subprocess.run([_PY, f"{HOME}/maintenance/bin/claude-relogin.py", "status"],
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+        ok(json.dumps(relogin_status()) == out, "relogin_status() prints what the script prints")
+    except Exception as x:
+        ok(False, f"relogin script ran: {x}")
+
+    # 7. over the wire: keep-alive, HEAD, ETag/304, the guard, a tt POST that is not there
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        wire(srv, ok, http.client)
+    except Exception as x:
+        ok(False, f"the wire checks ran to the end ({type(x).__name__}: {x})")
+    finally:
+        TT_POSTS.pop("/api/__selftest", None)
+        srv.shutdown()
+    print(f"{'ALL PASS' if not fails else str(len(fails)) + ' FAIL'}")
+    return 1 if fails else 0
+
+
+def wire(srv, ok, http_client):
+    """selftest part 7, over a real socket: keep-alive, HEAD, ETag/304, the guard."""
+    c = http_client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=20)
+    c.request("GET", "/", headers={"Accept-Encoding": "gzip"})
+    r = c.getresponse()
+    r.read()
+    et = r.getheader("ETag")
+    ok(r.status == 200 and et and r.getheader("Content-Encoding") == "gzip"
+       and r.getheader("Cache-Control") == "no-cache", "GET /: 200, gzip, ETag, no-cache")
+    sock = c.sock
+    c.request("GET", "/", headers={"If-None-Match": et})
+    r = c.getresponse()
+    ok(r.status == 304 and r.read() == b"", "GET / with its ETag: 304, no body")
+    ok(c.sock is sock, "the second request reused the connection (HTTP/1.1 keep-alive)")
+    # TCP_NODELAY: with Nagle on, every request after the first on a kept-alive socket waits
+    # ~40 ms for the client's delayed ACK before its body leaves (measured 2026-09-24)
+    slow = 0.0
+    for _ in range(5):
+        t1 = time.time()
+        c.request("GET", "/api/relogin")
+        c.getresponse().read()
+        slow = max(slow, time.time() - t1)
+    ok(slow < 0.03, f"five reused-socket GETs, none held back by Nagle (slowest {slow * 1000:.0f} ms)")
+    c.request("HEAD", "/api/relogin")
+    r = c.getresponse()
+    ok(r.status == 200 and r.read() == b"" and int(r.getheader("Content-Length")) > 0,
+       "HEAD: headers only")
+    c.sock.settimeout(3)
+    c.request("GET", "/api/relogin")
+    r = c.getresponse()
+    try:
+        got = json.loads(r.read())
+    except Exception:
+        got = None                              # no body came: the HEAD flag leaked
+    ok(r.status == 200 and got == relogin_status(),
+       "a GET after a HEAD on the same socket has its body")
+    c.close()
+    c = http_client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=20)
+    c.request("POST", "/api/bus/ignore", body=b'{"slug":"x"}',
+              headers={"Content-Type": "application/json", "Origin": "https://evil.example"})
+    r = c.getresponse()
+    ok(r.status == 403 and json.loads(r.read())["ok"] is False, "cross-origin POST over the wire: 403")
+    c.close()
+    c = http_client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=20)
+    TT_POSTS["/api/__selftest"] = ("tt_not_a_module", "answer")
+    c.request("POST", "/api/__selftest", body=b'{"key":"k"}',
+              headers={"Content-Type": "application/json"})
+    r = c.getresponse()
+    j = json.loads(r.read())
+    ok(r.status == 200 and j.get("ok") is False and "not there yet" in j.get("error", ""),
+       "a POST into a tt module that does not exist: clean {ok:false, error}")
+    c.request("GET", "/api/__nope")
+    r = c.getresponse()
+    r.read()
+    ok(r.status == 404, "unknown path: 404, connection still usable")
+    # /api/live over the wire: 200 and the contract's keys, twice (the second from its 2 s
+    # cache). Its Stocks-asks read goes to a temp catalog log, never the live one.
+    import tempfile
+    saved_reads = os.environ.get("MC_CATALOG_READS")
+    tmp_reads = os.path.join(tempfile.mkdtemp(prefix="mc-selftest-"), "reads.jsonl")
+    os.environ["MC_CATALOG_READS"] = tmp_reads
+    try:
+        got = []
+        for q in ("/api/live", "/api/live?since=1"):
+            c.request("GET", q)
+            r = c.getresponse()
+            got.append((r.status, json.loads(r.read())))
+        need = {"now", "since", "busy", "running", "waiting", "events", "truncated", "next_poll_s",
+                "limits", "sources"}
+        ok(all(st == 200 and need <= set(j) for st, j in got) and got[1][1]["since"] >= got[1][1]["now"] - 600,
+           f"GET /api/live: 200, the live contract, since clamped ({got[0][1].get('build_ms')} ms build)")
+    finally:
+        if saved_reads is None:
+            os.environ.pop("MC_CATALOG_READS", None)
+        else:
+            os.environ["MC_CATALOG_READS"] = saved_reads
+        import shutil
+        shutil.rmtree(os.path.dirname(tmp_reads), ignore_errors=True)
+    c.request("HEAD", "/api/relogin")
+    c.getresponse().read()
+    c.sock.settimeout(3)
+    c.request("POST", "/api/__selftest", body=b'{"key":"k"}',
+              headers={"Content-Type": "application/json"})
+    r = c.getresponse()
+    try:
+        got = json.loads(r.read())
+    except Exception:
+        got = None                              # no body came: the HEAD flag leaked into POST
+    ok(r.status == 200 and isinstance(got, dict) and got.get("ok") is False,
+       "a POST after a HEAD on the same socket has its body")
+    c.close()
+    # fix round 2026-09-24: an answer carries where it came from, set here, never by the client
+    TT_POSTS["/api/__selftest_via"] = ("tt_decide", "_via")
+    try:
+        port = srv.server_address[1]
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=20)
+        c.request("POST", "/api/__selftest_via", body=b'{"key":"k","_via":{"page":true}}',
+                  headers={"Content-Type": "application/json"})
+        cu = json.loads(c.getresponse().read())
+        c.request("POST", "/api/__selftest_via", body=b'{"key":"k"}',
+                  headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}",
+                           "Host": f"127.0.0.1:{port}", "User-Agent": "Mozilla/5.0 (iPhone)"})
+        pg = json.loads(c.getresponse().read())
+        c.close()
+        ok(cu.get("page") is False and cu.get("from") == "other client"
+           and pg.get("page") is True and pg.get("from") == "dashboard" and pg.get("ua", "").startswith("Mozilla"),
+           f"POST: the page (Origin = this host) reads as the dashboard; curl claiming page:true does not {cu, pg}")
+    finally:
+        TT_POSTS.pop("/api/__selftest_via", None)
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["selftest"]:
+        sys.exit(selftest())
+    _REFRESHER["on"] = True                  # before any request can look at it
+    threading.Thread(target=_refresher, daemon=True, name="mc-refresher").start()
     threading.Thread(target=_warm, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+    ThreadingHTTPServer((BIND, PORT), H).serve_forever()
