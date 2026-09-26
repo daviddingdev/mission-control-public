@@ -2196,7 +2196,7 @@ def _transcript_totals(path):
         return c
     if not c or size < c["size"]:
         c = {"size": 0, "in": 0, "out": 0, "cc": 0, "cr": 0, "msgs": 0, "model": None, "last_ts": None,
-             "first_prompt": None}
+             "first_prompt": None, "lid": None}
     try:
         with open(path, "rb") as fh:
             fh.seek(c["size"])
@@ -2231,6 +2231,12 @@ def _transcript_totals(path):
         u = m.get("usage") or {}
         if not u:
             continue
+        # one API message is one line per content block, each repeating the whole usage: count
+        # it once (2026-09-26 — per line overstated a session's tokens 3-7x; usage.py's doc)
+        mid = m.get("id")
+        if mid and mid == c.get("lid"):
+            continue
+        c["lid"] = mid or c.get("lid")
         c["in"] += u.get("input_tokens") or 0
         c["out"] += u.get("output_tokens") or 0
         c["cc"] += u.get("cache_creation_input_tokens") or 0
@@ -2838,6 +2844,18 @@ def _tt_fn(mod_name, fn_name):
         raise LookupError(f"{mod_name}.py is not there yet")
     mt = os.path.getmtime(f)
     with _TT_LOCK:                      # the refresher and a request must not reload at once
+        # THIS dashboard's modules first (2026-09-25): bin/decisions.py puts ~/maintenance/dashboard
+        # at sys.path[0] when it is imported, so a worktree's test copy served the LIVE tt_*.py
+        # (and each tt_* module's `import tt_sessions` found the live one too). On the box BASE is
+        # that same folder and nothing changes.
+        if sys.path[0] != BASE:
+            if BASE in sys.path:
+                sys.path.remove(BASE)
+            sys.path.insert(0, BASE)
+            for k in [k for k, v in sys.modules.items() if k.startswith("tt_") and getattr(v, "__file__", None)
+                      and os.path.dirname(os.path.abspath(v.__file__)) != BASE]:
+                sys.modules.pop(k, None)
+                _TT_MODS.pop(k, None)
         m, seen = _TT_MODS.get(mod_name, (None, 0))
         if m is None:
             m = importlib.import_module(mod_name)
@@ -3614,6 +3632,23 @@ def selftest():
         _HOT.pop("/api/__selftest_tt", None)
     for k in ("__t_a", "__t_b", "__t_c"):
         _HOT.pop(k, None)
+    # a tt module comes from THIS dashboard even after another folder took sys.path[0]
+    # (bin/decisions.py inserts ~/maintenance/dashboard; a worktree's test copy served the live
+    # modules until 2026-09-25)
+    import tempfile
+    import types
+    with tempfile.TemporaryDirectory() as td:
+        sys.path.insert(0, td)
+        sys.modules["tt_live"] = types.ModuleType("tt_live")
+        sys.modules["tt_live"].__file__ = os.path.join(td, "tt_live.py")
+        _TT_MODS.pop("tt_live", None)
+        try:
+            _tt_fn("tt_live", "live")
+            ok(sys.path[0] == BASE and os.path.dirname(os.path.abspath(sys.modules["tt_live"].__file__)) == BASE,
+               "tt modules load from this dashboard's folder, whatever took sys.path[0]")
+        finally:
+            if td in sys.path:
+                sys.path.remove(td)
     # v2.2: /api/live goes straight through to its module's own 2 s cache — never a hot entry,
     # never warmed, never rebuilt by the refresher, with or without a since= cursor
     ok("/api/live" in TT_ROUTES and "/api/live" not in HOT_ROUTES

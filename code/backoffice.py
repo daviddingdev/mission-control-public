@@ -258,6 +258,30 @@ def _listening_ports():
     return sorted(out)
 
 
+def _port_owners():
+    """{port: {pid, cwd, cmd, started, all_ifaces}} for the listening sockets this user owns (`ss -tlnp`
+    shows the pid of our own processes without sudo). What turns "port 8911 is listening" into "an
+    hbs worktree's test dashboard has listened on every interface since 09-21" — and names the
+    project, so the finding reaches its inbox instead of waiting on Mission Control's list."""
+    out = {}
+    for line in (sh(["ss", "-tlnp"]) or "").splitlines()[1:]:
+        m = re.search(r"\s(\S+):(\d+)\s", line)
+        pm = re.search(r"pid=(\d+)", line)
+        if not m or not pm:
+            continue
+        port, pid = int(m.group(2)), int(pm.group(1))
+        o = out.setdefault(port, {"pid": pid, "all_ifaces": False})
+        o["all_ifaces"] = o["all_ifaces"] or m.group(1) in ("0.0.0.0", "*", "[::]")
+        try:
+            o["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+            o["cmd"] = " ".join(open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace")
+                                .split("\0")).split("\n")[0].strip()[:90]
+            o["started"] = os.stat(f"/proc/{pid}").st_mtime
+        except OSError:
+            pass
+    return out
+
+
 def _declared():
     """What the written layer claims — the other half of every drift check."""
     d = {}
@@ -570,7 +594,8 @@ def dt_from(ts):
 
 def census():
     c = {"at": now(), "projects": {}, "crons": _cron_lines(),
-         "ports": _listening_ports(), "declared": _declared(), "logs": {}}
+         "ports": _listening_ports(), "port_owners": {str(k): v for k, v in _port_owners().items()},
+         "declared": _declared(), "logs": {}}
     for name in _project_dirs():
         repo = os.path.join(HOME, name)
         c["projects"][name] = {
@@ -744,7 +769,7 @@ ARMED_CHECKS = (
      "standard": "§2a.3", "check": "headless token present · `claude-headless --selftest defaults`",
      "requires": ("bin/claude-headless",),
      "titles": ("claude-headless is installed but has no token — it is a no-op",
-                "claude-headless no longer applies the default model/effort")},
+                "claude-headless no longer applies the default model/effort/advisor")},
     {"id": "spawn-guard", "control": "PreToolUse claude-spawn guard", "layer": "preventive",
      "standard": "§2a.3", "check": None, "requires": ("bin/hook-guard-claude.py",),
      "titles": (), "gap": "no armed-check; `claudeq.py audit` (C26) names spawns after the fact"},
@@ -797,10 +822,41 @@ ARMED_CHECKS = (
     {"id": "deadunits", "control": "dead-unit rule", "layer": "detective",
      "standard": "—", "check": "`deadunits.py selftest`", "requires": ("bin/deadunits.py",),
      "titles": ("deadunits selftest fails — the dead-unit rule no longer fires",)},
+    {"id": "smb-fruit", "control": "SMB share vfs_fruit (no Finder ._ files)", "layer": "preventive",
+     "standard": "—", "check": "`testparm -s` loads fruit + streams_xattr · no AppleDouble since",
+     "requires": (),
+     "titles": ("the SMB share no longer loads vfs_fruit — Finder copies leave ._ files again",)},
     {"id": "sentinel", "control": "sentinel page recheck", "layer": "detective",
      "standard": "—", "check": "`sentinel.py selftest`", "requires": ("bin/sentinel.py",),
      "titles": ("sentinel selftest fails — it can page on a job that already recovered",)},
 )
+
+
+SMB_FRUIT_SINCE = 1790374800          # 2026-09-25 22:20Z: vfs_fruit live on the user-home share (smb.conf written 22:20:11Z)
+_AD_SKIP = {"archive", "backups", "model-vault", "snap", "poker-data", "node_modules", ".venv",
+            "venv", ".git", "__pycache__"}
+
+
+def _appledouble_since(since, root=HOME):
+    """-> paths of AppleDouble (`._*`, magic 00 05 16 07) files under ~ changed after `since`.
+    Skips the big trees nobody drops files into and the hidden folders at ~ (except .claude).
+    ~0.2 s over ~100k files."""
+    out = []
+    for d, subdirs, files in os.walk(root):
+        subdirs[:] = [s for s in subdirs if s not in _AD_SKIP
+                      and not (d == root and s.startswith(".") and s != ".claude")]
+        for fn in files:
+            if not fn.startswith("._"):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                if os.stat(p).st_mtime > since:
+                    with open(p, "rb") as fh:
+                        if fh.read(4) == b"\x00\x05\x16\x07":
+                            out.append(p)
+            except OSError:
+                pass
+    return sorted(out)
 
 
 def _catalog_key(r):
@@ -903,8 +959,24 @@ def audit(c=None):
         if port not in d["infra_ports"]:
             where.append("INFRASTRUCTURE.md")
         if len(where) == 2:
-            _finding(f, "port-undeclared", "med", f"port {port} is listening but undeclared",
-                     "missing from " + " and ".join(where) + " (PROJECT_STANDARDS §4)")
+            # who is listening (2026-09-26): an owner makes it the owner's finding — a memo when it
+            # listens on every interface — instead of a line on Mission Control's list that no one
+            # reads (8797 and 8911 were two forgotten test dashboards, open 5 days, project "")
+            o = (c.get("port_owners") or {}).get(str(port)) or {}
+            proj = _project_of((o.get("cwd") or "") + "/") if o.get("cwd") else ""
+            if proj in ("maintenance", "home"):
+                proj = ""
+            who = (f"{o['cmd']} (pid {o['pid']}, in {o['cwd'].replace(HOME, '~')}"
+                   + (f", running since {dt_from(o['started'])[:10]}" if o.get("started") else "") + ")"
+                   if o.get("cmd") and o.get("cwd") else "")
+            wide = bool(o.get("all_ifaces"))
+            _finding(f, "port-undeclared", "high" if wide and proj else "med",
+                     f"port {port} is listening but undeclared",
+                     (f"{who}. " if who else "")
+                     + ("It listens on every interface, not just the tailnet or localhost. " if wide else "")
+                     + "Missing from " + " and ".join(where) + " (PROJECT_STANDARDS §4): stop it if "
+                     "it is a leftover test server, or declare it in all three places.",
+                     proj, fix="memo" if proj else "human", key=f"port:{port}")
 
     # 6. Day-1 checklist drift
     for name, p in c["projects"].items():
@@ -1203,14 +1275,15 @@ def audit(c=None):
                  "from the phone (Mission Control -> Claude -> Headless auth) writes it.")
 
     # claude-headless's default --model/--effort (2026-09-23, David: every automated Claude
-    # job on Opus 5.5 at high effort). If the wrapper stops appending them nothing fails: the
-    # jobs that pass no flag quietly go back to Sonnet at medium. So the wrapper's own argv
-    # selftest runs here every morning (<1s, zero tokens).
+    # job on Opus 5.5 at high effort) and --advisor (2026-09-25, Fable 5.1). If the wrapper
+    # stops appending them nothing fails: the jobs that pass no flag quietly go back to Sonnet
+    # at medium, with no advisor. So the wrapper's own argv selftest runs here every morning
+    # (<1s, zero tokens).
     _hl_st = sh([os.path.join(MC, "bin", "claude-headless"), "--selftest", "defaults"],
                 timeout=20) or ""
     if "FAIL" in _hl_st or "OK" not in _hl_st:
         _finding(f, "guardrail-inert", "high",
-                 "claude-headless no longer applies the default model/effort",
+                 "claude-headless no longer applies the default model/effort/advisor",
                  "run `~/maintenance/bin/claude-headless --selftest defaults`; each FAIL line "
                  "shows the argv a headless job would hand the CLI. Without the defaults, a job "
                  "that passes no --model runs on Sonnet at medium effort, not Opus 5.5 at high: "
@@ -1234,6 +1307,30 @@ def audit(c=None):
                      f"&& sudo chmod 440 /etc/sudoers.d/91-spark-updates")
     except Exception:
         pass
+
+    # SMB share hygiene (2026-09-25, memo from stocks): without vfs_fruit, every Finder copy onto
+    # the user-home share left a `._<name>` AppleDouble sidecar beside the file, and every
+    # glob, rglob and the catalog's undeclared-file sweep read it as a real file. The fix is
+    # Samba config (/etc/samba/smb.conf [global]: vfs objects = fruit streams_xattr), which a
+    # package upgrade or a hand edit can undo without a sound — so prove it every morning:
+    # fruit is still loaded, and no AppleDouble file has appeared on the box since the fix.
+    _tp = sh(["testparm", "-s"], timeout=15) or ""
+    if _tp and not re.search(r"^\s*vfs objects = .*\bfruit\b.*\bstreams_xattr\b", _tp, re.M):
+        _finding(f, "guardrail-inert", "med",
+                 "the SMB share no longer loads vfs_fruit — Finder copies leave ._ files again",
+                 "`testparm -s` shows no `vfs objects = fruit streams_xattr`. Restore the block in "
+                 "/etc/samba/smb.conf (the pre-change copy and the reasons are in "
+                 "~/backups/maintenance/smb.conf.2026-09-25-pre-fruit and the [user-home] "
+                 "comment), check package samba-vfs-modules is installed, then "
+                 "`sudo smbcontrol smbd reload-config`.")
+    for p in _appledouble_since(SMB_FRUIT_SINCE):
+        rel = os.path.relpath(p, HOME)
+        _finding(f, "appledouble-litter", "low", f"a Finder ._ file appeared: {rel}",
+                 "An AppleDouble sidecar written after vfs_fruit went live (2026-09-25 22:20Z), so "
+                 "a Mac copied onto the share without Apple's SMB extensions — most likely a "
+                 "connection opened before the change (eject and reconnect the share in Finder). "
+                 "It is metadata only; delete it once `file` says AppleDouble.",
+                 _project_of("~/" + rel), key=f"appledouble:{rel}")
 
     # The memo-inbox SessionStart hook (2026-09-01) is how a directive reaches a session that
     # never read CLAUDE.md. If it is unregistered or not executable, memos go back to being a
@@ -1857,7 +1954,10 @@ def _verify_david(e, fresh, store):
                     f"{dt_from(os.path.getmtime(p))}Z, after your answer")
         return None
     if e.get("option") == "purge":
-        m = re.search(r"([\w-]+-public)/", rec.get("detail") or "")
+        # a status item that is not a finding (the rejected publish push, 2026-09-25) has no
+        # record here, so the repo comes from the option's own words the answer stored
+        m = (re.search(r"([\w-]+-public)/", rec.get("detail") or "")
+             or re.search(r"~/public/([\w-]+-public)\b", e.get("consequence") or ""))
         d = os.path.join(HOME, "public", m.group(1)) if m else None
         if d and os.path.isdir(os.path.join(d, ".git")):
             local = sh(["git", "-C", d, "rev-parse", "HEAD"])
@@ -2183,6 +2283,22 @@ def selftest():
         _commit = lambda paths, msg, skip=(): commits.append((tuple(paths), msg)) or "abc1234"
         save(MUTE, {"muted": []})
 
+        # AppleDouble litter (2026-09-25): only real `._` AppleDouble files newer than the fix, and
+        # never inside the skipped trees or hidden folders at the root
+        ad = f"{t}/home"
+        for rel, body, age in (("proj/._new.pdf", b"\x00\x05\x16\x07rest", 0),
+                               ("proj/._old.pdf", b"\x00\x05\x16\x07rest", 3 * 86400),
+                               ("proj/._notad.txt", b"hello", 0),
+                               ("archive/._x.pdf", b"\x00\x05\x16\x07", 0),
+                               (".hidden/._y.pdf", b"\x00\x05\x16\x07", 0)):
+            os.makedirs(os.path.dirname(f"{ad}/{rel}"), exist_ok=True)
+            with open(f"{ad}/{rel}", "wb") as fh:
+                fh.write(body)
+            os.utime(f"{ad}/{rel}", (time.time() - age, time.time() - age))
+        got = [os.path.relpath(p, ad) for p in _appledouble_since(time.time() - 86400, root=ad)]
+        check("appledouble: a new AppleDouble file is found; old, non-AppleDouble, archived and "
+              "hidden-root ones are not", got == ["proj/._new.pdf"], got)
+
         # keys
         a, b = [], []
         job = {"sched": "20 8 * * *", "scripts": ["memo-process.py"], "log": "x.log", "project": "maintenance"}
@@ -2418,6 +2534,20 @@ def selftest():
                   _verify_david(ev, [], rec) is None)
             os.utime(f"{t}/.secrets/zz", (tt + 5, tt + 5))
             check("rotated: rewritten after the answer is verified", bool(_verify_david(ev, [], rec)))
+            # "I'll push the cleaned history" on the rejected-publish row (2026-09-25): a status
+            # item, not a finding, so no record — the repo comes from the answer's consequence
+            g = lambda *a, cwd=None: subprocess.run(["git", *a], cwd=cwd, capture_output=True)
+            g("init", "-q", "--bare", "-b", "main", f"{t}/remote.git")
+            g("clone", "-q", f"{t}/remote.git", f"{t}/public/x-public")
+            g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "c",
+              cwd=f"{t}/public/x-public")
+            pev = {"id": "r0000008", "key": "job-failed:abc", "option": "purge", "exec": "david",
+                   "at": int(tt), "consequence": "Public-facing, so you run it: git -C ~/public/x-public "
+                   "push --force-with-lease origin main. Nothing runs from this answer; …"}
+            check("purge: not yet pushed stays queued", _verify_david(pev, [], {}) is None)
+            g("push", "-q", "origin", "main", cwd=f"{t}/public/x-public")
+            check("purge: with no record, the repo is read from the consequence and the push verifies",
+                  "x-public" in (_verify_david(pev, [], {}) or ""))
         finally:
             globals()["HOME"] = saved_home
 
