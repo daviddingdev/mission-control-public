@@ -25,7 +25,7 @@ repeats the message's full `usage`. Counting per line overstated every figure he
 are consecutive, so a line whose message id equals the last one counted is skipped; the last id
 is kept with the file's entry so an incremental read that splits a message still counts it once.
 Entries from before this rule (no `v`) are re-read from the start once."""
-_V = 3            # 2: one count per message (09-26); 3: entries carry their session id (09-26)
+_V = 4            # 2: one count per message; 3: session ids; 4: Eastern days, page names (09-26)
 import json, os, time, glob, threading
 
 HOME = os.path.expanduser("~")
@@ -61,15 +61,40 @@ GROUPS = {
 }
 
 
+# the project names the page uses everywhere (index.html PROJ): "HBS", "Home (~)", never "hbs",
+# "general" (2026-09-26 polish: Usage was the one page that spelled them its own way)
+_NICE = {"home": "Home (~)", "general": "Home (~)", "hbs": "HBS", "maintenance": "Mission Control",
+         "stocks": "Stocks", "clientco-db": "clientco-db", "poker": "poker", "thesis": "thesis",
+         "poker-appstore": "poker-appstore"}
+
+
+def _nice(proj):
+    return _NICE.get(str(proj).lower(), proj)
+
+
+def _et_day(ts):
+    """The Eastern calendar day of an ISO timestamp — the dashboard reads ET (CLAUDE.md, TIME)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:
+        return ts[:10]
+
+
+def _et_today(back_days=0):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    return (datetime.now(ZoneInfo("America/New_York")) - timedelta(days=back_days)).strftime("%Y-%m-%d")
+
+
 def _classify(first_user, proj):
     fu = (first_user or "").lstrip()
     for pre, label in JOB_PREFIXES:
         if fu.startswith(pre):
             return "scheduled", label, GROUPS.get(label, "Other scheduled")
     proj = proj.split("--")[0] or "general"
-    nice = {"home": "general", "Stocks": "Stocks", "clientco-db": "clientco-db",
-            "maintenance": "Mission Control", "poker": "poker"}.get(proj, proj)
-    return "interactive", f"interactive · {proj}", f"Sessions — {nice}"
+    return "interactive", f"interactive · {proj}", f"Sessions — {_nice(proj)}"
 
 
 def _parse_file(path, proj, prev=None):
@@ -123,7 +148,7 @@ def _parse_file(path, proj, prev=None):
                 lid = mid or lid
                 ts = j.get("timestamp")
                 try:
-                    day = ts[:10] if isinstance(ts, str) else time.strftime("%Y-%m-%d")
+                    day = _et_day(ts) if isinstance(ts, str) else _et_today()
                 except Exception:
                     day = time.strftime("%Y-%m-%d")
                 d = days.setdefault(day, {"in": 0, "out": 0, "cc": 0, "cr": 0, "adv": 0, "msgs": 0})
@@ -261,7 +286,8 @@ def _usage(days_back):
             kind = "interactive"
         return kind or "interactive", label or "interactive", group
     # aggregate
-    cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - days_back * 86400))
+    # `days_back` Eastern days INCLUDING today — "30 days" means 30 bars, not 31 (2026-09-26 polish)
+    cutoff = _et_today(days_back - 1)
     daily, jobs = {}, {}
     for e in cache.values():
         if not isinstance(e, dict) or "days" not in e:
@@ -313,8 +339,7 @@ def _classify_label_fallback(e):
     if e.get("kind") == "scheduled":
         return GROUPS.get(label, "Other scheduled")
     proj = label.replace("interactive · ", "").split("--")[0] or "general"
-    nice = {"home": "general", "maintenance": "Mission Control"}.get(proj, proj)
-    return f"Sessions — {nice}"
+    return f"Sessions — {_nice(proj)}"
 
 
 def selftest():

@@ -2,6 +2,7 @@
 # Coded Spark health check — no Claude tokens. Runs from cron every 15 min.
 # Pushes to the ntfy "alerts" channel ONLY on state change (new failure or recovery),
 # so a persistent outage alerts once, not every 15 minutes.
+case "${1:-}" in -h|--help) sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0 ;; esac   # `--help` never runs the job (2026-09-26)
 cd "$(dirname "$0")/.." || exit 1
 # cron has no session env — without this, `systemctl --user` fails and false-alarms
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -10,7 +11,17 @@ STATE=state/health.state
 mkdir -p state
 FAIL=()
 
-chk(){ curl -sf -m 5 -o /dev/null "http://${3:-localhost}:$1/" || FAIL+=("$2(:$1)"); }
+# chk PORT NAME [HOST] [EXTRA_OK_CODES]: up is any 2xx/3xx, plus the codes a service answers
+# on / by design (the Justin desk says 403 there). A port David switched off on purpose
+# (config/paused.json, in force while its keepalive cron line is commented `# PAUSED`) is not
+# checked at all — it is paused, not down (2026-09-26, memo from stocks).
+chk(){
+  python3 bin/paused.py port "$1" >/dev/null 2>&1 && return
+  local c; c=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://${3:-localhost}:$1/")
+  case "$c" in 2??|3??) return ;; esac
+  case " ${4:-} " in *" $c "*) return ;; esac
+  FAIL+=("$2(:$1)")
+}
 # retired, no longer checked: ApplyNow(:3000), OpenWebUI(:8080), opensearch, ollama,
 # FamilyVault(:5000) archived 2026-08-08
 chk 8000 ClientCoWiki
@@ -18,7 +29,7 @@ chk 8088 Pokerlog <host-ip>   # pokerlog binds the tailscale IP, not localhost
 chk 8787 StocksDash
 chk 8900 MissionControl
 chk 8910 HBSCasework
-chk 8790 JustinDesk
+chk 8790 JustinDesk localhost 403
 chk 19999 Netdata
 curl -sf -m 5 -o /dev/null "http://127.0.0.1:11434/api/tags" || FAIL+=("ollama(:11434)")   # local AI is production now (sentinel/digest/scoring depend on it)
 # Every local job binds to a ROLE in config/models.json and pre-checks it before running.

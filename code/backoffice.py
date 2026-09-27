@@ -771,11 +771,13 @@ ARMED_CHECKS = (
      "titles": ("claude-headless is installed but has no token — it is a no-op",
                 "claude-headless no longer applies the default model/effort/advisor")},
     {"id": "spawn-guard", "control": "PreToolUse claude-spawn guard", "layer": "preventive",
-     "standard": "§2a.3", "check": None, "requires": ("bin/hook-guard-claude.py",),
-     "titles": (), "gap": "no armed-check; `claudeq.py audit` (C26) names spawns after the fact"},
+     "standard": "§2a.3", "check": "listed under hooks.PreToolUse · executable · flags a bare `claude -p`, passes claude-headless",
+     "requires": ("bin/hook-guard-claude.py",),
+     "titles": ("the claude-spawn guard is not armed",)},
     {"id": "claudeq", "control": "claudeq box slot", "layer": "preventive",
-     "standard": "§2a.3", "check": None, "requires": ("bin/claudeq.py",),
-     "titles": (), "gap": "no armed-check in the daily pass; C26 (`claudeq.py audit`) is manual"},
+     "standard": "§2a.3", "check": "`claudeq.py audit` (C26): every Claude spawn point goes through the slot",
+     "requires": ("bin/claudeq.py",),
+     "titles": ("a Claude spawn point goes around the box slot",)},
     {"id": "notify", "control": "notify.sh + notify_policy.json", "layer": "preventive",
      "standard": "§1", "check": "policy parses · `notify_policy.py selftest`",
      "requires": ("bin/notify.sh", "bin/notify_policy.py", "config/notify_policy.json"),
@@ -789,19 +791,22 @@ ARMED_CHECKS = (
      "standard": "§2a", "check": "listed under hooks.PreToolUse · executable · `schedule-check.py --audit` runs",
      "requires": ("bin/hook-guard-schedule.py", "bin/schedule-check.py"),
      "titles": ("the schedule-check PreToolUse hook is not armed",
+                "the schedule-check hook misreads commands — its selftest fails",
                 "schedule-check.py does not run — the crontab hook is calling a broken checker")},
     {"id": "session-ledger", "control": "SessionStart/End session ledger", "layer": "preventive",
-     "standard": "—", "check": None, "requires": ("bin/claude-session-notify.sh",),
-     "titles": (), "gap": "no armed-check; a dropped hook shows only as a quiet session ledger"},
+     "standard": "—", "check": "both hooks listed · executable · a ledger row in the last 26 h",
+     "requires": ("bin/claude-session-notify.sh",),
+     "titles": ("the session ledger is not armed",)},
     {"id": "models-require", "control": "models.require() roles", "layer": "preventive",
-     "standard": "§3", "check": None, "requires": ("bin/models.py",),
-     "titles": (), "gap": "no armed-check; detective: model-role-dead, model-fallback"},
+     "standard": "§3", "check": "`models.py check`: every role resolves to an installed model",
+     "requires": ("bin/models.py",),
+     "titles": ("models.py check fails — a local-model role cannot be served",)},
     {"id": "gpu-slot", "control": "gpu.slot() priority queue", "layer": "preventive",
-     "standard": "§3a", "check": None, "requires": ("bin/gpu.py",),
-     "titles": (), "gap": "no armed-check; detective: gpu-unmanaged"},
+     "standard": "§3a", "check": "`gpu.py selftest`", "requires": ("bin/gpu.py",),
+     "titles": ("gpu.py selftest fails — the GPU queue's ordering rules no longer hold",)},
     {"id": "publish-scan", "control": "publish.py leak scanner", "layer": "preventive",
-     "standard": "§5", "check": None, "requires": ("bin/publish.py",),
-     "titles": (), "gap": "no armed-check; detective: public-leak re-runs the scan daily"},
+     "standard": "§5", "check": "`publish.py selftest`", "requires": ("bin/publish.py",),
+     "titles": ("publish.py selftest fails — the leak scanner could let a secret through",)},
     {"id": "backup-refusal", "control": "backup.py credential refusal", "layer": "preventive",
      "standard": "—", "check": "`backup.py selftest`", "requires": ("bin/backup.py",),
      "titles": ("backup selftest fails — a credential could reach an archive",)},
@@ -822,6 +827,10 @@ ARMED_CHECKS = (
     {"id": "deadunits", "control": "dead-unit rule", "layer": "detective",
      "standard": "—", "check": "`deadunits.py selftest`", "requires": ("bin/deadunits.py",),
      "titles": ("deadunits selftest fails — the dead-unit rule no longer fires",)},
+    {"id": "crew-namer", "control": "the crew namer (one name per agent everywhere)", "layer": "detective",
+     "standard": "—", "check": "`tt_crew.py selftest` (resolver, tools-rule and badge fixtures) · every live job, scripts too, claimed once",
+     "requires": ("dashboard/tt_crew.py", "config/crew.json"),
+     "titles": ("crew selftest fails — the page can name the wrong agent",)},
     {"id": "smb-fruit", "control": "SMB share vfs_fruit (no Finder ._ files)", "layer": "preventive",
      "standard": "—", "check": "`testparm -s` loads fruit + streams_xattr · no AppleDouble since",
      "requires": (),
@@ -1308,6 +1317,69 @@ def audit(c=None):
     except Exception:
         pass
 
+    # The six controls the guardrail ledger listed as declared gaps (2026-09-26, David: "fix all
+    # the stuff that needs attention ... i want this to be perfect"). Each check is plain code,
+    # under a second, zero tokens — the same "prove it is armed" rule as claude-headless above.
+    try:
+        _st = load(os.path.expanduser("~/.claude/settings.json"), {}) or {}
+        _hk = lambda ev: [h.get("command", "") for grp in (_st.get("hooks", {}).get(ev) or [])
+                          for h in grp.get("hooks", [])]
+        _g = os.path.join(MC, "bin", "hook-guard-claude.py")
+        # one string, not an argv list: the hook's --test joins its arguments anyway, and the
+        # list form reads as a Claude spawn to _CLAUDE_SPAWN (it made this file "spawn a session")
+        _bad = sh(["python3", _g, "--test", "claude -p hi"], timeout=10) or ""
+        _ok = sh(["python3", _g, "--test", os.path.join(MC, "bin", "claude-headless"), "-p", "hi"], timeout=10) or ""
+        if (not any("hook-guard-claude" in c for c in _hk("PreToolUse")) or not os.access(_g, os.X_OK)
+                or not _bad.startswith("VIOLATION") or _ok.strip() != "ok"):
+            _finding(f, "guardrail-inert", "high", "the claude-spawn guard is not armed",
+                     "bin/hook-guard-claude.py must be listed under hooks.PreToolUse in ~/.claude/"
+                     "settings.json, be executable, flag a bare `claude -p` and pass claude-headless "
+                     f"(got: {_bad.strip()[:60]!r} / {_ok.strip()[:30]!r}). Without it a session can "
+                     "spawn on the rotating credential that killed auth box-wide three times.")
+        _n = os.path.join(MC, "bin", "claude-session-notify.sh")
+        _led = os.path.join(MC, "state", "claude_sessions.jsonl")
+        _age = time.time() - os.path.getmtime(_led) if os.path.exists(_led) else None
+        if (not any("claude-session-notify" in c for c in _hk("SessionStart"))
+                or not any("claude-session-notify" in c for c in _hk("SessionEnd"))
+                or not os.access(_n, os.X_OK) or _age is None or _age > 26 * 3600):
+            _finding(f, "guardrail-inert", "high", "the session ledger is not armed",
+                     "bin/claude-session-notify.sh must be listed under hooks.SessionStart AND "
+                     "hooks.SessionEnd and be executable, and state/claude_sessions.jsonl must have a "
+                     f"row from the last 26 h (newest: {'none' if _age is None else f'{_age / 3600:.0f} h ago'}). "
+                     "Every headless-run count, push and usage attribution reads it.")
+    except Exception:
+        pass
+    def _selfcheck(cmd, want=None):
+        """-> (ok, output) for a zero-token checker in bin/: exit 0, no FAIL line, and `want` present."""
+        try:
+            r = subprocess.run(["python3", os.path.join(MC, "bin", cmd[0]), *cmd[1:]],
+                               capture_output=True, text=True, timeout=60)
+            out = (r.stdout or "") + (r.stderr or "")
+            return (r.returncode == 0 and "FAIL" not in out and (not want or want in out),
+                    out.strip().replace("\n", " | ")[-300:])
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+    _ok, _out = _selfcheck(["claudeq.py", "audit"], "every Claude spawn point goes through claudeq")
+    if not _ok:
+        _finding(f, "guardrail-inert", "high", "a Claude spawn point goes around the box slot",
+                 "`claudeq.py audit` (C26) found a launch that does not take the box slot — a "
+                 "reservation every other project has to schedule around. Its output: " + _out)
+    _ok, _out = _selfcheck(["models.py", "check"])
+    if not _ok:
+        _finding(f, "guardrail-inert", "high", "models.py check fails — a local-model role cannot be served",
+                 "a job asking models.require() for that role exits 75. Its output: " + _out)
+    _ok, _out = _selfcheck(["gpu.py", "selftest"], "passed")
+    if not _ok:
+        _finding(f, "guardrail-inert", "high",
+                 "gpu.py selftest fails — the GPU queue's ordering rules no longer hold",
+                 "Stocks-first ordering on the one GPU keeps local jobs out of the trading path. "
+                 "Its output: " + _out)
+    _ok, _out = _selfcheck(["publish.py", "selftest"], "passed")
+    if not _ok:
+        _finding(f, "guardrail-inert", "high",
+                 "publish.py selftest fails — the leak scanner could let a secret through",
+                 "the scanner is the only gate between the private repos and GitHub. Its output: " + _out)
+
     # SMB share hygiene (2026-09-25, memo from stocks): without vfs_fruit, every Finder copy onto
     # the user-home share left a `._<name>` AppleDouble sidecar beside the file, and every
     # glob, rglob and the catalog's undeclared-file sweep read it as a real file. The fix is
@@ -1366,6 +1438,15 @@ def audit(c=None):
                      "bin/hook-guard-schedule.py must be listed under hooks.PreToolUse "
                      "(matcher Bash) in ~/.claude/settings.json and be executable, or a "
                      "crontab install goes in unchecked again")
+        elif subprocess.run([sys.executable, _hook, "selftest"], capture_output=True,
+                            text=True, timeout=30).returncode != 0:
+            # ...and it must tell an install from a mention (2026-09-26: prose in heredocs that
+            # said "crontab" was 4 of its 5 BLOCKs — a hook that cries wolf gets turned off)
+            _finding(f, "guardrail-inert", "high",
+                     "the schedule-check hook misreads commands — its selftest fails",
+                     "run `python3 ~/maintenance/bin/hook-guard-schedule.py selftest`: each FAIL is a "
+                     "command it would call an install (or miss). A hook that blocks prose gets "
+                     "switched off; one that misses an install is not a guard.")
         elif os.path.exists(_chk):
             # ...and the checker it calls must still run. A hook that shells out to a broken
             # script is the guardrail-inert pattern one level down.
@@ -1450,6 +1531,10 @@ def audit(c=None):
         "Stocks/_engine/dashboard/advised_page.py": "pushes to another person's topic",
         "clientco-db/scripts/ntfy.py":      "project-local helper; reads the same ntfy.json",
         "maintenance/bin/backoffice.py":   "this rule quotes the pattern it looks for",
+        "Stocks/_engine/agent/journal/ops/_sandbox/sitecustomize.py":
+            "the proof sandbox — it names ntfy.sh to BLOCK every push a proof run attempts",
+        "Stocks/_engine/agent/journal/ops/2026-09-12_hunt_proof_sandbox.py":
+            "the proof that the sandbox blocks a raw ntfy.sh post (to a fake topic)",
     }
     # Copies are not call sites. ~/public/ is generated FROM the private repos, worktrees are
     # throwaway checkouts, and vendored/venv trees are not ours — flagging them would make the
@@ -1653,10 +1738,59 @@ def audit(c=None):
                  "runs) and two cases that must still page. Output: "
                  + _sn_st.strip().replace("\n", " | ")[-300:])
 
+    # 23. crew-unclaimed (v2.5, 2026-09-26; v2.7 scripts too): every scheduled job belongs to exactly
+    #     one named agent in config/crew.json (David 2026-09-26: "make all automated jobs assigned to
+    #     an agent"), or the Overview's crew and every "who ran this" line on the page quietly miss it.
+    #     A job no agent claims (or two do), a declared agent with no job that is not on demand, and an
+    #     agent whose `does` is not a badge family are findings; an accepted one is muted in
+    #     backoffice_mute.json.
+    _cw = sh([sys.executable, os.path.join(MC, "dashboard", "tt_crew.py"), "check"], timeout=90)
+    try:
+        for h in json.loads(_cw or "null") or []:
+            _finding(f, "crew-unclaimed", "low", h["text"],
+                     "config/crew.json is Mission Control's display layer over the scheduled jobs "
+                     "(dashboard/tt_crew.py). Claim the job with a `cmd` substring on the agent whose "
+                     "work it feeds or keeps running (the longest match wins; a script too), add a "
+                     "new agent for it, or mark an agent "
+                     "`on_demand`. `python3 dashboard/tt_crew.py selftest` proves the whole fleet "
+                     "is claimed once.", project="Mission Control", fix="human", key=h["id"])
+    except Exception:
+        pass
+    # 23b. and the namer itself must be provable — rule `guardrail-inert`
+    _cw_st = sh([sys.executable, os.path.join(MC, "dashboard", "tt_crew.py"), "selftest"], timeout=120) or ""
+    if not re.search(r"^0 failure\(s\)$", _cw_st, re.M):
+        _finding(f, "guardrail-inert", "med",
+                 "crew selftest fails — the page can name the wrong agent",
+                 "run `python3 ~/maintenance/dashboard/tt_crew.py selftest`; it resolves the real "
+                 "queue names (ops:signals, research:COO, the Bench in the VP's window), the tools "
+                 "rule and every agent's badge family, and checks every live job is claimed once. Output: " + _cw_st.strip().replace("\n", " | ")[-300:])
+
     uniq = {}
     for x in f:
         uniq.setdefault(x["id"], x)
     return sorted(uniq.values(), key=lambda x: SEV[x["sev"]])
+
+
+def expire_mutes(today=None):
+    """A mute can carry an end date: `_until: {entry: "YYYY-MM-DD"}` (2026-09-26). Past it, the
+    entry leaves `muted` for `_expired` (with its reason and the date), so the finding is back the
+    next morning — a deferral ("stop pinging and try again next month") must not become a mute
+    nobody remembers, the same rule config/dev.json keeps for in-development labels. Done here,
+    in the file, so every reader of the mute list (this pass, schedule-check, the dashboard) sees
+    the same active list. -> the entries that expired."""
+    cfg = load(MUTE, {})
+    until = cfg.get("_until") or {}
+    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    gone = [k for k, d in until.items() if str(d) < today]
+    if not gone:
+        return []
+    for k in gone:
+        if k in cfg.get("muted", []):
+            cfg["muted"].remove(k)
+        cfg.setdefault("_expired", {})[k] = {"until": until.pop(k),
+                                             "reason": (cfg.get("_reasons") or {}).pop(k, None)}
+    save(MUTE, cfg, indent=1)
+    return gone
 
 
 def merge_findings(fresh):
@@ -1664,6 +1798,7 @@ def merge_findings(fresh):
     a finding that has been open for a week must not push again, and one that disappears
     is recorded as resolved rather than forgotten."""
     store = load(FINDINGS, {})
+    expire_mutes()
     muted = set(load(MUTE, {}).get("muted", []))
     # an open record under the same KEY is the same problem whose title's number moved on
     # ("89h" -> "96h"): it is updated in place, keeping its id and first_seen, instead of
@@ -2299,6 +2434,17 @@ def selftest():
         check("appledouble: a new AppleDouble file is found; old, non-AppleDouble, archived and "
               "hidden-root ones are not", got == ["proj/._new.pdf"], got)
 
+        # a mute with an end date leaves `muted` the day after it, with its reason kept
+        save(MUTE, {"muted": ["k-old", "k-new", "k-plain"], "_reasons": {"k-old": "why", "k-new": "why2"},
+                    "_until": {"k-old": "2026-09-01", "k-new": "2099-01-01"}})
+        gone = expire_mutes(today="2026-09-26")
+        mc = load(MUTE, {})
+        check("mute expiry: a past _until leaves the list with its reason; a future one and a plain mute stay",
+              gone == ["k-old"] and mc["muted"] == ["k-new", "k-plain"]
+              and mc["_expired"]["k-old"] == {"until": "2026-09-01", "reason": "why"}
+              and "k-old" not in mc["_until"] and "k-old" not in mc["_reasons"], mc)
+        save(MUTE, {"muted": []})
+
         # keys
         a, b = [], []
         job = {"sched": "20 8 * * *", "scripts": ["memo-process.py"], "log": "x.log", "project": "maintenance"}
@@ -2607,6 +2753,9 @@ def selftest():
 
 
 if __name__ == "__main__":
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
+        print((__doc__ or "").strip() or "usage: see the header of " + __file__)
+        sys.exit(0)
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     dry = "--dry" in sys.argv
     if cmd == "census":

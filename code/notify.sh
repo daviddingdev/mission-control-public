@@ -12,6 +12,7 @@
 # Everything is recorded to state/notifications.jsonl either way (with tier + pushed), which is
 # the permanent history the dashboard renders and the rollup reads — ntfy.sh keeps only ~12h.
 # If the policy layer errors, the push is SENT: a throttle bug must never eat an outage alert.
+case "${1:-}" in -h|--help) sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0 ;; esac   # `--help` never runs the job (2026-09-26)
 cd "$(dirname "$0")/.." || exit 1
 
 TIER=""

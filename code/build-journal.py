@@ -6,6 +6,9 @@ import os, subprocess, sys, time
 HOME = os.path.expanduser("~")
 sys.path.insert(0, f"{HOME}/maintenance/bin")
 from localllm import ask
+if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
+    print((__doc__ or "").strip() or "usage: see the header of " + __file__)
+    sys.exit(0)
 
 # derived, not declared: every project on the box is whatever has a git repo in ~,
 # so a new project appears in the journal without anyone editing this line

@@ -251,6 +251,9 @@ def main():
 
 
 if __name__ == "__main__":
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
+        print((__doc__ or "").strip() or "usage: see the header of " + __file__)
+        sys.exit(0)
     if sys.argv[1:2] == ["selftest"]:
         sys.exit(selftest())
     main()

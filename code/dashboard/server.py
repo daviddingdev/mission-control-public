@@ -324,6 +324,12 @@ def system_stats():
     s["updates_available"] = _slow_bg("apt", 3600, _apt_updates, None)
     s["updates_applicable"] = _slow_bg("apt_applicable", 3600, _apt_applicable, None)
     s["reboot_required"] = os.path.exists("/var/run/reboot-required")
+    # O1: the dry-runs count against the package lists apt last downloaded — "nothing to install"
+    # is only as new as they are (2026-09: a month old, so "OS up to date" was a stale claim)
+    try:
+        s["apt_lists_at"] = int(max(os.path.getmtime(f) for f in glob.glob("/var/lib/apt/lists/*InRelease")))
+    except Exception:
+        s["apt_lists_at"] = None
     # update-run status
     st = _exp_state().get("__update__", {})
     s["update_running"] = bool(st.get("pid")) and _pid_alive(st.get("pid", -1))
@@ -336,7 +342,39 @@ def system_stats():
         return (lines[-1][-120:] if lines else ""), _update_summary(ulog)
     # a 320 KB log read twice per build, for a line that changes when an update runs
     s["update_tail"], s["update_last"] = _by_sig("update_log", (ulog,), tail)
+    # upsc can take its whole 4 s timeout: read on a background thread, never inside the build
+    s["power"] = _slow_bg("ups", 120, _ups_state, None) or {"state": "unknown", "words": "Power: reading the UPS…", "tone": ""}
     return s
+
+
+def _ups_state():
+    """The UPS in plain words (v2.5, 2026-09-26). Read from `upsc` — never from a unit name being up:
+    the NUT driver is being changed to start when the USB cable is plugged in instead of restart-looping,
+    so what answers is the fact. The cable has been out since the 08-30 boot: "Driver not connected"."""
+    import subprocess
+    try:
+        r = subprocess.run(["upsc", "cyberpower", "ups.status"], capture_output=True, text=True, timeout=4)
+        out = (r.stdout or "").strip().split()
+        err = (r.stderr or "") + (r.stdout if r.returncode else "")
+    except FileNotFoundError:
+        return {"state": "none", "words": "Power: no UPS software on this box — a power cut hard-stops the box", "tone": "warn"}
+    except Exception as e:
+        return {"state": "unknown", "words": f"Power: UPS state unknown ({type(e).__name__})", "tone": "warn"}
+    if r.returncode or not out:
+        if re.search(r"Data stale", err, re.I):          # attached, but the driver is not updating
+            return {"state": "stale", "words": "Power: UPS not reporting — a power cut may hard-stop the box", "tone": "warn",
+                    "why": err.strip().splitlines()[-1][:120] if err.strip() else ""}
+        if re.search(r"not connected|Unknown UPS|Connection failure", err, re.I):
+            return {"state": "none", "words": "Power: no UPS connected — a power cut hard-stops the box", "tone": "warn",
+                    "why": err.strip().splitlines()[-1][:120] if err.strip() else ""}
+        return {"state": "unknown", "words": "Power: UPS state unknown", "tone": "warn"}
+    flags = set(out)
+    if "OB" in flags:
+        return {"state": "battery", "words": "Power: on UPS battery — mains is out", "tone": "bad",
+                "low": "LB" in flags}
+    if "OL" in flags:
+        return {"state": "mains", "words": "Power: on mains, UPS connected", "tone": "ok"}
+    return {"state": "unknown", "words": f"Power: UPS says {' '.join(out)[:40]}", "tone": "warn"}
 
 
 def _update_summary(ulog):
@@ -356,7 +394,7 @@ def _update_summary(ulog):
         if len(blocks) < 2:
             return ""
         last = blocks[-1]
-        when = last.split("===")[0].strip()[11:16]          # HH:MM off the ISO stamp
+        when = _update_when(last.split("===")[0].strip())   # "today 12:21 PM", "Aug 29, 12:21 PM" (Eastern)
         if "BLOCKED" in last:
             return f"last run {when} — BLOCKED: passwordless apt not configured"
         held = 0
@@ -368,9 +406,29 @@ def _update_summary(ulog):
         if "update complete" not in last:
             return f"last run {when} — did not finish"
         extra = f", {held} held back (need full-upgrade)" if held else ""
-        return f"last run {when} — {installed} installed{extra}"
+        got = "nothing to install" if not installed else f"{installed} installed"
+        return f"last run {when} — {got}{extra}"
     except Exception:
         return ""
+
+
+def _update_when(iso):
+    """The update log's UTC ISO stamp in the page's words: Eastern, 12-hour, with the day
+    (v2.5 fix: a bare "16:21" read as a future time on a page that is Eastern everywhere)."""
+    try:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        t = datetime.fromisoformat(iso).astimezone(et)
+        today = datetime.now(et).date()
+        clock = t.strftime("%I:%M %p").lstrip("0")
+        if t.date() == today:
+            return f"today {clock}"
+        if t.date() == today - timedelta(days=1):
+            return f"yesterday {clock}"
+        return f"{t.strftime('%b')} {t.day}, {clock}"
+    except Exception:
+        return iso[11:16]
 
 
 _SPAWNS = re.compile(r'subprocess\.\w+\(\s*\[\s*["\']claude|runner\.launch|"claude",\s*"-p"')
@@ -995,7 +1053,13 @@ KNOWN_PORTS = {
     3493: ("NUT / UPS daemon", "system"), 4317: ("OpenTelemetry", "system"),
     8125: ("StatsD (netdata)", "system"), 51820: ("WireGuard (tailscale)", "system"),
     53: ("DNS", "system"), 11434: ("ollama — local AI models", "Mission Control"),
+    11000: ("NVIDIA DGX Dashboard (vendor)", "system"),
+    8090: ("Poker App Store build — dev server (on demand)", "poker-appstore"),
+    8443: ("tailscale serve HTTPS → poker App Store build (on demand)", "poker-appstore"),
 }
+# Ports that listen only while someone works on them (v2.5, polish #15): declared, so a listening one is
+# never "undeclared", and listed as a service only while it listens — off is their normal state, not down.
+ON_DEMAND_PORTS = {8090, 8443}
 
 
 def ports():
@@ -1009,7 +1073,8 @@ def ports():
     except Exception:
         pass
     rows = [{"port": p, "service": s, "project": proj, "live": p in listening}
-            for p, (s, proj) in sorted(KNOWN_PORTS.items()) if proj != "system" or p in listening]
+            for p, (s, proj) in sorted(KNOWN_PORTS.items())
+            if (proj != "system" and p not in ON_DEMAND_PORTS) or p in listening]
     other = sorted(p for p in listening if p not in KNOWN_PORTS and p < 30000)
     return {"rows": rows, "other": other}
 
@@ -1242,6 +1307,14 @@ def backoffice():
         out["last"] = rows[-1] if rows else None
     except Exception:
         pass
+    # v2.5 (polish #4): the newest check.py run against the live page; a dashboard-broken finding filed
+    # before a passing run says "passes now" on the Janitor and Guardrails pages
+    dc = _load_json(f"{HOME}/maintenance/state/dash_check.json", {}) or {}
+    out["dash_check"] = {"ts": dc.get("ts"), "ok": dc.get("ok")} if isinstance(dc, dict) and dc.get("ts") else None
+    for f in out["open"]:
+        if f.get("kind") == "dashboard-broken" and out["dash_check"] and out["dash_check"]["ok"] is True \
+                and (out["dash_check"]["ts"] or 0) > (f.get("first_seen") or 0):
+            f["passes_now"] = out["dash_check"]["ts"]
     cen = _load_json(f"{HOME}/maintenance/state/census.json", {})
     out["census"] = {"at": cen.get("at"), "projects": len(cen.get("projects", {})),
                      "crons": len(cen.get("crons", [])), "ports": len(cen.get("ports", []))}
@@ -1352,6 +1425,39 @@ def catalog_origin(origin):
             "grouped_by": "project" if origin == "internal" else "where it came from"}
 
 
+# D1 (2026-09-26): a stale feed David deferred himself ("stop pinging and try again next month")
+# is muted in config/backoffice_mute.json, so Box › Janitor counted it as an accepted deviation
+# while the Overview Data card and Data › Catalog drew the same four datasets as open and red.
+# Every catalog count now applies the same mute list the janitor does: `stale` is what nobody
+# chose to live with, `held` is what David paused, with the mute's end date and its reason.
+MUTE_FILE = f"{HOME}/maintenance/config/backoffice_mute.json"
+
+
+def _catalog_holds():
+    """{mute key: {"until", "why"}} for every live catalog-stale mute. A mute past its `_until`
+    is not a hold even before the janitor moves it to `_expired` (bin/backoffice.py
+    expire_mutes), so the page turns amber again on the morning the deferral ends."""
+    cfg = _load_json(MUTE_FILE, {})
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    until, why = cfg.get("_until") or {}, cfg.get("_reasons") or {}
+    return {k: {"until": until.get(k), "why": why.get(k)} for k in cfg.get("muted", [])
+            if str(k).startswith("catalog-stale:") and not (until.get(k) and str(until[k]) < today)}
+
+
+def _hold_key(project, cid):
+    """The key bin/backoffice.py mutes a catalog-stale finding under (_catalog_key → _key)."""
+    s = re.sub(r"[^a-z0-9._@:+-]+", "-", f"catalog-stale:{project}:{cid}".lower()).strip("-")
+    return re.sub(r"-{2,}", "-", s)[:200]
+
+
+def _catalog_held(ent, holds=None):
+    """{dataset id: hold} for the stale datasets whose finding David muted."""
+    holds = _catalog_holds() if holds is None else holds
+    return {cid: holds[_hold_key(r.get("project", ""), cid)] for cid, r in ent.items()
+            if r.get("exists") and not r.get("fresh")
+            and _hold_key(r.get("project", ""), cid) in holds}
+
+
 def catalog_project(slug):
     """One project's drill-down: what it owns, what it reads from others, what others read
     from it. Metadata only — an id, a one-line description of what a record contains, a size.
@@ -1390,6 +1496,12 @@ def catalog_project(slug):
                         "observed": slug in (r.get("readers_seen") or [])})
     p = dict(st.get("projects", {}).get(slug, {}))
     p.pop("undeclared_sample", None)
+    held = _catalog_held({k: r for k, r in ent.items() if r["project"] == slug})
+    for b in owns:
+        if b["id"] in held:
+            b["held"] = held[b["id"]]
+    if held:
+        p["stale"], p["held"] = max(0, (p.get("stale") or 0) - len(held)), len(held)
     return {"project": slug, "meta": p, "owns": owns, "ins": ins, "outs": outs,
             "bytes": sum(x["bytes"] or 0 for x in owns)}
 
@@ -1441,7 +1553,7 @@ def catalog_view():
     the 30-day read window also move with the clock."""
     paths = [f"{HOME}/maintenance/state/{x}" for x in
              ("catalog.json", "catalog_reads.jsonl", "findings.json")]
-    paths.append(os.path.join(BASE, "index.html"))
+    paths += [os.path.join(BASE, "index.html"), MUTE_FILE]
     return _by_sig("catalog_view", paths, _catalog_view_build, max_age=300,
                    extra=_SWEEP["t"])
 
@@ -1521,12 +1633,31 @@ def _catalog_view_build():
         p["export_bytes"] = sum(r["bytes"] or 0 for r in mine
                                 if set(r["declared"] + r["seen"]) - {sl})
     order = sorted(projs, key=lambda p: (-(projs[p].get("declared") or 0), p))
+    # D1: the findings David paused leave "Open findings" for their own group, with the reason
+    holds = _catalog_holds()
+    open_f, held = [], []
+    for f in _catalog_findings(cat, st):
+        m = re.match(r"^(\S+) is \d+d old", f.get("title") or "")
+        h = holds.get(_hold_key(f.get("project", ""), m.group(1))) if f.get("kind") == "catalog-stale" and m else None
+        # fix2: the dataset id and its age ride along, so the page says "board · last written Aug 8", not the raw title
+        if m and f.get("kind") == "catalog-stale":
+            f = {**f, "id": m.group(1), "age_h": (ent.get(m.group(1)) or {}).get("age_h")}
+        (held.append({**f, **h}) if h else open_f.append(f))
+    counts = dict(st.get("counts", {}))
+    hd = _catalog_held(ent, holds)
+    if hd:
+        counts["stale"], counts["held"] = max(0, (counts.get("stale") or 0) - len(hd)), len(hd)
+        for cid in hd:
+            q = projs.get(ent[cid]["project"])
+            if q is not None:
+                q = projs[ent[cid]["project"]] = dict(q)
+                q["stale"], q["held"] = max(0, (q.get("stale") or 0) - 1), (q.get("held") or 0) + 1
     out = {"at": st.get("at"), "build": _build_id(),
-           "counts": st.get("counts", {}), "projects": projs,
+           "counts": counts, "projects": projs,
            "sources": st.get("sources", {}), "order": order,
            "errors": st.get("errors", []),
            "links": sorted(links.values(), key=lambda x: -x["n"]),
-           "findings": _catalog_findings(cat, st)}
+           "findings": open_f, "held": held}
     return out
 
 
@@ -1824,9 +1955,59 @@ def bus_pending():
     return out
 
 
+def _memo_title_cut(t, keep=96, cut=90):
+    """A memo title at most `keep` long: cut at a word before `cut`, and before an unclosed "("."""
+    if len(t) <= keep:
+        return t
+    c = t[:cut].rsplit(" ", 1)[0]
+    if c.count("(") > c.count(")"):
+        c = c[:c.rfind("(")]
+    return c.rstrip(" ,;:-") + "…"
+
+
+def _memo_title(path):
+    """K6 (2026-09-26): a memo's own H1, not its file slug — "Two Finder `._` files in group/derived"
+    read "Appledouble files in group derived". Backticks stripped, cut at the first " — ". Kept whole up
+    to 96 characters and the row's CSS clamps it to the width it has (fix2: a 60-character cap cut
+    "(10 false hbs files)" to "(10…" and made two memos read "…Fable 5.1 as its…"). Longer: cut at a
+    word before 90, and never inside an open parenthesis. None when the memo has no H1."""
+    try:
+        with open(path, errors="replace") as f:
+            for i, ln in enumerate(f):
+                if ln.startswith("# "):
+                    t = ln[2:].strip().replace("`", "").split(" — ")[0].strip()
+                    if not t or re.fullmatch(r"[\w.]+(?:-[\w.]+)+", t):
+                        return None      # an H1 that is itself the slug says nothing more
+                    return _memo_title_cut(t)
+                if i > 30:
+                    break
+    except Exception:
+        pass
+    return None
+
+
+def memo_titles():
+    """{memo slug: title} over the processed memos and every inbox, keyed by the slug with and
+    without its date prefix — the ledger, the queue's job names and the flow labels all use one
+    of the two. Rebuilt only when a memo folder changed."""
+    dirs = [f"{MEMOBUS}/processed"] + sorted(glob.glob(f"{MEMOBUS}/inbox/*"))
+
+    def build():
+        out = {}
+        for d in dirs:
+            for fp in glob.glob(f"{d}/*.md"):
+                t = _memo_title(fp)
+                if t:
+                    name = os.path.basename(fp)[:-3]
+                    out[name] = t
+                    out.setdefault(re.sub(r"^\d{4}-\d{2}-\d{2}_", "", name), t)
+        return out
+    return _by_sig("memo_titles", dirs, build, max_age=600)
+
+
 def bus():
     return {"projects": [{"slug": s, "label": l} for s, (_, l) in bus_projects().items()],
-            "ledger": parse_ledger(), "pending": bus_pending()}
+            "ledger": parse_ledger(), "pending": bus_pending(), "memo_titles": memo_titles()}
 
 
 def bus_process(target):
@@ -2431,7 +2612,8 @@ def catalog_summary():
     only — no walk, no stat storm on an 8-second cache — and only when it changed (it is
     compiled once a day; parsing its 240 KB on every build was most of this function)."""
     path = f"{HOME}/maintenance/state/catalog.json"
-    return dict(_by_sig("catalog_summary", (path,), lambda: _catalog_summary_build(path)))
+    return dict(_by_sig("catalog_summary", (path, MUTE_FILE), lambda: _catalog_summary_build(path),
+                        max_age=3600))   # a mute's end date moves with the clock, not the file
 
 
 def _catalog_summary_build(path):
@@ -2441,11 +2623,17 @@ def _catalog_summary_build(path):
     declared = sum(p.get("declared", 0) for p in projs.values())
     undeclared = sum(p.get("undeclared", 0) or 0 for p in projs.values())
     nodecl = sorted(p.get("dir") or sl for sl, p in projs.items() if not p.get("has_catalog"))
+    ent = st.get("entries", {})
+    held = _catalog_held(ent)
+    hu = sorted(h["until"] for h in held.values() if h.get("until"))
     return {"at": st.get("at"), "datasets": c.get("datasets", 0),
+            "held": len(held), "held_until": hu[0] if hu else None,
+            "held_projects": sorted({ent[k]["project"] for k in held}),
             "projects_declaring": c.get("projects_declaring", 0),
             "projects_total": len(projs), "projects_without": nodecl,
             "coverage_pct": round(declared / (declared + undeclared) * 100) if declared + undeclared else 100,
-            "undeclared": undeclared, "stale": c.get("stale", 0), "orphan": c.get("orphan", 0),
+            "undeclared": undeclared, "stale": max(0, c.get("stale", 0) - len(held)),
+            "orphan": c.get("orphan", 0),
             "external": c.get("external", 0), "internal": c.get("internal", 0),
             "mixed": c.get("mixed", 0), "read_30d": c.get("read_30d", 0)}
 
@@ -2586,6 +2774,7 @@ HOT_ROUTES = {
     "/api/heat":            (60, 1800, 10),
     "/api/notifications":   (30, 600, 11),
     "/api/usage":           (120, 1800, 12),
+    "/api/crew":            (60, 600, 13),
 }
 
 
@@ -2819,7 +3008,11 @@ TT_ROUTES = {
     "/api/flow":      ("tt_flow", "flow"),          # who hands work to whom (v2.1)
     "/api/decisions": ("tt_decide", "state"),       # David's answers to Needs attention (v2.1)
     "/api/live":      ("tt_live", "live"),          # what runs now, and what it touches (v2.2)
+    "/api/crew":      ("tt_crew", "crew"),          # the named agents, their state and runs (v2.5)
 }
+# v2.5: tt_crew.stamp() puts `agent` + `agent_name` on every run these feeds carry — one namer for
+# the desk, the crew, Recent runs and "Last used by"
+CREW_STAMPED = {"/api/fleet", "/api/live", "/api/sessions", "/api/timeline", "/api/flow"}
 # Routes that never enter the hot cache (v2.2, 2026-09-24). /api/live is a now-view the page
 # polls every 3 s while something runs: its module keeps its own 2 s cache over incremental file
 # tails (a build is ~1 ms warm), so it goes straight through like a `since=` cursor. As a hot
@@ -2874,11 +3067,22 @@ def _tt_call(path, strict=False):
     mod_name, fn_name = TT_ROUTES[u.path]
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     try:
-        return _tt_fn(mod_name, fn_name)(q)
+        data = _tt_fn(mod_name, fn_name)(q)
     except Exception as e:
         if strict:
             raise
         return {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+    if u.path in CREW_STAMPED:
+        try:
+            data = _tt_fn("tt_crew", "stamp")(u.path, data)
+        except Exception as e:              # the crew never blanks a feed
+            print(f"[dashboard] crew stamp {u.path}: {type(e).__name__}: {e}", flush=True)
+    if u.path in ("/api/sessions", "/api/flow") and isinstance(data, dict):
+        try:
+            data["memo_titles"] = memo_titles()     # K6: memos read by their H1 on every list
+        except Exception as e:
+            print(f"[dashboard] memo titles: {type(e).__name__}: {e}", flush=True)
+    return data
 
 
 def _tt_post(path, body):

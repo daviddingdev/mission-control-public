@@ -401,7 +401,7 @@ def refresh(dry=False):
     file that was safe when somebody last looked at it.
     """
     build()
-    quarantined, changed = [], []
+    quarantined, changed, failed = [], [], []
     for name, spec in cfg()["projects"].items():
         if not spec.get("publish"):
             continue
@@ -420,13 +420,24 @@ def refresh(dry=False):
             continue                            # nothing moved in this project today
         changed.append(repo)
         if not dry:
-            publish(repo)
+            # one repo's failed push must not stop the others (2026-09-26: mission-control-public's
+            # push was rejected as non-fast-forward after its history was scrubbed — a push only
+            # David can make — and the exception aborted the loop, so stocks-public stopped
+            # refreshing too). The failure is still recorded, printed and returned non-zero.
+            try:
+                publish(repo)
+            except RuntimeError as e:
+                changed.remove(repo)
+                failed.append({"repo": repo, "error": str(e)[-400:]})
+                print(f"  {repo}: push FAILED —")
+                for ln in str(e).strip().splitlines()[-6:]:     # git's own words: the dashboard's
+                    print(f"    {ln[:200]}")                    # answer reads "[rejected]" from here
     if quarantined:
         print(f"  QUARANTINED {len(quarantined)} file(s) — a published file started leaking:")
         for q in quarantined:
             print(f"    {q['file']}  [{q['why']}] {q['match']}")
-    print(f"refresh: {len(changed)} repo(s) updated, {len(quarantined)} quarantined")
-    out = {"at": int(time.time()), "updated": changed, "quarantined": quarantined}
+    print(f"refresh: {len(changed)} repo(s) updated, {len(quarantined)} quarantined, {len(failed)} failed")
+    out = {"at": int(time.time()), "updated": changed, "quarantined": quarantined, "failed": failed}
     try:
         with open(os.path.join(MC, "state/publish_refresh.json"), "w") as fh:
             json.dump(out, fh, indent=1)
@@ -537,6 +548,9 @@ def status():
 
 
 if __name__ == "__main__":
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
+        print((__doc__ or "").strip() or "usage: see the header of " + __file__)
+        sys.exit(0)
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     arg = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else None
     if cmd == "scan":
@@ -550,7 +564,7 @@ if __name__ == "__main__":
     elif cmd == "publish":
         sys.exit(publish(arg, dry="--dry" in sys.argv))
     elif cmd == "refresh":
-        refresh(dry="--dry" in sys.argv)
+        sys.exit(1 if refresh(dry="--dry" in sys.argv).get("failed") else 0)
     elif cmd == "selftest":
         sys.exit(selftest())
     elif cmd == "candidates":

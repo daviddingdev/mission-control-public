@@ -14,9 +14,11 @@ import server
 STATE = f"{HOME}/maintenance/state/sentinel.json"
 COOLDOWN = 24 * 3600
 # Authoritative state files — these OUTRANK log tails (day-1 lesson: a stale
-# "CYCLE CHECK FAIL" tail caused a false alarm while cycle_state.json said ok)
+# "CYCLE CHECK FAIL" tail caused a false alarm while cycle_state.json said ok).
+# Catalog ids, not paths (box rule 8; the 2026-W39 catalog review found this the one hard-coded
+# reach into another project left in bin/): clientco-db declares us a reader of cycle_state.
 STATE_PROBES = [
-    ("clientco monthly cycle", f"{HOME}/clientco-db/logs/cycle_state.json"),
+    ("clientco monthly cycle", "clientco-db/cycle_state"),
 ]
 
 
@@ -127,11 +129,13 @@ def main():
     # file as a dead watchdog. The log mtime is the "last ran" fact.
     w_age = f"{int((time.time() - w['last_check']) / 60)}m ago" if w.get("last_check") else "unknown"
     probes = []
-    for name, path in STATE_PROBES:
+    import catalog
+    for name, cid in STATE_PROBES:
         try:
-            probes.append(f"{name}: {open(path).read().strip()[:300]}")
-        except Exception:
-            pass
+            probes.append(f"{name}: {open(catalog.path(cid, proj='maintenance')).read().strip()[:300]}")
+        except Exception as e:
+            # an id that stopped resolving is a broken contract, not a quiet skip
+            probes.append(f"{name}: UNREADABLE — catalog id {cid}: {type(e).__name__}: {str(e)[:160]}")
     prompt = (
         "You are a server ops sentinel. Below: authoritative STATE FILES, every scheduled job "
         "(expected cadence, last-run age, last log line) and the watchdog state. STATE FILES "
@@ -260,6 +264,9 @@ def _selftest(target=None):
 
 
 if __name__ == "__main__":
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
+        print((__doc__ or "").strip() or "usage: see the header of " + __file__)
+        sys.exit(0)
     if sys.argv[1:2] == ["selftest"]:
         sys.exit(0 if _selftest() else 1)
     main()
