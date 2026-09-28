@@ -38,6 +38,16 @@ curl -sf -m 5 -o /dev/null "http://127.0.0.1:11434/api/tags" || FAIL+=("ollama(:
 python3 bin/models.py check >/dev/null 2>&1; [ $? -ge 2 ] && FAIL+=("local-model-role-unservable")
 
 systemctl --user is-active --quiet pokerlog 2>/dev/null || FAIL+=("pokerlog.service")
+# :8900 is the user unit maintenance-dashboard since 2026-09-28 (enabled = systemd owns it; the
+# rollback disables it and restores the cron keepalive). Enabled, it must be active AND capped:
+# MemoryMax is a guardrail — CPU and GPU share one memory pool with Ollama and the Stocks model
+# jobs — and `infinity` (an edit or a drop-in that lost the line) is an unarmed guardrail, so it
+# is loud. chk 8900 above stays: systemd only sees a process that exits; a hung one needs the probe.
+if systemctl --user is-enabled --quiet maintenance-dashboard 2>/dev/null; then
+  systemctl --user is-active --quiet maintenance-dashboard || FAIL+=("maintenance-dashboard.service")
+  [ "$(systemctl --user show -p MemoryMax --value maintenance-dashboard 2>/dev/null)" = infinity ] \
+    && FAIL+=("maintenance-dashboard-uncapped")
+fi
 
 # Headless-Claude auth canary — coded, zero tokens (memo 2026-08-28 from hbs: OAuth refresh
 # died ~08-27 and every `claude -p` job failed silently for a day). The CLI refreshes the

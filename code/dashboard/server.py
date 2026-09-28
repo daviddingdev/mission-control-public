@@ -1986,6 +1986,29 @@ def _memo_title(path):
     return None
 
 
+def bus_memo(project, name):
+    """{project, name, title, text, where} for ~/memos/inbox/<project>/<name> (or processed/<name>
+    once it has been handled) — secrets redacted like every other payload. Refuses anything that is
+    not a plain .md basename in a real inbox folder."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,60}", project or "") or \
+            not re.fullmatch(r"[\w][\w.-]{0,160}\.md", name or ""):
+        return {"error": "no such memo"}
+    base = os.path.join(HOME, "memos")
+    for where, p in (("inbox", os.path.join(base, "inbox", project, name)),
+                     ("processed", os.path.join(base, "processed", name))):
+        rp = os.path.realpath(p)
+        if not rp.startswith(os.path.realpath(base) + os.sep) or not os.path.isfile(rp):
+            continue
+        try:
+            text = open(rp, errors="replace").read()[:200_000]
+        except OSError:
+            continue
+        m = re.search(r"^#\s+(.+)$", text, re.M)
+        return _tt_fn("tt_now", "_scrub")({"project": project, "name": name, "where": where,
+                                          "title": m.group(1).strip() if m else name[:-3], "text": text})
+    return {"error": "no such memo"}
+
+
 def memo_titles():
     """{memo slug: title} over the processed memos and every inbox, keyed by the slug with and
     without its date prefix — the ledger, the queue's job names and the flow labels all use one
@@ -2025,7 +2048,7 @@ def bus_process(target):
         os.makedirs(os.path.dirname(log), exist_ok=True)
         with open(log, "ab") as fh:
             fh.write(f"\n=== process {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
-            _p = subprocess.Popen([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"],
+            _p = subprocess.Popen(_scoped([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"]),
                                   cwd=root, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
         _claim_slot(f"memo process ({target})", "memo", _p.pid, 15)
     except Exception as e:
@@ -2072,7 +2095,7 @@ def _claim_slot(job, kind, pid, est_min):
         sys.path.insert(0, f"{HOME}/maintenance/bin")
         import claudeq
         claudeq.take(job, pid, kind, est_min=est_min, preempt=True)
-        claudeq.watcher(pid)
+        claudeq.watcher(pid, prefix=_scoped([]))
     except Exception as e:
         print(f"[dashboard] claudeq claim failed for {job}: {type(e).__name__}: {e}", flush=True)
 
@@ -2082,8 +2105,42 @@ CLAUDE_HEADLESS = f"{HOME}/maintenance/bin/claude-headless"  # every -p spawn (b
 
 
 def _tmux_env():
-    return {"HOME": HOME, "USER": os.environ.get("USER", "user"),
-            "PATH": f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin", "TERM": "xterm-256color"}
+    env = {"HOME": HOME, "USER": os.environ.get("USER", "user"),
+           "PATH": f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin", "TERM": "xterm-256color"}
+    if os.environ.get("XDG_RUNTIME_DIR"):       # systemd-run --user (_scoped) finds the manager by it
+        env["XDG_RUNTIME_DIR"] = os.environ["XDG_RUNTIME_DIR"]
+    return env
+
+
+_SCOPE = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--"]
+_SCOPE_OK = []
+
+
+def _scoped(cmd):
+    """argv for a job the dashboard launches that must outlive it (2026-09-28). Under systemd
+    (serve.sh run sets MC_SUPERVISOR=systemd) this process's cgroup IS the unit: a restart kills
+    everything in it and MemoryMax counts it, so a memo session, an experiment, an apt run, a
+    tmux server or the relogin daemon launched from here would die with the dashboard.
+    `systemd-run --user --scope` moves the job into its own run-*.scope and execs it in place,
+    so Popen's pid stays the job's pid (_claim_slot, the experiment state and the watcher key on
+    it). Not under systemd: the argv is unchanged. Under systemd but no scope can be made (no
+    user manager answering): unchanged too, and said once in _server.log — a click that
+    silently launches nothing is worse than a job that shares the unit's cgroup. A failed probe
+    is not remembered, so the next launch asks again."""
+    if os.environ.get("MC_SUPERVISOR") != "systemd":
+        return list(cmd)
+    if not _SCOPE_OK:
+        try:
+            r = subprocess.run([*_SCOPE, "true"], capture_output=True, text=True, timeout=10)
+            err = "" if r.returncode == 0 else (r.stderr or f"exit {r.returncode}").strip()
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        if err:
+            print(f"[dashboard] systemd-run --scope fails ({err[:160]}) — launching in the "
+                  f"unit's cgroup: a restart would kill this job", flush=True)
+            return list(cmd)
+        _SCOPE_OK.append(True)
+    return [*_SCOPE, *cmd]
 
 
 def _bus_slug(x):
@@ -2169,8 +2226,8 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     if interactive:
         name = re.sub(r"[^a-zA-Z0-9_-]", "-", f"memo-{slug[:24]}-{time.strftime('%H%M')}")
         try:
-            subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", root,
-                            CLAUDE_BIN, prompt], env=_tmux_env(), timeout=15, check=True)
+            subprocess.run(_scoped(["tmux", "new-session", "-d", "-s", name, "-c", root,
+                                    CLAUDE_BIN, prompt]), env=_tmux_env(), timeout=15, check=True)
         except Exception as e:
             return {"ok": False, "msg": f"tmux launch failed: {e}"[:140]}
         return {"ok": True, "msg": f"Dispatched — session '{name}' is live (join from claude.ai/code or the app).",
@@ -2178,7 +2235,7 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     log = f"{HOME}/maintenance/logs/memo_process_{target}.log"
     os.makedirs(os.path.dirname(log), exist_ok=True)
     with open(log, "ab") as fh:
-        _p = subprocess.Popen([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"],
+        _p = subprocess.Popen(_scoped([CLAUDE_HEADLESS, "-p", prompt, "--dangerously-skip-permissions"]),
                               cwd=root, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
     _claim_slot(f"dispatch ({target})", "foreign", _p.pid, 30)
     return {"ok": True, "msg": "Dispatched headless."}
@@ -2326,7 +2383,7 @@ def run_experiment(slug):
         shell_cmd = f"echo DRY RUN {slug}; sleep 2; echo done"
     with open(log, "ab") as fh:
         fh.write(f"\n=== run {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
-        p = subprocess.Popen(["bash", "-c", shell_cmd], stdout=fh, stderr=fh,
+        p = subprocess.Popen(_scoped(["bash", "-c", shell_cmd]), stdout=fh, stderr=fh,
                              cwd=f"{HOME}/maintenance", start_new_session=True)
     _claim_slot(f"experiment {slug}", "foreign", p.pid, 60)
     state = _exp_state()
@@ -2340,7 +2397,7 @@ def run_update():
     st = state.get("__update__", {})
     if st.get("pid") and _pid_alive(st["pid"]):
         return {"ok": False, "error": "update already running"}
-    p = subprocess.Popen(["bash", f"{HOME}/maintenance/bin/update-spark.sh"],
+    p = subprocess.Popen(_scoped(["bash", f"{HOME}/maintenance/bin/update-spark.sh"]),
                          start_new_session=True)
     state["__update__"] = {"pid": p.pid, "started": int(time.time())}
     _save_exp_state(state)
@@ -3398,6 +3455,12 @@ class H(BaseHTTPRequestHandler):
             self._daily(backoffice())
         elif path == "/api/reports":
             self._daily({"reports": reports(), "attention": attention()})
+        elif path.startswith("/api/bus/memo"):
+            # one inbox memo's whole text, read-only (2026-09-26: the answer panel clipped a memo at
+            # 140 characters with no way to read it). Only a basename in a known inbox folder.
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(path).query)
+            self._json(bus_memo((q.get("project") or [""])[0], (q.get("name") or [""])[0]))
         elif path.startswith("/api/bus"):
             self._json(bus())
         elif path.startswith("/api/dailylog"):
@@ -3568,7 +3631,7 @@ class H(BaseHTTPRequestHandler):
                              d.get("source_file", ""), bool(d.get("interactive", True)))
         elif path in ("/api/relogin/start", "/api/relogin/cancel"):
             act = path.rsplit("/", 1)[1]
-            out = subprocess.run([_PY, f"{HOME}/maintenance/bin/claude-relogin.py", act],
+            out = subprocess.run(_scoped([_PY, f"{HOME}/maintenance/bin/claude-relogin.py", act]),
                                  capture_output=True, text=True, timeout=60)
             self._send(200, (out.stdout.strip() or "{}").encode(), "application/json")
             _hot_invalidate("/api/status")

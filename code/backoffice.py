@@ -176,10 +176,11 @@ def _project_of(text):
     return ""
 
 
-def _project_dirs():
+def _project_dirs(home=None):
+    home = home or HOME
     out = []
-    for name in sorted(os.listdir(HOME)):
-        p = os.path.join(HOME, name)
+    for name in sorted(os.listdir(home)):
+        p = os.path.join(home, name)
         if name.startswith(".") or name in NOT_PROJECTS or not os.path.isdir(p):
             continue
         if os.path.isdir(os.path.join(p, ".git")) or os.path.exists(os.path.join(p, "CLAUDE.md")):
@@ -197,22 +198,68 @@ def expected_gap_h(sched):
     if len(parts) != 5:
         return None
     minute, hour, dom, mon, dow = parts
+    days = _cron_dows(dow)
+    if days is not None and len(days) == 7:
+        dow = "*"                 # 0-6, */1, sun-sat: every day, the same as *
     m = re.match(r"\*/(\d+)", minute)
-    if m and hour == "*":
+    if m and hour == "*" and dom == "*" and dow == "*":
         return max(int(m.group(1)) / 60.0, 0.25)
     gap = 24.0
     if dom != "*":
         gap = 24 * 31
     elif dow != "*":
-        gap = 24 * 7
+        # The longest stretch the schedule skips, plus the day it resumes — whatever the
+        # hour and minute fields say, the gap is bounded by that stretch. Was a flat 168h
+        # that the weekday cap below it could never lower (memo weekday-crons-get-a-week-of-
+        # grace, 2026-09-27): 1-5 → Fri→Mon 72h, 1,3,5 → 72h, 0 → 168h.
+        gap = _weekday_gap_h(days) if days else 24 * 7
     elif m:                       # */N minutes inside an hour window
         gap = 24.0
-    # weekday-only jobs sit idle across the weekend
-    if dow != "*" and re.match(r"^[1-5](-[1-5])?$", dow):
-        gap = max(gap, 72.0)
     if hour != "*" and "-" in hour and dow in ("1-5", "*"):
         gap = max(gap, 72.0)
     return gap
+
+
+_DOW_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+
+
+def _cron_dows(dow):
+    """The weekdays (0=Sun … 6=Sat) a cron day-of-week field allows, or None if it doesn't
+    parse. Lists, ranges, steps (`*/2`, `1-5/2`), 0 and 7 both Sunday, three-letter names."""
+    def num(tok):
+        tok = tok.lower()
+        if tok in _DOW_NAMES:
+            return _DOW_NAMES.index(tok)
+        if tok.isdigit() and int(tok) <= 7:
+            return int(tok)
+        raise ValueError(tok)
+    days = set()
+    try:
+        for piece in dow.split(","):
+            rng, slash, step = piece.partition("/")
+            step = int(step) if slash else 1
+            if rng == "*":
+                lo, hi = 0, 7
+            elif "-" in rng:
+                lo, hi = map(num, rng.split("-", 1))
+            else:
+                lo = num(rng)
+                hi = 7 if slash else lo      # `N/S` reads as N-7/S
+            if step < 1 or lo > hi:
+                return None
+            days.update(d % 7 for d in range(lo, hi + 1, step))
+    except ValueError:
+        return None
+    return days or None
+
+
+def _weekday_gap_h(days):
+    """(longest run of consecutive disallowed weekdays, circular over the week, + 1) × 24."""
+    run = best = 0
+    for d in list(range(7)) * 2:  # walked twice so a run across Sat→Sun counts whole
+        run = 0 if d in days else run + 1
+        best = max(best, run)
+    return (min(best, 6) + 1) * 24.0
 
 
 def _git(repo):
@@ -831,6 +878,11 @@ ARMED_CHECKS = (
      "standard": "—", "check": "`tt_crew.py selftest` (resolver, tools-rule and badge fixtures) · every live job, scripts too, claimed once",
      "requires": ("dashboard/tt_crew.py", "config/crew.json"),
      "titles": ("crew selftest fails — the page can name the wrong agent",)},
+    {"id": "dashboard-unit", "control": "systemd unit maintenance-dashboard (Restart=always, MemoryMax=2G, MemorySwapMax=256M)",
+     "layer": "preventive", "standard": "—",
+     "check": "the unit is enabled · active · MemoryMax and MemorySwapMax are byte counts, not infinity",
+     "requires": ("dashboard/maintenance-dashboard.service", "dashboard/serve.sh"),
+     "titles": ("the dashboard unit is not armed — :8900 has no supervisor or no memory cap",)},
     {"id": "smb-fruit", "control": "SMB share vfs_fruit (no Finder ._ files)", "layer": "preventive",
      "standard": "—", "check": "`testparm -s` loads fruit + streams_xattr · no AppleDouble since",
      "requires": (),
@@ -838,6 +890,11 @@ ARMED_CHECKS = (
     {"id": "sentinel", "control": "sentinel page recheck", "layer": "detective",
      "standard": "—", "check": "`sentinel.py selftest`", "requires": ("bin/sentinel.py",),
      "titles": ("sentinel selftest fails — it can page on a job that already recovered",)},
+    {"id": "mdreader-drift", "control": "shared markdown reader: every vendored copy is the current build",
+     "layer": "detective", "standard": "—",
+     "check": "the canonical dist/ VERSION reads · `backoffice.py selftest` (the mdreader-drift fixtures)",
+     "requires": ("shared/mdreader/dist/mdreader.js",),
+     "titles": ("the mdreader drift rule cannot read the shared reader's VERSION — it checks nothing",)},
 )
 
 
@@ -866,6 +923,59 @@ def _appledouble_since(since, root=HOME):
             except OSError:
                 pass
     return sorted(out)
+
+
+# The box's one markdown reader (2026-09-27, David: "can we code some md reader to make things clean? this applies
+# to every dashboard we have"). Mission Control owns the source; every dashboard serves a COPY of its dist/ (a
+# project never reads another project's path), so a copy can be left behind by a rebuild. Rule `mdreader-drift`.
+MDREADER_DIST = os.path.join(MC, "shared", "mdreader", "dist")
+_MDR_NAME = re.compile(r"^mdreader(?:[.-][0-9A-Za-z][0-9A-Za-z.+-]*)?\.(?:js|py|css)$")   # also mdreader.1.3.0-7baad46b.js
+_MDR_SKIP = {"node_modules", ".git", "__pycache__", "venv", ".venv", "site-packages", "dist-packages", "archive",
+             ".mypy_cache", ".pytest_cache", ".claude"}   # .claude/worktrees = other sessions' scratch checkouts
+_MDR_STAMP = re.compile(r"""(?:\bVERSION\s*=\s*["']|/\*! mdreader )(\d+\.\d+\.\d+(?:\+[0-9a-f]{8})?)""")
+
+
+def _mdr_version(path):
+    """The VERSION a built mdreader file carries in its first 4 KB ("1.3.0+7baad46b": the JS `var VERSION`, the
+    Python `VERSION =`, the CSS banner), or None — no file, or no stamp (a hand-made or patched copy)."""
+    try:
+        with open(path, errors="replace") as fh:
+            m = _MDR_STAMP.search(fh.read(4096))
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def _mdreader_copies(home=None, canon=None, projects=None):
+    """-> sorted [(project, path, version|None)]: every vendored copy of the reader under ~/<project>/ — a file
+    named mdreader.js / .py / .css, or a versioned name like mdreader.1.3.0-7baad46b.js — outside the canonical
+    folder, skipping dependency trees, virtualenvs (any folder holding pyvenv.cfg) and archives. The roster is
+    the disk's (_project_dirs); ~0.1 s over the box's ~50k project files."""
+    home = home or HOME
+    canon = os.path.realpath(canon or os.path.dirname(MDREADER_DIST))
+    out = []
+    for name in (projects if projects is not None else _project_dirs(home)):
+        for d, subdirs, files in os.walk(os.path.join(home, name)):
+            subdirs[:] = [x for x in subdirs if x not in _MDR_SKIP and os.path.realpath(os.path.join(d, x)) != canon
+                          and not os.path.exists(os.path.join(d, x, "pyvenv.cfg"))]
+            out += [(name, os.path.join(d, fn), _mdr_version(os.path.join(d, fn))) for fn in files if _MDR_NAME.match(fn)]
+    return sorted(out, key=lambda r: (r[0], r[1]))
+
+
+def _mdreader_drift(copies, current):
+    """{project: [(path, version|None, why)]} for every copy that is not the `current` build: an older version, the
+    same version number built from other source (the hash differs), a stamp AHEAD of the source (edited in place),
+    or no stamp at all. A copy is a build artifact, never a fork (shared/mdreader/README.md, the drift rule)."""
+    num = lambda v: tuple(int(x) for x in re.match(r"(\d+)\.(\d+)\.(\d+)", v).groups())
+    out = {}
+    for proj, path, v in copies:
+        if v == current:
+            continue
+        why = ("carries no VERSION stamp" if not v else "is an older version" if num(v) < num(current)
+               else "is another build of the same version" if num(v) == num(current)
+               else "is ahead of its source — edited in place?")
+        out.setdefault(proj, []).append((path, v, why))
+    return out
 
 
 def _catalog_key(r):
@@ -1380,6 +1490,35 @@ def audit(c=None):
                  "publish.py selftest fails — the leak scanner could let a secret through",
                  "the scanner is the only gate between the private repos and GitHub. Its output: " + _out)
 
+    # :8900 under systemd (2026-09-28, proposals/2026-09-28_always-on-under-systemd.md). The user
+    # unit maintenance-dashboard is what brings the dashboard back, and its MemoryMax (+ a swap cap)
+    # is what stops a runaway dashboard eating the memory pool the GPU, Ollama and the Stocks model
+    # jobs share. Either one gone (unit disabled, a drop-in or an edit that lost the cap) is this
+    # rule's case — and so is a rollback to the cron keepalive, which has no cap at all: that is a
+    # deliberate deviation, muted in config/backoffice_mute.json with its reason (rule 7), never a
+    # check that quietly stands down and leaves Box › Guardrails calling the unit armed. Cron has no
+    # XDG_RUNTIME_DIR, so it is passed: without it `systemctl --user` answers nothing.
+    try:
+        _env = dict(os.environ, XDG_RUNTIME_DIR=os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+        _u = dict(ln.split("=", 1) for ln in subprocess.run(
+            ["systemctl", "--user", "show", "maintenance-dashboard",
+             "-p", "UnitFileState", "-p", "ActiveState", "-p", "MemoryMax", "-p", "MemorySwapMax"],
+            capture_output=True, text=True, timeout=15, env=_env).stdout.splitlines() if "=" in ln)
+    except Exception as e:
+        _u = {"error": f"{type(e).__name__}: {e}"}
+    if not (_u.get("UnitFileState") == "enabled" and _u.get("ActiveState") == "active"
+            and (_u.get("MemoryMax") or "").isdigit() and (_u.get("MemorySwapMax") or "").isdigit()):
+        _cron = re.search(r"^[^#\n]*maintenance/dashboard/serve\.sh\s+(?:ensure|start)", sh(["crontab", "-l"]), re.M)
+        _finding(f, "guardrail-inert", "high",
+                 "the dashboard unit is not armed — :8900 has no supervisor or no memory cap",
+                 f"the user unit maintenance-dashboard must be enabled and active, with MemoryMax and "
+                 f"MemorySwapMax byte counts. It reads {_u or 'nothing (no user manager answered)'}"
+                 f"{' — and a crontab keepalive owns :8900 (rolled back?), which has no cap at all' if _cron else ''}. "
+                 f"`systemctl --user status maintenance-dashboard`; the unit's source is "
+                 f"dashboard/maintenance-dashboard.service, installed with `systemctl --user link` — never "
+                 f"copied, so an edit there plus daemon-reload is the fix. A deliberate rollback is muted "
+                 f"with its reason: CRON_REGISTRY.md, Always-on.")
+
     # SMB share hygiene (2026-09-25, memo from stocks): without vfs_fruit, every Finder copy onto
     # the user-home share left a `._<name>` AppleDouble sidecar beside the file, and every
     # glob, rglob and the catalog's undeclared-file sweep read it as a real file. The fix is
@@ -1764,6 +1903,28 @@ def audit(c=None):
                  "run `python3 ~/maintenance/dashboard/tt_crew.py selftest`; it resolves the real "
                  "queue names (ops:signals, research:COO, the Bench in the VP's window), the tools "
                  "rule and every agent's badge family, and checks every live job is claimed once. Output: " + _cw_st.strip().replace("\n", " | ")[-300:])
+
+    # 24. mdreader-drift (2026-09-27): the box's one markdown reader lives in shared/mdreader and every dashboard
+    #     serves a COPY of its dist/. A copy left behind by a rebuild reads documents the old way on that
+    #     dashboard, and nothing else would notice. One low finding per project, naming each stale copy. The rule
+    #     is armed only while the canonical VERSION reads — without it every copy would pass: guardrail-inert.
+    _mdr_cur = _mdr_version(os.path.join(MDREADER_DIST, "mdreader.js"))
+    if not _mdr_cur:
+        _finding(f, "guardrail-inert", "med",
+                 "the mdreader drift rule cannot read the shared reader's VERSION — it checks nothing",
+                 "~/maintenance/shared/mdreader/dist/mdreader.js is missing or carries no `var VERSION = \"…\"` stamp, "
+                 "so no vendored copy can be compared with it. Rebuild it: `python3 ~/maintenance/shared/mdreader/build.py` "
+                 "then `./run_tests.sh` there.", project="maintenance")
+    else:
+        for _proj, _rows in _mdreader_drift(_mdreader_copies(), _mdr_cur).items():
+            _finding(f, "mdreader-drift", "low",
+                     f"{_proj} serves an out-of-date copy of the shared markdown reader",
+                     "; ".join(f"`{p.replace(HOME, '~', 1)}` {why}" + (f" ({v})" if v else "") for p, v, why in _rows)
+                     + f". The current build is {_mdr_cur}. Fix: vendor the current ~/maintenance/shared/mdreader/dist "
+                     "copy (a copy is never patched in place: change src/ there, rebuild, run its tests, re-vendor), "
+                     "and where the page names the file by version (Mission Control's vendor/mdreader.<version>.js) "
+                     "rename it and its <script> tag together.",
+                     project=_proj, fix="memo" if _proj != "maintenance" else "human", key=_proj)
 
     uniq = {}
     for x in f:
@@ -2418,6 +2579,18 @@ def selftest():
         _commit = lambda paths, msg, skip=(): commits.append((tuple(paths), msg)) or "abc1234"
         save(MUTE, {"muted": []})
 
+        # expected gap from the weekdays a line allows (memo weekday-crons-get-a-week-of-grace,
+        # 2026-09-27): the longest skipped stretch + 1 day, never a flat week for a weekday job
+        for sched, want in (("5 14 * * 1-5", 72), ("*/30 12-21 * * 1-5", 72), ("*/15 * * * 1-5", 72),
+                            ("0 7 * * 0", 168), ("0 7 * * 7", 168), ("0 7 * * 1,3,5", 72),
+                            ("0 7 * * 2,6", 96), ("5 4 * * 2-6", 72), ("0 7 * * mon-fri", 72),
+                            ("0 7 * * 1-5/2", 72), ("0 7 * * */2", 48), ("0 7 * * 5-7", 120),
+                            ("0 7 * * *", 24), ("0 7 * * 0-6", 24), ("*/30 12-21 * * *", 72),
+                            ("*/15 * * * *", 0.25), ("*/15 * * * 0-7", 0.25), ("35 9 1 * *", 744),
+                            ("0 7 * * L", 168), ("@reboot x", None)):
+            got = expected_gap_h(sched)
+            check(f"expected gap: `{sched}` → {'none' if want is None else f'{want}h'}", got == want, got)
+
         # AppleDouble litter (2026-09-25): only real `._` AppleDouble files newer than the fix, and
         # never inside the skipped trees or hidden folders at the root
         ad = f"{t}/home"
@@ -2433,6 +2606,46 @@ def selftest():
         got = [os.path.relpath(p, ad) for p in _appledouble_since(time.time() - 86400, root=ad)]
         check("appledouble: a new AppleDouble file is found; old, non-AppleDouble, archived and "
               "hidden-root ones are not", got == ["proj/._new.pdf"], got)
+
+        # mdreader-drift (2026-09-27): every vendored copy of the shared reader is found by name (a versioned
+        # file name too), its stamp read from any of the three built files, the canonical folder and the
+        # dependency / venv / archive trees skipped; a copy that is not the current build is drift, per project
+        mh, cur = f"{t}/mdr", "1.3.0+7baad46b"
+        for rel, body in (("mc/shared/mdreader/dist/mdreader.js", f'var VERSION = "{cur}";'),
+                          ("mc/shared/mdreader/src/mdreader.js", "var VERSION = /*@VERSION*/'0.0.0-dev';"),
+                          ("mc/dashboard/vendor/mdreader.1.3.0-7baad46b.js", f'/*! mdreader {cur} */\nvar VERSION = "{cur}";'),
+                          ("alpha/dash/vendor/mdreader.py", "VERSION = '1.2.0+0123abcd'  # built"),
+                          ("alpha/dash/static/mdreader.css", f"/*! mdreader {cur} — generated */"),
+                          ("beta/web/mdreader.js", "// patched by hand"),
+                          ("beta/web/node_modules/x/mdreader.js", "var VERSION = \"0.1.0\";"),
+                          ("beta/.venv/lib/mdreader.py", "VERSION = '0.1.0'"),
+                          ("beta/env/pyvenv.cfg", "home = /usr"), ("beta/env/lib/mdreader.py", "VERSION = '0.1.0'"),
+                          ("beta/web/test_mdreader.js", "var VERSION = \"0.1.0\";"),
+                          ("beta/.claude/worktrees/wt1/web/mdreader.js", "var VERSION = \"0.1.0\";"),
+                          ("gamma/CLAUDE.md", "# gamma"), ("gamma/ui/mdreader.js", 'var VERSION = "1.3.0+ffffffff";'),
+                          ("delta/ui/mdreader.js", 'var VERSION = "2.0.0+00000000";')):
+            os.makedirs(os.path.dirname(f"{mh}/{rel}"), exist_ok=True)
+            with open(f"{mh}/{rel}", "w") as fh:
+                fh.write(body)
+        for proj in ("mc", "alpha", "beta", "delta"):
+            os.makedirs(f"{mh}/{proj}/.git", exist_ok=True)
+        got = [(p, os.path.relpath(x, mh), v) for p, x, v in _mdreader_copies(home=mh, canon=f"{mh}/mc/shared/mdreader")]
+        check("mdreader-drift: finds each vendored copy (a versioned name too) and reads its stamp; skips the "
+              "canonical folder, node_modules, venvs, session worktrees and test files", got == [
+                  ("alpha", "alpha/dash/static/mdreader.css", cur), ("alpha", "alpha/dash/vendor/mdreader.py", "1.2.0+0123abcd"),
+                  ("beta", "beta/web/mdreader.js", None), ("delta", "delta/ui/mdreader.js", "2.0.0+00000000"),
+                  ("gamma", "gamma/ui/mdreader.js", "1.3.0+ffffffff"),
+                  ("mc", "mc/dashboard/vendor/mdreader.1.3.0-7baad46b.js", cur)], got)
+        dr = _mdreader_drift(_mdreader_copies(home=mh, canon=f"{mh}/mc/shared/mdreader"), cur)
+        check("mdreader-drift: one entry per project with a stale copy — older, unstamped, another build, ahead — "
+              "and none for a project whose copies are all current",
+              sorted(dr) == ["alpha", "beta", "delta", "gamma"] and [w for _, _, w in dr["alpha"]] == ["is an older version"]
+              and dr["beta"][0][2] == "carries no VERSION stamp" and dr["gamma"][0][2] == "is another build of the same version"
+              and dr["delta"][0][2].startswith("is ahead"), dr)
+        check("mdreader-drift: the stamp reads from the real built files (the canonical dist/ carries one)",
+              all(_mdr_version(os.path.join(MDREADER_DIST, n)) for n in ("mdreader.js", "mdreader.py", "mdreader.css"))
+              and len({_mdr_version(os.path.join(MDREADER_DIST, n)) for n in ("mdreader.js", "mdreader.py", "mdreader.css")}) == 1,
+              [_mdr_version(os.path.join(MDREADER_DIST, n)) for n in ("mdreader.js", "mdreader.py", "mdreader.css")])
 
         # a mute with an end date leaves `muted` the day after it, with its reason kept
         save(MUTE, {"muted": ["k-old", "k-new", "k-plain"], "_reasons": {"k-old": "why", "k-new": "why2"},
