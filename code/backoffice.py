@@ -890,6 +890,11 @@ ARMED_CHECKS = (
     {"id": "sentinel", "control": "sentinel page recheck", "layer": "detective",
      "standard": "—", "check": "`sentinel.py selftest`", "requires": ("bin/sentinel.py",),
      "titles": ("sentinel selftest fails — it can page on a job that already recovered",)},
+    {"id": "rc-sign-in", "control": "phone sign-in canary (healthcheck remote-control-auth) + login-mode re-sign-in",
+     "layer": "detective", "standard": "—",
+     "check": "`claude-relogin.py selftest` (credential fixtures, login-mode markers, the RC-host pgrep gotcha, healthcheck wiring)",
+     "requires": ("bin/claude-relogin.py", "bin/healthcheck.sh"),
+     "titles": ("claude-relogin selftest fails — the phone sign-in canary or its re-sign-in can misread",)},
     {"id": "mdreader-drift", "control": "shared markdown reader: every vendored copy is the current build",
      "layer": "detective", "standard": "—",
      "check": "the canonical dist/ VERSION reads · `backoffice.py selftest` (the mdreader-drift fixtures)",
@@ -1489,6 +1494,15 @@ def audit(c=None):
         _finding(f, "guardrail-inert", "high",
                  "publish.py selftest fails — the leak scanner could let a secret through",
                  "the scanner is the only gate between the private repos and GitHub. Its output: " + _out)
+    # The phone's Remote Control sign-in died 09-24 → 09-28 with every canary green (memo
+    # 2026-09-28 from home). healthcheck's remote-control-auth item and the login-mode re-sign-in
+    # both run on claude-relogin.py; its selftest is their proof (fixtures only, <10 s, no push).
+    _ok, _out = _selfcheck(["claude-relogin.py", "selftest"], "ALL PASS")
+    if not _ok:
+        _finding(f, "guardrail-inert", "high",
+                 "claude-relogin selftest fails — the phone sign-in canary or its re-sign-in can misread",
+                 "run `python3 ~/maintenance/bin/claude-relogin.py selftest`; each FAIL line names the "
+                 "case. Until it passes, a dead phone sign-in can sit unseen again. Its output: " + _out)
 
     # :8900 under systemd (2026-09-28, proposals/2026-09-28_always-on-under-systemd.md). The user
     # unit maintenance-dashboard is what brings the dashboard back, and its MemoryMax (+ a swap cap)

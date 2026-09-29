@@ -1056,6 +1056,7 @@ KNOWN_PORTS = {
     11000: ("NVIDIA DGX Dashboard (vendor)", "system"),
     8090: ("Poker App Store build — dev server (on demand)", "poker-appstore"),
     8443: ("tailscale serve HTTPS → poker App Store build (on demand)", "poker-appstore"),
+    8911: ("tailscale serve HTTPS → HBS dashboard (:8910)", "hbs"),
 }
 # Ports that listen only while someone works on them (v2.5, polish #15): declared, so a listening one is
 # never "undeclared", and listed as a service only while it listens — off is their normal state, not down.

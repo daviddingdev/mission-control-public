@@ -10,6 +10,7 @@ TOPIC=$(python3 -c "import json;print(json.load(open('config/ntfy.json'))['chann
 STATE=state/health.state
 mkdir -p state
 FAIL=()
+WARN=()    # heads-ups, not outages: pushed once through notify.sh (end of file), never "DOWN"
 
 # chk PORT NAME [HOST] [EXTRA_OK_CODES]: up is any 2xx/3xx, plus the codes a service answers
 # on / by design (the Justin desk says 403 there). A port David switched off on purpose
@@ -29,6 +30,10 @@ chk 8088 Pokerlog <host-ip>   # pokerlog binds the tailscale IP, not localhost
 chk 8787 StocksDash
 chk 8900 MissionControl
 chk 8910 HBSCasework
+# :8911 is the tailscale serve HTTPS front for :8910 — David's Home Screen icon (memo from hbs,
+# 2026-09-29). The box can't resolve ts.net (--accept-dns=false), so pin the name to our tailnet IP.
+c=$(curl -s -m 5 -o /dev/null -w '%{http_code}' --resolve <host>.<tailnet>.ts.net:8911:<host-ip> https://<host>.<tailnet>.ts.net:8911/)
+case "$c" in 2??|3??) ;; *) FAIL+=("HBSCaseworkHTTPS(:8911)") ;; esac
 chk 8790 JustinDesk localhost 403
 chk 19999 Netdata
 curl -sf -m 5 -o /dev/null "http://127.0.0.1:11434/api/tags" || FAIL+=("ollama(:11434)")   # local AI is production now (sentinel/digest/scoring depend on it)
@@ -99,6 +104,20 @@ except Exception:
     sys.exit(0)   # unreadable file is not proof of dead auth — don't false-alarm
 PYEOF
 
+# The phone's Remote Control sign-in — its OWN credential (memo 2026-09-28 from home). The Claude
+# app and claude.ai/code reach this box through the RC host, which runs on
+# ~/.claude/.credentials.json → claudeAiOauth: not the fleet's headless-token, not the desktop
+# app's token. It lasts about a month (refreshTokenExpiresAt) and was dead 09-24 → 09-28 with this
+# watchdog green: the canary above needs a job-log auth failure, and no job uses that credential.
+# Definitive and zero-token — `check-login` reads booleans and timestamps, never prints a token:
+# accessToken or refreshToken empty/missing = FAIL (auto-starts the phone sign-in below); refresh
+# expiry within 72 h = a WARN, pushed once.
+RCA=$(python3 bin/claude-relogin.py check-login 2>/dev/null)
+case "$RCA" in
+  dead:*) FAIL+=("remote-control-auth(needs sign-in)") ;;
+  warn:*) WARN+=("${RCA#warn: }") ;;
+esac
+
 # Sample the GPU temperature on the watchdog's guaranteed cadence. This lived only in the
 # dashboard's request path, so the 48h thermal record only accumulated while somebody had
 # the page open — exactly backwards for a question ("can it run this 24/7?") that is about
@@ -132,13 +151,28 @@ curl -sf -m 2 -o /dev/null \
   "https://speed.cloudflare.com/__down?bytes=1000000" 2>/dev/null \
   || FAIL+=("download-slow(<1MB/s)")
 
+# HEALTHCHECK_DRY=1 stops here and prints what this run found: no state written, no push, no
+# re-auth started — how a session checks a change against the live box without paging David.
+if [ -n "${HEALTHCHECK_DRY:-}" ]; then
+  printf 'FAIL: %s\n' "${FAIL[*]:-none}"
+  printf 'WARN: %s\n' "${WARN[*]:-none}"
+  printf 'remote-control-auth: %s\n' "${RCA:-no answer from check-login}"
+  exit 0
+fi
+
 # Dead CLI auth is fixable from David's phone — when it NEWLY fails, auto-start the
 # remote re-auth flow (pty scrape of `claude setup-token`, zero tokens): the OAuth link
 # lands on his phone via ntfy and the code comes back through Mission Control's Claude
 # tab. claude-relogin.py is idempotent while a flow is already waiting.
 if printf '%s\n' "${FAIL[@]}" | grep -q "claude-cli-auth" && \
    ! grep -q "claude-cli-auth" "$STATE" 2>/dev/null; then
-  python3 bin/claude-relogin.py start >> logs/relogin.log 2>&1 &
+  python3 bin/claude-relogin.py start --token >> logs/relogin.log 2>&1 &
+# The phone's sign-in takes the same flow in login mode: `claude auth login --claudeai`, verified
+# by `claude auth status`, then the RC host restarted. One state machine and one paste box, so
+# never two flows from one run.
+elif printf '%s\n' "${FAIL[@]}" | grep -q "remote-control-auth" && \
+   ! grep -q "remote-control-auth" "$STATE" 2>/dev/null; then
+  python3 bin/claude-relogin.py start --login >> logs/relogin.log 2>&1 &
 fi
 
 # Drop in-dev services (config/dev.json) BEFORE the state diff — otherwise a flapping WIP
@@ -159,5 +193,19 @@ if [ "$NOW" != "$PREV" ]; then
     echo "$(date -Is) recovered"
     curl -s -m 10 -H "Title: Spark health" -H "Tags: white_check_mark" \
       -d "Recovered — all checks green" "https://ntfy.sh/$TOPIC" >/dev/null
+  fi
+fi
+
+# Heads-ups: once, when the set changes and is not empty, through notify.sh (tiered and ledgered;
+# the raw POST above is the outage alarm's deliberate exemption). Clearing is silent: a renewal
+# pushes its own confirmation, and an expiry turns into a FAIL.
+WSTATE=state/health.warn
+WNOW=$(printf '%s\n' "${WARN[@]}" | sort)
+if [ "$WNOW" != "$(cat "$WSTATE" 2>/dev/null)" ]; then
+  printf '%s' "$WNOW" > "$WSTATE"
+  if [ ${#WARN[@]} -gt 0 ]; then
+    echo "$(date -Is) WARN: ${WARN[*]}"
+    bin/notify.sh --tier actionable alerts "Claude sign-in expiring" "$(printf '%s\n' "${WARN[@]}")
+Renew before then: Mission Control › Sessions › Setup → Start re-auth (while this warning stands it starts the phone sign-in): http://<host-ip>:8900/#sessions/setup — or let it lapse and the watchdog starts it for you."
   fi
 fi
