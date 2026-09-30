@@ -19,6 +19,9 @@ COOLDOWN = 24 * 3600
 # reach into another project left in bin/): clientco-db declares us a reader of cycle_state.
 STATE_PROBES = [
     ("clientco monthly cycle", "clientco-db/cycle_state"),
+    # the Data Desk's per-source health (2026-09-29): its header keys status / at / worse come
+    # first by design, so they fall inside the 300 characters pasted below
+    ("Data Desk health", "data-desk/health"),
 ]
 
 

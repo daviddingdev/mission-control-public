@@ -166,9 +166,33 @@ def _cron_lines():
     return out
 
 
-def _project_of(text):
-    """Which project a cron command belongs to, by the path it cds into or runs from."""
-    for name in sorted(_project_dirs(), key=len, reverse=True):
+_HOME_RE = r"(?:~|\$HOME|\$\{HOME\}|" + re.escape(HOME) + r")"
+
+
+def _project_of(text, names=None):
+    """Which project a cron command belongs to, by the path it cds into or runs from.
+
+    In order (2026-09-29, the Data Desk's visibility memo): the folder the command `cd`s into;
+    else the project of a script it runs from a project folder, where another project's script
+    beats Mission Control's shared tools (claudeq.py, notify.sh, claude-headless wrap other
+    projects' jobs); else any project path it names, longest name first. Before this, the last
+    rule came first, so `cd ~/Stocks/_engine && … || ~/maintenance/bin/notify.sh …` was filed
+    under maintenance (longest name wins) — 10 Stocks/clientco lines on 2026-09-29, and every
+    Data Desk line.
+    `names` is the project list (default: the folders on disk), for the selftest."""
+    names = list(names) if names is not None else _project_dirs()
+    known = set(names)
+    m = re.search(r"(?:^|&&|;|\|\||[({])\s*cd\s+" + _HOME_RE + r"/([^/\s;&|)]+)", text)
+    if m and m.group(1) in known:
+        return m.group(1)
+    tops = [s.group(1) for s in re.finditer(
+        _HOME_RE + r"/([^/\s;&|'\"]+)/[^\s;&|'\"]*?\.(?:py|sh)\b", text) if s.group(1) in known]
+    for top in tops:
+        if top != "maintenance":
+            return top
+    if tops:
+        return "maintenance"
+    for name in sorted(names, key=len, reverse=True):
         if re.search(r"[~/]" + re.escape(name) + r"[/\s]", text) or f"/{name}/" in text:
             return name
     if ".claude/" in text:
@@ -428,8 +452,10 @@ def _ollama_callers():
     out = []
     for name in _project_dirs():
         root = os.path.join(HOME, name)
+        # api/embed (2026-09-29): ollama's batch embedding endpoint, which the Data Desk is the
+        # first to call; the older api/embeddings is a prefix match of it
         hits = sh(["grep", "-rl", "--include=*.py", "-e", "api/chat", "-e", ":11434",
-                   "-e", "chat_url(", "-e", "api/generate", "-e", "api/embeddings",
+                   "-e", "chat_url(", "-e", "api/generate", "-e", "api/embed",
                    root]).splitlines()
         for f in hits:
             if any(skip in f for skip in ("/.git/", "/node_modules/", "/worktrees/",
@@ -555,7 +581,7 @@ def _diagram_state():
         out["outdated"] = []
         arch = os.path.join(MC, "architecture")
         proj_of = {"stocks": "Stocks", "clientco": "clientco-db", "poker": "poker",
-                   "mission-control": "maintenance"}
+                   "mission-control": "maintenance", "thesis": "thesis", "data-desk": "data-desk"}
         # architecture/_style.d2 (2026-09-24) is the shared look a diagram spread-imports with a
         # line reading exactly `...@_style`. Files starting with `_` are imports, never diagrams
         # (no .svg of their own, so they would read as unrendered forever); and a styled
@@ -586,6 +612,109 @@ def _diagram_state():
     except Exception as e:
         out["error"] = str(e)[:120]
     return out
+
+
+# A wind-down board's retire step, per project that declares one (`<slug>/handover`). The Data
+# Desk's is its own CLI: it files the retirement checklist to the lane's owner as a memo and moves
+# the lane to cutover_requested. A board for a project not listed here may name its own step in a
+# top-level `retire_cmd` ("{lane}" stands for the lane id).
+RETIRE_CMD = {"data-desk": "cd ~/data-desk && .venv/bin/python bin/desk.py handover retire {lane}"}
+# no `_`: the answer key (tt_now._key) keeps only [a-z0-9.-] of it, and the daily check reads the
+# lane back out of that key
+_LANE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,79}$")
+
+
+def _handover_state(ids=None, reader=None):
+    """Every wind-down board the catalog declares (a dataset `<slug>/handover`; the Data Desk's is
+    the first, 2026-09-29), cut to its READY lanes: state `parity_ok`, so the replacement has
+    matched the old lane for as many days as the board asks and only David's word is missing.
+    Read by catalog id, so the read is logged (box rule 8); only metadata is kept — ids, names,
+    counts, states. A lane id goes into a shell command in the finding, so anything but a plain
+    slug is dropped and said. `ids` / `reader` (cid -> path) are the selftest's."""
+    out = []
+    try:
+        import catalog as _catalog
+        ids = ids if ids is not None else list(_catalog.index())
+        reader = reader or (lambda cid: _catalog.path(cid, proj="maintenance"))
+    except Exception as e:
+        return [{"id": "?", "project": "", "error": f"catalog: {type(e).__name__}: {str(e)[:160]}"}]
+    for cid in sorted(i for i in ids if "/" in i and i.split("/", 1)[1] == "handover"):
+        slug = cid.split("/", 1)[0]
+        try:
+            board = json.load(open(reader(cid)))
+            lanes = board.get("lanes") or []
+        except Exception as e:
+            out.append({"id": cid, "project": slug, "error": f"{type(e).__name__}: {str(e)[:160]}"})
+            continue
+        ready, bad = [], []
+        for ln in lanes:
+            if not isinstance(ln, dict) or ln.get("state") != "parity_ok":
+                continue
+            lid = str(ln.get("id") or "")
+            if not _LANE_RE.match(lid):
+                bad.append(lid[:40])
+                continue
+            p = ln.get("parity") if isinstance(ln.get("parity"), dict) else {}
+            ready.append({"id": lid, "owner": str(ln.get("owner") or "")[:40],
+                          "name": str(ln.get("name") or lid)[:120],
+                          "replaced_by": [str(x)[:80] for x in (ln.get("replaced_by") or [])][:6],
+                          # what moves and what the owner keeps (2026-09-29 review): a lane whose
+                          # replacement carries only part of it must not read as a whole handover
+                          "carries": re.sub(r"\s+", " ", str(ln.get("carries") or ""))[:160],
+                          "keeps": [str(x)[:80] for x in (ln.get("keeps") or []) if isinstance(x, str)][:6],
+                          "days_green": ln.get("days_green"), "need_days": ln.get("need_days"),
+                          "parity": {k: p.get(k) for k in ("kind", "value", "bar", "n", "covered")},
+                          "cron": str((ln.get("cron") or {}).get("state") or "")[:20]})
+        cmd = board.get("retire_cmd") if isinstance(board.get("retire_cmd"), str) else None
+        out.append({"id": cid, "project": slug, "at": board.get("at"), "lanes": len(lanes),
+                    "ready": ready, "bad_ids": bad, "retire_cmd": RETIRE_CMD.get(slug) or cmd})
+    return out
+
+
+def _handover_words(ln):
+    """'112/112 legacy items (100%, bar 100%) · 7 of 7 days green' from a ready lane."""
+    p = ln.get("parity") or {}
+    pct = lambda v: f"{v:.0%}" if isinstance(v, (int, float)) else "?"
+    got = (f"{p['covered']}/{p['n']} " if isinstance(p.get("n"), int) and isinstance(p.get("covered"), int)
+           else "")
+    kind = str(p.get("kind") or "parity").replace("_", " ")
+    days = (f" · {ln['days_green']} of {ln['need_days']} days green"
+            if ln.get("days_green") is not None and ln.get("need_days") else "")
+    return f"{kind} {got}({pct(p.get('value'))}, bar {pct(p.get('bar'))}){days}"
+
+
+def _handover_findings(f, handovers):
+    """Rule 20b's findings from the census' wind-down boards (_handover_state)."""
+    for hb in handovers:
+        if hb.get("error"):
+            _finding(f, "handover-unreadable", "med", f"{hb['id']} cannot be read",
+                     f"The wind-down board {hb['id']} is declared but could not be read "
+                     f"({hb['error']}), so a lane ready to hand over would never reach Needs "
+                     "attention. Its writer is in the project's catalog.json.",
+                     hb.get("project", ""), fix="memo", key=hb["id"])
+            continue
+        if hb.get("bad_ids"):
+            _finding(f, "handover-unreadable", "med",
+                     f"{hb['id']} has lane ids that are not plain slugs",
+                     f"Lane(s) {', '.join(hb['bad_ids'])} are ready but their ids are not "
+                     "lowercase slugs, so no retire step is offered for them.",
+                     hb["project"], fix="memo", key=hb["id"] + ":ids")
+        for ln in hb.get("ready") or []:
+            name = re.sub(r"\s*\([^)]*\)\s*$", "", ln["name"]).strip() or ln["id"]
+            step = (hb.get("retire_cmd") or "").replace("{lane}", ln["id"])
+            keeps = ln.get("keeps") or []
+            _finding(f, "handover-ready", "high", f"Ready to hand over: {name[:48]}",
+                     f"Lane `{ln['id']}` ({ln['name']}, owned by {ln['owner'] or '?'}): "
+                     f"{', '.join(ln['replaced_by']) or 'its replacement'} now carries "
+                     f"{ln.get('carries') or 'it'} — {_handover_words(ln)}, read from {hb['id']}"
+                     + (f"; {ln['owner'] or 'the owner'} keeps {', '.join(keeps)}, which the replacement "
+                        "does not carry" if keeps else "") + ". Its cron line is "
+                     f"{ln['cron'] or 'not tracked'}. "
+                     + (f"David's go → `{step}` files the retirement memo to {ln['owner']}; "
+                        f"{ln['owner']} retires the lane and the board marks it retired."
+                        if step else "David's go → the board's retire step files the retirement "
+                        f"memo to {ln['owner']}; {hb['project']} names that step."),
+                     hb["project"], fix="human", key=ln["id"])
 
 
 def _public_state():
@@ -691,6 +820,7 @@ def census():
         c["containers"] = []
     c["public"] = _public_state()
     c["diagrams"] = _diagram_state()
+    c["handovers"] = _handover_state()
     c["experiments"] = _experiments_state()
     try:
         r = subprocess.run([sys.executable, os.path.join(MC, "bin/models.py"), "check"],
@@ -1773,6 +1903,16 @@ def audit(c=None):
                  "and the irreplaceable-and-unbacked rule are all proven by that fixture "
                  "suite: " + _cat_st.strip().replace("\n", " | ")[-300:])
 
+    # 20b. A WIND-DOWN LANE READY TO HAND OVER (2026-09-29, the Data Desk). A project that
+    #      declares `<slug>/handover` shadows another project's lane until its replacement has
+    #      matched it for the days the board asks; from then only David's word is missing. One
+    #      high finding per ready lane puts it in Overview › Needs attention, keyed by the lane so
+    #      a snooze, a mute or a Claude answer outlives the day count. The answer "retire" goes to
+    #      the daily check, which runs the board's own retire step (RETIRE_CMD): that files the
+    #      retirement memo to the lane's owner, and the owner retires it (box rule 6). A lane
+    #      that leaves parity_ok (retired, requested, fell back) resolves its finding by itself.
+    _handover_findings(f, c.get("handovers") or [])
+
     # The dashboard's own tab tests. They are shim-DOM renders against the LIVE :8900
     # payloads, so they catch the thing a syntax check cannot: a field renamed in
     # server.py that leaves a panel blank on David's phone. Nothing ran them until now
@@ -1896,7 +2036,8 @@ def audit(c=None):
     #     an agent"), or the Overview's crew and every "who ran this" line on the page quietly miss it.
     #     A job no agent claims (or two do), a declared agent with no job that is not on demand, and an
     #     agent whose `does` is not a badge family are findings; an accepted one is muted in
-    #     backoffice_mute.json.
+    #     backoffice_mute.json. Filed under the slug `maintenance` (2026-09-29): the display name
+    #     "Mission Control" put a space in the finding's id, which the answer path could not reach.
     _cw = sh([sys.executable, os.path.join(MC, "dashboard", "tt_crew.py"), "check"], timeout=90)
     try:
         for h in json.loads(_cw or "null") or []:
@@ -1906,7 +2047,7 @@ def audit(c=None):
                      "work it feeds or keeps running (the longest match wins; a script too), add a "
                      "new agent for it, or mark an agent "
                      "`on_demand`. `python3 dashboard/tt_crew.py selftest` proves the whole fleet "
-                     "is claimed once.", project="Mission Control", fix="human", key=h["id"])
+                     "is claimed once.", project="maintenance", fix="human", key=h["id"])
     except Exception:
         pass
     # 23b. and the namer itself must be provable — rule `guardrail-inert`
@@ -2604,6 +2745,79 @@ def selftest():
                             ("0 7 * * L", 168), ("@reboot x", None)):
             got = expected_gap_h(sched)
             check(f"expected gap: `{sched}` → {'none' if want is None else f'{want}h'}", got == want, got)
+
+        # cron attribution (2026-09-29): the folder a line cds into wins, then another project's
+        # script over Mission Control's shared tools, then the old longest-name match
+        pn = ["Stocks", "data-desk", "clientco-db", "hbs", "maintenance", "poker", "poker-appstore", "thesis"]
+        for cmd, want in (
+                ("cd ~/Stocks/_engine && ./.venv/bin/python research/closes.py refresh >> logs/c.log 2>&1 "
+                 f"|| {HOME}/maintenance/bin/notify.sh --tier actionable alerts x y", "Stocks"),
+                ("cd ~/data-desk && .venv/bin/python bin/desk.py predmkt >> logs/predmkt.log 2>&1 "
+                 "|| ~/maintenance/bin/notify.sh alerts x y", "data-desk"),
+                (f"cd {HOME}/hbs && python3 {HOME}/maintenance/bin/claudeq.py run --kind k -- x", "hbs"),
+                (f"python3 {HOME}/maintenance/bin/claudeq.py run --kind vp --job vp -- "
+                 f"{HOME}/Stocks/_engine/agent/runner.py vp >> /tmp/x.log 2>&1", "Stocks"),
+                ("cd ~/maintenance && python3 bin/catalog.py compile ~/Stocks/x", "maintenance"),
+                ("python3 ~/maintenance/bin/sentinel.py >> ~/maintenance/logs/sentinel.log 2>&1", "maintenance"),
+                ("cd ~/poker-appstore && npm run build >> logs/b.log 2>&1", "poker-appstore"),
+                ("cd /tmp && python3 ~/poker/tools/x.py", "poker"),
+                ("~/.claude/remote-control/keepalive", "maintenance"), ("echo hi", "")):
+            got = _project_of(cmd, names=pn)
+            check(f"cron attribution: {cmd[:48]}… → {want or 'nobody'}", got == want, got)
+
+        # handover-ready (2026-09-29): one high finding per lane at parity_ok on a declared
+        # `<slug>/handover` board, keyed by the lane; nothing for shadow/stays/requested lanes,
+        # a lane id that is not a slug never reaches the shell command, an unreadable board says so
+        hv = f"{t}/handover.json"
+        lane = lambda i, st, **k: dict({"id": i, "owner": "stocks", "name": f"Lane {i} (feeds.py)", "state": st,
+                                        "days_green": 7, "need_days": 7, "replaced_by": ["data-desk/filings_radar"],
+                                        "parity": {"kind": "accession_superset", "value": 1.0, "bar": 1.0,
+                                                   "n": 112, "covered": 112, "missing_sample": ["0000-secret"]},
+                                        "cron": {"state": "live", "line": 16}, "consumers": ["x"]}, **k)
+        save(hv, {"status": "ready", "at": "2026-09-29T08:15:00Z", "ready": ["a-lane"],
+                  "lanes": [lane("a-lane", "parity_ok"), lane("b-lane", "shadow"), lane("c-lane", "stays"),
+                            lane("d-lane", "cutover_requested"), lane("x; rm -rf ~", "parity_ok")]})
+        hs = _handover_state(ids=["data-desk/handover", "data-desk/health", "stocks/feed", "zz/handover"],
+                             reader=lambda cid: hv if cid == "data-desk/handover" else f"{t}/nope.json")
+        hf = []
+        _handover_findings(hf, hs)
+        ready = [x for x in hf if x["kind"] == "handover-ready"]
+        check("handover-ready: only the declared */handover ids are read, the parity_ok lane is the one finding",
+              [h["id"] for h in hs] == ["data-desk/handover", "zz/handover"] and len(ready) == 1
+              and ready[0]["key"] == "handover-ready:data-desk:a-lane" and ready[0]["sev"] == "high"
+              and ready[0]["project"] == "data-desk" and ready[0]["title"] == "Ready to hand over: Lane a-lane", [hs, hf])
+        d0 = ready[0]["detail"] if ready else ""
+        check("handover-ready: the detail names the lane, its replacement, the parity and David's step",
+              all(w in d0 for w in ("`a-lane`", "owned by stocks", "data-desk/filings_radar", "112/112", "100%",
+                                    "7 of 7 days green", "cron line is live",
+                                    "`cd ~/data-desk && .venv/bin/python bin/desk.py handover retire a-lane`",
+                                    "retirement memo to stocks"))
+              and "0000-secret" not in json.dumps(hs), d0)
+        check("handover-ready: without carries/keeps the detail still reads 'now carries it'",
+              "data-desk/filings_radar now carries it — accession superset" in d0 and "keeps" not in d0, d0)
+        hs3 = [dict(hs[0], ready=[dict(hs[0]["ready"][0], carries="the EDGAR daily-index download",
+                                       keeps=["stocks/sc13d_subjects", "stocks/spin_parents"])])]
+        hf3 = []
+        _handover_findings(hf3, hs3)
+        d3 = next((x["detail"] for x in hf3 if x["kind"] == "handover-ready"), "")
+        check("handover-ready: a partial handover names what moves and what the owner keeps",
+              "now carries the EDGAR daily-index download — accession superset" in d3
+              and "stocks keeps stocks/sc13d_subjects, stocks/spin_parents, which the replacement does not carry" in d3, d3)
+        sv = f"{t}/handover_partial.json"
+        save(sv, {"lanes": [lane("p-lane", "parity_ok", carries="the index\n download " + "x" * 300,
+                                 keeps=["stocks/a", 7, "stocks/b"])]})
+        hp = _handover_state(ids=["data-desk/handover"], reader=lambda cid: sv)
+        rp = (hp[0].get("ready") or [{}])[0]
+        check("handover-ready: carries is one line of at most 160 chars, keeps only strings",
+              len(rp.get("carries", "")) == 160 and "\n" not in rp["carries"] and rp.get("keeps") == ["stocks/a", "stocks/b"], rp)
+        check("handover-ready: a lane id that is not a slug never reaches a command; an unreadable board is a finding",
+              not any("rm -rf" in x["detail"] and "retire x" in x["detail"] for x in hf)
+              and sorted(x["key"] for x in hf if x["kind"] == "handover-unreadable")
+              == ["handover-unreadable:data-desk:data-desk-handover:ids", "handover-unreadable:zz:zz-handover"], hf)
+        hf2 = []
+        _handover_findings(hf2, [dict(hs[0], ready=[dict(hs[0]["ready"][0], days_green=9, need_days=7)])])
+        check("handover-ready: the key stays the same when the day count moves, so an answer sticks",
+              [x["key"] for x in hf2 if x["kind"] == "handover-ready"] == ["handover-ready:data-desk:a-lane"], hf2)
 
         # AppleDouble litter (2026-09-25): only real `._` AppleDouble files newer than the fix, and
         # never inside the skipped trees or hidden folders at the root

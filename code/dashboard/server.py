@@ -921,8 +921,33 @@ def _job_name(cmd, fallback):
     return fallback
 
 
+_HOME_PATH = r"(?:~|\$HOME|\$\{HOME\}|" + re.escape(HOME) + r")"
+
+
+def _cmd_folder(text):
+    """The top folder under ~ a cron command belongs to: the one it `cd`s into, else the folder
+    of a script it runs, where another project's script beats Mission Control's shared tools
+    (claudeq.py, notify.sh wrap other projects' jobs). None when it names neither. The same
+    order as backoffice._project_of and tt_system._job_project (2026-09-29)."""
+    m = re.search(r"(?:^|&&|;|\|\||[({])\s*cd\s+" + _HOME_PATH + r"/([^/\s;&|)]+)", text)
+    if m:
+        return m.group(1)
+    tops = [x.group(1) for x in re.finditer(_HOME_PATH + r"/([^/\s;&|'\"]+)/[^\s;&|'\"]*?\.(?:py|sh)\b", text)]
+    return next((t for t in tops if t != "maintenance"), tops[0] if tops else None)
+
+
 def _project_of(text):
-    for name, meta in _pcfg().items():
+    """The projects.json card a cron command is filed under. The folder it runs in decides
+    first (_cmd_folder), matched against each card's `match` list; only then the first card whose
+    `match` appears anywhere in the line. Before 2026-09-29 only the second rule ran, in the
+    file's order, so `cd ~/hbs && … ~/maintenance/bin/claudeq.py …` was Mission Control's."""
+    cfg = _pcfg()
+    top = _cmd_folder(text)
+    if top:
+        for name, meta in cfg.items():
+            if top == name or top in (meta.get("match") or []):
+                return name
+    for name, meta in cfg.items():
         if any(pat in text for pat in meta.get("match", [])):
             return name
     return "Mission Control"
@@ -1504,7 +1529,19 @@ def catalog_project(slug):
     if held:
         p["stale"], p["held"] = max(0, (p.get("stale") or 0) - len(held)), len(held)
     return {"project": slug, "meta": p, "owns": owns, "ins": ins, "outs": outs,
-            "bytes": sum(x["bytes"] or 0 for x in owns)}
+            "bytes": sum(x["bytes"] or 0 for x in owns), "boards": catalog_boards(slug)}
+
+
+def catalog_boards(slug):
+    """A project's own status boards — `<slug>/health` (its sources) and `<slug>/handover` (its
+    wind-down board) — read by catalog id and cut to metadata in tt_boards.py (2026-09-29, the
+    Data Desk's visibility memo). {} for a project that declares neither. Served inside the
+    drill-down and alone at /api/catalog/project?p=<slug>&part=boards, which the page asks again
+    while the drill-down stays open. A tt module, so a change to what is drawn needs no restart."""
+    try:
+        return _tt_fn("tt_boards", "boards")(slug)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:160]}"}
 
 
 # The catalog's cold sweep (catalog.py rules 9-11) walks every project's data_roots: 7,000
@@ -2283,7 +2320,7 @@ def bus_ignore(slug):
 # how far their project had moved on.
 ARCH_PROJECTS = (("mission-control", "maintenance"), ("maintenance", "maintenance"),
                  ("clientco", "clientco-db"), ("stocks", "Stocks"), ("poker", "poker"),
-                 ("thesis", "thesis"))
+                 ("thesis", "thesis"), ("data-desk", "data-desk"))
 
 
 def architecture():
@@ -3449,7 +3486,10 @@ class H(BaseHTTPRequestHandler):
         elif path.startswith("/api/catalog/project"):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(path).query)
-            self._daily(catalog_project((q.get("p") or [""])[0]))
+            if (q.get("part") or [""])[0] == "boards":
+                self._daily(catalog_boards((q.get("p") or [""])[0]))
+            else:
+                self._daily(catalog_project((q.get("p") or [""])[0]))
         elif path == "/api/catalog":
             self._daily(catalog_view())
         elif path == "/api/backoffice":

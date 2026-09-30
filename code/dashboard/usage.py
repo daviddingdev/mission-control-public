@@ -65,7 +65,7 @@ GROUPS = {
 # "general" (2026-09-26 polish: Usage was the one page that spelled them its own way)
 _NICE = {"home": "Home (~)", "general": "Home (~)", "hbs": "HBS", "maintenance": "Mission Control",
          "stocks": "Stocks", "clientco-db": "clientco-db", "poker": "poker", "thesis": "thesis",
-         "poker-appstore": "poker-appstore"}
+         "poker-appstore": "poker-appstore", "data-desk": "Data Desk"}
 
 
 def _nice(proj):
