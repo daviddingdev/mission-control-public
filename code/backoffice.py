@@ -1008,11 +1008,13 @@ ARMED_CHECKS = (
      "standard": "—", "check": "`tt_crew.py selftest` (resolver, tools-rule and badge fixtures) · every live job, scripts too, claimed once",
      "requires": ("dashboard/tt_crew.py", "config/crew.json"),
      "titles": ("crew selftest fails — the page can name the wrong agent",)},
-    {"id": "dashboard-unit", "control": "systemd unit maintenance-dashboard (Restart=always, MemoryMax=2G, MemorySwapMax=256M)",
-     "layer": "preventive", "standard": "—",
-     "check": "the unit is enabled · active · MemoryMax and MemorySwapMax are byte counts, not infinity",
+    {"id": "always-on-units", "control": "always-on user units (systemd, linked from a project repo, memory-capped)",
+     "layer": "preventive", "standard": "§4",
+     "check": "every enabled user unit linked from ~/<project>/, and maintenance-dashboard always: enabled · active · "
+              "MemoryMax and MemorySwapMax are byte counts, not infinity",
      "requires": ("dashboard/maintenance-dashboard.service", "dashboard/serve.sh"),
-     "titles": ("the dashboard unit is not armed — :8900 has no supervisor or no memory cap",)},
+     "titles": ("an always-on user unit is not armed — {} has no supervisor or no memory cap",
+                "always-on unit discovery is inert — it did not see maintenance-dashboard")},
     {"id": "smb-fruit", "control": "SMB share vfs_fruit (no Finder ._ files)", "layer": "preventive",
      "standard": "—", "check": "`testparm -s` loads fruit + streams_xattr · no AppleDouble since",
      "requires": (),
@@ -1634,34 +1636,70 @@ def audit(c=None):
                  "run `python3 ~/maintenance/bin/claude-relogin.py selftest`; each FAIL line names the "
                  "case. Until it passes, a dead phone sign-in can sit unseen again. Its output: " + _out)
 
-    # :8900 under systemd (2026-09-28, proposals/2026-09-28_always-on-under-systemd.md). The user
-    # unit maintenance-dashboard is what brings the dashboard back, and its MemoryMax (+ a swap cap)
-    # is what stops a runaway dashboard eating the memory pool the GPU, Ollama and the Stocks model
-    # jobs share. Either one gone (unit disabled, a drop-in or an edit that lost the cap) is this
-    # rule's case — and so is a rollback to the cron keepalive, which has no cap at all: that is a
-    # deliberate deviation, muted in config/backoffice_mute.json with its reason (rule 7), never a
-    # check that quietly stands down and leaves Box › Guardrails calling the unit armed. Cron has no
-    # XDG_RUNTIME_DIR, so it is passed: without it `systemctl --user` answers nothing.
+    # Always-on user units (2026-09-28 for :8900; every repo-linked unit since 2026-10-01 —
+    # proposals/2026-09-28_always-on-under-systemd.md, PROJECT_STANDARDS §4). A user unit is what
+    # brings a server back, and its MemoryMax (+ a swap cap) is what stops a runaway one eating
+    # the memory pool the GPU, Ollama and the Stocks model jobs share. Every ENABLED user unit
+    # whose file resolves into a project folder (~/<project>/…: installed with `systemctl --user
+    # link`, so FragmentPath is the ~/.config symlink and realpath is the repo) is checked without
+    # an edit here; a unit copied into ~/.config is not seen. maintenance-dashboard is checked
+    # whether or not it is enabled: a rollback to the cron keepalive (no cap at all) is a
+    # deliberate deviation, muted in config/backoffice_mute.json with its reason (rule 7), never
+    # a check that quietly stands down and leaves Box › Guardrails calling it armed. Another
+    # project disabling its own unit is its owner's rollback and stands down (healthcheck.sh does
+    # the same). Discovery missing an enabled maintenance-dashboard is the check itself gone
+    # inert. Cron has no XDG_RUNTIME_DIR, so it is passed: without it `systemctl --user` answers
+    # nothing.
+    _env = dict(os.environ, XDG_RUNTIME_DIR=os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    _props = ["-p", "Id", "-p", "FragmentPath", "-p", "UnitFileState", "-p", "ActiveState",
+              "-p", "MemoryMax", "-p", "MemorySwapMax"]
+    _units, _err = {}, ""
     try:
-        _env = dict(os.environ, XDG_RUNTIME_DIR=os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
-        _u = dict(ln.split("=", 1) for ln in subprocess.run(
-            ["systemctl", "--user", "show", "maintenance-dashboard",
-             "-p", "UnitFileState", "-p", "ActiveState", "-p", "MemoryMax", "-p", "MemorySwapMax"],
-            capture_output=True, text=True, timeout=15, env=_env).stdout.splitlines() if "=" in ln)
+        _en = [ln.split()[0] for ln in subprocess.run(
+            ["systemctl", "--user", "list-unit-files", "--type=service", "--state=enabled", "--no-legend"],
+            capture_output=True, text=True, timeout=15, env=_env).stdout.splitlines() if ln.split()]
+        _out = subprocess.run(["systemctl", "--user", "show", *_props, *sorted(set(_en) | {"maintenance-dashboard.service"})],
+                              capture_output=True, text=True, timeout=15, env=_env).stdout
+        for _blk in _out.split("\n\n"):
+            _u = dict(ln.split("=", 1) for ln in _blk.splitlines() if "=" in ln)
+            if _u.get("Id"):
+                _units[_u["Id"].removesuffix(".service")] = _u
     except Exception as e:
-        _u = {"error": f"{type(e).__name__}: {e}"}
-    if not (_u.get("UnitFileState") == "enabled" and _u.get("ActiveState") == "active"
-            and (_u.get("MemoryMax") or "").isdigit() and (_u.get("MemorySwapMax") or "").isdigit()):
-        _cron = re.search(r"^[^#\n]*maintenance/dashboard/serve\.sh\s+(?:ensure|start)", sh(["crontab", "-l"]), re.M)
+        _err = f"{type(e).__name__}: {e}"
+    _home = os.path.expanduser("~")
+
+    def _repo_linked(u):
+        r = os.path.realpath(u.get("FragmentPath") or "/")
+        rel = os.path.relpath(r, _home)
+        return not rel.startswith(".") and os.sep in rel     # ~/<project>/…, not ~/.config, not ~/x
+    _seen = sorted(n for n, u in _units.items() if u.get("UnitFileState") == "enabled" and _repo_linked(u))
+    _md = _units.get("maintenance-dashboard") or ({"error": _err} if _err else {})
+    if _md.get("UnitFileState") == "enabled" and "maintenance-dashboard" not in _seen:
         _finding(f, "guardrail-inert", "high",
-                 "the dashboard unit is not armed — :8900 has no supervisor or no memory cap",
-                 f"the user unit maintenance-dashboard must be enabled and active, with MemoryMax and "
-                 f"MemorySwapMax byte counts. It reads {_u or 'nothing (no user manager answered)'}"
+                 "always-on unit discovery is inert — it did not see maintenance-dashboard",
+                 f"maintenance-dashboard is enabled, but the always-on check found it among no repo-linked "
+                 f"units (found: {', '.join(_seen) or 'none'}; its FragmentPath "
+                 f"{_md.get('FragmentPath') or '?'} resolves to {os.path.realpath(_md.get('FragmentPath') or '/')}). "
+                 f"Every other project's unit is going unchecked. Was it copied into ~/.config instead of "
+                 f"linked? `systemctl --user link ~/maintenance/dashboard/maintenance-dashboard.service`.")
+    for _n in sorted(set(_seen) | {"maintenance-dashboard"}):
+        _u = _units.get(_n) or ({"error": _err} if _err else {})
+        if (_u.get("UnitFileState") == "enabled" and _u.get("ActiveState") == "active"
+                and (_u.get("MemoryMax") or "").isdigit() and (_u.get("MemorySwapMax") or "").isdigit()):
+            continue
+        _show = {k: v for k, v in _u.items() if k != "Id"}
+        _src = os.path.relpath(os.path.realpath(_u.get("FragmentPath") or "/"), _home) if _u.get("FragmentPath") else "?"
+        _cron = (_n == "maintenance-dashboard" and re.search(
+            r"^[^#\n]*maintenance/dashboard/serve\.sh\s+(?:ensure|start)", sh(["crontab", "-l"]), re.M))
+        _finding(f, "guardrail-inert", "high",
+                 f"an always-on user unit is not armed — {_n} has no supervisor or no memory cap",
+                 f"the user unit {_n} must be enabled and active, with MemoryMax and MemorySwapMax byte "
+                 f"counts. It reads {_show or 'nothing (no user manager answered)'}"
                  f"{' — and a crontab keepalive owns :8900 (rolled back?), which has no cap at all' if _cron else ''}. "
-                 f"`systemctl --user status maintenance-dashboard`; the unit's source is "
-                 f"dashboard/maintenance-dashboard.service, installed with `systemctl --user link` — never "
-                 f"copied, so an edit there plus daemon-reload is the fix. A deliberate rollback is muted "
-                 f"with its reason: CRON_REGISTRY.md, Always-on.")
+                 f"`systemctl --user status {_n}`; the unit's source is ~/{_src}, installed with "
+                 f"`systemctl --user link` — never copied, so an edit there plus daemon-reload is the fix. "
+                 f"A deliberate rollback is muted with its reason (rule 7); another project's own rollback "
+                 f"disables its unit, which stands this check down.")
 
     # SMB share hygiene (2026-09-25, memo from stocks): without vfs_fruit, every Finder copy onto
     # the user-home share left a `._<name>` AppleDouble sidecar beside the file, and every

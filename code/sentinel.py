@@ -33,6 +33,22 @@ _MISS = re.compile(r"fail(?:ed|ure)?s? \((\d+)x\)", re.I)
 _LAB_SKIP = re.compile(r"lab mode \w+: .*does not run \(mode\.py\)", re.I)
 
 
+# memo 2026-10-01 (data-desk): an hourly desk job gets one grace. One failed run is
+# `"<src>:retrying"` in data-desk/health's head and its log ends 'failed (1x), retries on its next
+# run' (the job line is then exempt through _MISS); the desk pages itself on a second failure in
+# a row. A head whose every worse entry is retrying is that grace, said beside the state file.
+_WORSE = re.compile(r'"worse"\s*:\s*\[([^\]]*)\]')
+
+
+def _probe_note(head):
+    m = _WORSE.search(head or "")
+    items = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+    if items and all(i.endswith(":retrying") for i in items):
+        return ("  <- every source listed is retrying after ONE failed run of an hourly job that "
+                "pages itself on a second: NOT an issue")
+    return ""
+
+
 def _miss_count(tail):
     m = _MISS.search(tail or "")
     return int(m.group(1)) if m else None
@@ -135,7 +151,8 @@ def main():
     import catalog
     for name, cid in STATE_PROBES:
         try:
-            probes.append(f"{name}: {open(catalog.path(cid, proj='maintenance')).read().strip()[:300]}")
+            head = open(catalog.path(cid, proj='maintenance')).read().strip()[:300]
+            probes.append(f"{name}: {head}{_probe_note(head)}")
         except Exception as e:
             # an id that stopped resolving is a broken contract, not a quiet skip
             probes.append(f"{name}: UNREADABLE — catalog id {cid}: {type(e).__name__}: {str(e)[:160]}")
@@ -231,15 +248,38 @@ def _selftest(target=None):
                 for s in ("30,45 13 * * 1-5", "*/15 14-19 * * 1-5", "20 10 * * *")]
 
     snap = rows(at("14:15:04"), dns)                    # what the 14:20 run read
-    cases = [  # (name, table at page time, expect a critical page?)
-        ("09-23 replay: 14:30/14:45 runs clean by the time the slot came", rows(at("14:45:08"), ok), False),
-        ("newest run failed again", rows(at("15:00:14"), retried), True),
-        ("no run since the snapshot", snap, True),
+    # memo 2026-10-01 (data-desk): ONE failed hourly desk run must not page — the desk's last
+    # log line is the self-alerting form below SELF_ALERT_AT; a third failure in a row still pages
+    desk_tail = "2026-10-01T10:03:05Z [edgar_live] failed ({}x), retries on its next run"
+    desk_verdict = {"issues": [{"key": "edgar-live-fail", "summary": "Same-day filings job failed "
+                                "on its last run (Data Desk edgar_live)"}]}
+
+    def desk(n):
+        return [{"project": "data-desk", "desc": "Same-day filings", "log": "/replay/edgar_live.log",
+                 "schedule": "3 0-2,10-23 * * 1-6", "expect_min": 60, "age_min": 17,
+                 "last_run": at("10:03:05"), "tail": desk_tail.format(n)}]
+    cases = [  # (name, snapshot, table at page time, verdict, cooldown key, page?, held?)
+        ("09-23 replay: 14:30/14:45 runs clean by the time the slot came", snap,
+         rows(at("14:45:08"), ok), verdict, "job:mcp-sync", False, True),
+        ("newest run failed again", snap, rows(at("15:00:14"), retried), verdict, "job:mcp-sync", True, False),
+        ("no run since the snapshot", snap, snap, verdict, "job:mcp-sync", True, False),
+        ("data-desk: one failed hourly run (1x) is the desk's own grace", desk(1), desk(1),
+         desk_verdict, "job:same-day-filings", False, False),
+        ("data-desk: a third failure in a row (3x) pages", desk(3), desk(3),
+         desk_verdict, "job:same-day-filings", True, False),
     ]
     saved = {k: getattr(t, k) for k in ("server", "ask_json", "subprocess", "STATE")}
     argv, bad = sys.argv, []
+    head = '{\n "status": "degraded",\n "at": "2026-10-01T10:20:00Z",\n "worse": [\n  "embed:retrying"\n ],'
+    for label, h, want in (("health head: retrying only", head, True),
+                           ("health head: retrying + degraded",
+                            head.replace('"embed:retrying"', '"embed:retrying", "fedreg:degraded"'), False),
+                           ("health head: failing", head.replace("retrying", "failing"), False)):
+        good = bool(_probe_note(h)) == want
+        print(f"{'PASS' if good else 'FAIL'}  {label}: NOT-an-issue note={bool(_probe_note(h))} (want {want})")
+        bad += [] if good else [label]
     with tempfile.TemporaryDirectory() as tmp:
-        for n, (name, later, want_page) in enumerate(cases):
+        for n, (name, snap, later, verdict, key, want_page, want_held) in enumerate(cases):
             calls, tables = [], iter([snap, later])
             t.server = types.SimpleNamespace(
                 cron_jobs=lambda: next(tables, later),
@@ -257,8 +297,8 @@ def _selftest(target=None):
                     setattr(t, k, v)
             paged = any("alerts" in c for c in calls)
             held = any("--tier" in c and "digest" in c for c in calls)
-            stamped = "job:mcp-sync" in json.load(open(os.path.join(tmp, f"sentinel{n}.json")))
-            good = paged == want_page and stamped == want_page and (want_page or held)
+            stamped = key in json.load(open(os.path.join(tmp, f"sentinel{n}.json")))
+            good = paged == want_page and stamped == want_page and held == want_held
             print(f"{'PASS' if good else 'FAIL'}  {name}: paged={paged} held={held} "
                   f"cooldown={stamped} (want paged={want_page})")
             bad += [] if good else [name]

@@ -43,16 +43,35 @@ curl -sf -m 5 -o /dev/null "http://127.0.0.1:11434/api/tags" || FAIL+=("ollama(:
 python3 bin/models.py check >/dev/null 2>&1; [ $? -ge 2 ] && FAIL+=("local-model-role-unservable")
 
 systemctl --user is-active --quiet pokerlog 2>/dev/null || FAIL+=("pokerlog.service")
-# :8900 is the user unit maintenance-dashboard since 2026-09-28 (enabled = systemd owns it; the
-# rollback disables it and restores the cron keepalive). Enabled, it must be active AND capped:
-# MemoryMax is a guardrail — CPU and GPU share one memory pool with Ollama and the Stocks model
-# jobs — and `infinity` (an edit or a drop-in that lost the line) is an unarmed guardrail, so it
-# is loud. chk 8900 above stays: systemd only sees a process that exits; a hung one needs the probe.
-if systemctl --user is-enabled --quiet maintenance-dashboard 2>/dev/null; then
-  systemctl --user is-active --quiet maintenance-dashboard || FAIL+=("maintenance-dashboard.service")
-  [ "$(systemctl --user show -p MemoryMax --value maintenance-dashboard 2>/dev/null)" = infinity ] \
-    && FAIL+=("maintenance-dashboard-uncapped")
+# >>> always-on user units (2026-10-01; one block for :8900 since 2026-09-28). cron = jobs that
+# finish; anything always up is a systemd user unit whose source lives in its project repo and is
+# installed with `systemctl --user link` (PROJECT_STANDARDS §4). Every ENABLED user unit whose
+# file resolves into a project folder (~/<project>/…, not ~/.config) is picked up here without an
+# edit: it must be active AND capped. MemoryMax is a guardrail — CPU and GPU share one memory
+# pool with Ollama and the Stocks model jobs — so `infinity` (an edit or a drop-in that lost the
+# line) is loud. Disabled = its owner rolled back to cron on purpose: stands down. Labels:
+# `<unit>.service` (not active), `<unit>-uncapped`. A unit copied into ~/.config instead of linked
+# is NOT seen (pokerlog's own line above stays). The chk probes above stay: systemd only sees a
+# process that exits; a hung one needs the probe. Discovery is itself a guardrail: if it misses
+# maintenance-dashboard while that unit is enabled, it is inert and says so.
+UNITS_SEEN=()
+while IFS='|' read -r id frag ufs act mmax; do
+  [ -n "$id" ] || continue
+  real=$(readlink -f "$frag" 2>/dev/null)
+  case "$real" in "$HOME"/.*|"") continue ;; "$HOME"/*/*) ;; *) continue ;; esac
+  [ "$ufs" = enabled ] || continue
+  n=${id%.service}; UNITS_SEEN+=("$n")
+  [ "$act" = active ] || FAIL+=("$n.service")
+  [ "$mmax" = infinity ] && FAIL+=("$n-uncapped")
+done < <(systemctl --user list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | awk '{print $1}' \
+  | xargs -r systemctl --user show -p Id,FragmentPath,UnitFileState,ActiveState,MemoryMax 2>/dev/null \
+  | awk -v RS= -F'\n' '{ delete v; for (k = 1; k <= NF; k++) { e = index($k, "="); v[substr($k, 1, e - 1)] = substr($k, e + 1) }
+                          print v["Id"] "|" v["FragmentPath"] "|" v["UnitFileState"] "|" v["ActiveState"] "|" v["MemoryMax"] }')
+if systemctl --user is-enabled --quiet maintenance-dashboard 2>/dev/null \
+   && ! printf '%s\n' "${UNITS_SEEN[@]}" | grep -qx maintenance-dashboard; then
+  FAIL+=("always-on-discovery-inert")
 fi
+# <<< always-on user units
 
 # Headless-Claude auth canary — coded, zero tokens (memo 2026-08-28 from hbs: OAuth refresh
 # died ~08-27 and every `claude -p` job failed silently for a day). The CLI refreshes the

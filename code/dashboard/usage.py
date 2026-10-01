@@ -24,12 +24,21 @@ repeats the message's full `usage`. Counting per line overstated every figure he
 (a Stocks job: 90 lines for 30 messages, output 407k counted for 55k real). Lines of one message
 are consecutive, so a line whose message id equals the last one counted is skipped; the last id
 is kept with the file's entry so an incremental read that splits a message still counts it once.
-Entries from before this rule (no `v`) are re-read from the start once."""
-_V = 4            # 2: one count per message; 3: session ids; 4: Eastern days, page names (09-26)
-import json, os, time, glob, threading
+Entries from before this rule (no `v`) are re-read from the start once.
+
+WHAT IT WOULD LIST AT (2026-10-01, David: "give a dollar amount of claude tokens ... similar to local
+models"). Each day also keeps `m` = {model: [input, output, cache-write 5m, cache-write 1h, cache-read]},
+the executor's model and an advisor's (Fable) under its own id, so a day's tokens can be priced at
+the rate of the model that actually ran them: Opus 5.5 reads its cache at 0.05x, Fable 5.1 at
+0.025x, a 1-hour cache write costs 2x input. Prices live in config/pricing.json `claude`, never here,
+and they are applied when totals are built, so a price change re-prices history without a re-read.
+The figure is API list price for these tokens, not the bill: the login is a flat-rate plan."""
+_V = 5            # 2: one count per message; 3: session ids; 4: Eastern days, page names (09-26); 5: per-model tokens (10-01)
+import json, os, re, time, glob, threading
 
 HOME = os.path.expanduser("~")
 CACHE = f"{HOME}/maintenance/state/usage_cache.json"
+PRICING = f"{HOME}/maintenance/config/pricing.json"
 
 # first-user-message prefix -> job label (order matters, first match wins)
 JOB_PREFIXES = [
@@ -97,6 +106,78 @@ def _classify(first_user, proj):
     return "interactive", f"interactive · {proj}", f"Sessions — {_nice(proj)}"
 
 
+def _model_id(m):
+    """'claude-haiku-4-5-20251001' -> 'claude-haiku-4-5'; '' / '<synthetic>' -> None."""
+    m = str(m or "").strip()
+    if not m.startswith("claude-"):
+        return None
+    return re.sub(r"-\d{8}$", "", m)
+
+
+def _add_model(d, mid, u):
+    """Add one usage object's tokens to the day's per-model bucket [in, out, cw5m, cw1h, cr]. A usage
+    with no TTL split (older transcripts) counts its whole cache write as 5-minute, the cheaper rate."""
+    cw = u.get("cache_creation_input_tokens", 0) or 0
+    split = u.get("cache_creation") or {}
+    c1 = split.get("ephemeral_1h_input_tokens", 0) or 0
+    c5 = split.get("ephemeral_5m_input_tokens")
+    c5 = max(0, cw - c1) if c5 is None else (c5 or 0)
+    row = (u.get("input_tokens", 0) or 0, u.get("output_tokens", 0) or 0, c5, c1,
+           u.get("cache_read_input_tokens", 0) or 0)
+    if not any(row):
+        return
+    b = d.setdefault("m", {}).setdefault(mid, [0, 0, 0, 0, 0])
+    for i, v in enumerate(row):
+        b[i] += v
+
+
+_PRICE = {"sig": None, "p": None}
+
+
+def prices():
+    """config/pricing.json `claude`, re-read when the file changes."""
+    try:
+        sig = _file_sig(PRICING)
+        if _PRICE["sig"] != sig:
+            _PRICE.update(sig=sig, p=json.load(open(PRICING)).get("claude") or {})
+    except Exception:
+        _PRICE.update(sig=None, p=_PRICE["p"] or {})
+    return _PRICE["p"] or {}
+
+
+def _rate(mid, P):
+    """(price row, matched key) for a model id: the longest `models` key that prefixes it, else default."""
+    base = mid.split("@")[0]
+    M = P.get("models") or {}
+    keys = [k for k in M if base == k or base.startswith(k + "-")]
+    if keys:
+        k = max(keys, key=len)
+        return M[k], k
+    d = P.get("default")
+    return M.get(d, {}), None
+
+
+def cost_of(mid, b, P):
+    """USD at list price for one per-model bucket [in, out, cw5m, cw1h, cr] -> (total, parts, matched)."""
+    r, k = _rate(mid, P)
+    fx = (P.get("fast") or {}).get(k or "", 1.0) if mid.endswith("@fast") else 1.0
+    pin, pout = (r.get("in") or 0) * fx, (r.get("out") or 0) * fx
+    pcr = r.get("cr", pin * 0.1)
+    parts = {"input": b[0] * pin / 1e6, "output": b[1] * pout / 1e6,
+             "cache_write": (b[2] * pin * P.get("cache_write_5m", 1.25) + b[3] * pin * P.get("cache_write_1h", 2.0)) / 1e6,
+             "cache_read": b[4] * pcr / 1e6}
+    return sum(parts.values()), parts, k
+
+
+def _day_cost(u, P):
+    """A day bucket's list price. A bucket from before per-model counting (no `m`, from a transcript
+    since deleted) is priced at the default model and flagged by the caller."""
+    if "m" in u:
+        return sum(cost_of(mid, b, P)[0] for mid, b in u["m"].items())
+    return cost_of(P.get("default") or "unknown",
+                   [u.get("in", 0), u.get("out", 0), u.get("cc", 0), 0, u.get("cr", 0)], P)[0]
+
+
 def _parse_file(path, proj, prev=None):
     """-> {'kind','label','group','days':{date:{'in','out','cc','cr','adv','msgs'}},'off','fu','lid','v'}
 
@@ -156,10 +237,13 @@ def _parse_file(path, proj, prev=None):
                 d["out"] += u.get("output_tokens", 0) or 0
                 d["cc"] += u.get("cache_creation_input_tokens", 0) or 0
                 d["cr"] += u.get("cache_read_input_tokens", 0) or 0
+                fast = "@fast" if u.get("speed") == "fast" else ""
+                _add_model(d, (_model_id(m.get("model")) or "unknown") + fast, u)
                 for it in u.get("iterations") or ():
                     if isinstance(it, dict) and it.get("type") == "advisor_message":
                         d["adv"] = d.get("adv", 0) + sum(it.get(k, 0) or 0 for k in (
                             "input_tokens", "output_tokens", "cache_creation_input_tokens"))
+                        _add_model(d, _model_id(it.get("model")) or "unknown", it)
                 d["msgs"] += 1
         except Exception:
             continue
@@ -288,7 +372,9 @@ def _usage(days_back):
     # aggregate
     # `days_back` Eastern days INCLUDING today — "30 days" means 30 bars, not 31 (2026-09-26 polish)
     cutoff = _et_today(days_back - 1)
+    P = prices()
     daily, jobs = {}, {}
+    by_model, parts_tot, legacy_usd, legacy_days = {}, {}, 0.0, 0
     for e in cache.values():
         if not isinstance(e, dict) or "days" not in e:
             continue
@@ -300,15 +386,34 @@ def _usage(days_back):
             touched = True
             adv = u.get("adv", 0) or 0
             proc = u["in"] + u["out"] + u["cc"] + adv
-            dd = daily.setdefault(day, {"scheduled": 0, "interactive": 0, "cache_read": 0, "advisor": 0})
+            usd = _day_cost(u, P)
+            dd = daily.setdefault(day, {"scheduled": 0, "interactive": 0, "cache_read": 0, "advisor": 0,
+                                        "usd_scheduled": 0.0, "usd_interactive": 0.0})
             dd[kind] += proc
             dd["cache_read"] += u["cr"]
             dd["advisor"] += adv
+            dd["usd_" + kind] += usd
             jj = jobs.setdefault(label, {"kind": kind, "sessions": 0, "proc": 0,
                                          "out": 0, "cr": 0})
             jj["proc"] += proc
             jj["out"] += u["out"]
             jj["cr"] += u["cr"]
+            if "m" not in u:            # no per-model split: a zero-token day (synthetic messages only), or a
+                if u["in"] or u["out"] or u["cc"] or u["cr"]:   # transcript deleted before v5 read it
+                    legacy_usd += usd
+                    legacy_days += 1
+                continue
+            for mid, b in u["m"].items():
+                c, parts, k = cost_of(mid, b, P)
+                bm = by_model.setdefault(mid, {"model": mid, "priced_as": k, "usd": 0.0,
+                                               "in": 0, "out": 0, "cw": 0, "cr": 0})
+                bm["usd"] += c
+                bm["in"] += b[0]
+                bm["out"] += b[1]
+                bm["cw"] += b[2] + b[3]
+                bm["cr"] += b[4]
+                for pk, pv in parts.items():
+                    parts_tot[pk] = parts_tot.get(pk, 0.0) + pv
         if touched and not e.get("sub"):
             jobs[label]["sessions"] += 1        # one top-level transcript = one session
     # aggregate labels into work-type groups (cache entries may predate 'group' field)
@@ -321,17 +426,41 @@ def _usage(days_back):
             continue
         kind, _l, g = who(e)
         g = g or _classify_label_fallback(e)
-        gg = groups.setdefault(g, {"kind": kind, "sessions": 0, "proc": 0, "out": 0, "cr": 0})
+        gg = groups.setdefault(g, {"kind": kind, "sessions": 0, "proc": 0, "out": 0, "cr": 0, "usd": 0.0})
         gg["sessions"] += 0 if e.get("sub") else 1
         for u in recent.values():
             gg["proc"] += u["in"] + u["out"] + u["cc"] + (u.get("adv", 0) or 0)
             gg["out"] += u["out"]
             gg["cr"] += u["cr"]
+            gg["usd"] += _day_cost(u, P)
     group_rows = [{"group": g, **v, "avg": v["proc"] // max(v["sessions"], 1)}
                   for g, v in groups.items()]
     group_rows.sort(key=lambda r: -r["proc"])
-    return {"daily": [{"date": k, **v} for k, v in sorted(daily.items())],
-            "groups": group_rows, "generated_at": int(time.time())}
+    rows = [{"date": k, **v} for k, v in sorted(daily.items())]
+    today = _et_today()
+    full = [r for r in rows if r["date"] != today]
+    usd_s = sum(r["usd_scheduled"] for r in rows)
+    usd_i = sum(r["usd_interactive"] for r in rows)
+    cost = {
+        "basis": "API list price for these tokens, not the bill (the login is a flat-rate plan)",
+        "days": days_back, "from": cutoff, "to": today, "today_partial": True,
+        "usd": round(usd_s + usd_i, 2), "usd_scheduled": round(usd_s, 2), "usd_interactive": round(usd_i, 2),
+        # the average whole Eastern day: the window's days before today (today is still running),
+        # counted whether or not anything ran on them
+        "per_full_day": round(sum(r["usd_scheduled"] + r["usd_interactive"] for r in full) / max(days_back - 1, 1), 2),
+        "full_days": days_back - 1,
+        "parts": {k: round(v, 2) for k, v in parts_tot.items()},
+        "by_model": sorted(({**v, "usd": round(v["usd"], 2)} for v in by_model.values()), key=lambda r: -r["usd"]),
+        "unmatched": sorted(m for m, v in by_model.items() if not v["priced_as"]),
+        "legacy_usd": round(legacy_usd, 2), "legacy_days": legacy_days,
+        "prices": {"source": P.get("source"), "default": P.get("default"),
+                   "cache_write_5m": P.get("cache_write_5m"), "cache_write_1h": P.get("cache_write_1h"),
+                   "models": P.get("models") or {}},
+    }
+    for r in rows:
+        r["usd_scheduled"] = round(r["usd_scheduled"], 2)
+        r["usd_interactive"] = round(r["usd_interactive"], 2)
+    return {"daily": rows, "groups": group_rows, "cost": cost, "generated_at": int(time.time())}
 
 
 def _classify_label_fallback(e):
@@ -380,6 +509,35 @@ def selftest():
         fh.write(part2)
     inc = _parse_file(f, "Stocks", e)["days"]["2026-09-26"]
     check("an incremental read that splits a message still counts it once", inc == whole, (inc, whole))
+
+    # list price (2026-10-01): each model's tokens at its own rate, the advisor under its own id
+    m = whole.get("m") or {}
+    check("tokens are kept per model; an advisor that names no model is 'unknown', never the executor's",
+          m.get("claude-opus-5-5") == [6, 140, 1200, 0, 101000] and m.get("unknown") == [30000, 300, 0, 0, 0], m)
+    ua = {"input_tokens": 2, "output_tokens": 10, "cache_creation_input_tokens": 300,
+          "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+          "cache_read_input_tokens": 1000,
+          "iterations": [{"type": "advisor_message", "model": "claude-fable-5-1", "input_tokens": 500,
+                          "output_tokens": 50}]}
+    dd = {}
+    _add_model(dd, "claude-opus-5-5", ua)
+    _add_model(dd, _model_id(ua["iterations"][0]["model"]), ua["iterations"][0])
+    check("the 1-hour and 5-minute cache writes stay apart", dd["m"]["claude-opus-5-5"] == [2, 10, 100, 200, 1000], dd)
+    check("an advisor is billed as its own model", dd["m"].get("claude-fable-5-1") == [500, 50, 0, 0, 0], dd)
+    P = {"cache_write_5m": 1.25, "cache_write_1h": 2.0, "default": "claude-opus-5-5",
+         "models": {"claude-opus-5-5": {"in": 4.0, "out": 20.0, "cr": 0.20},
+                    "claude-haiku-4-5": {"in": 1.0, "out": 5.0, "cr": 0.10}},
+         "fast": {"claude-opus-5-5": 2.0}}
+    # 1M in $4 + 1M out $20 + 1M 5m-write $5 + 1M 1h-write $8 + 10M reads at $0.20 = $39
+    c, parts, k = cost_of("claude-opus-5-5", [1e6, 1e6, 1e6, 1e6, 1e7], P)
+    check("Opus 5.5 at list: writes 1.25x/2x input, reads at its own $0.20", abs(c - 39.0) < 1e-9 and k == "claude-opus-5-5",
+          (c, parts))
+    check("fast mode doubles in and out only", abs(cost_of("claude-opus-5-5@fast", [1e6, 1e6, 0, 0, 0], P)[0] - 48.0) < 1e-9)
+    check("a dated id finds its family", _model_id("claude-haiku-4-5-20251001") == "claude-haiku-4-5"
+          and _rate("claude-haiku-4-5", P)[1] == "claude-haiku-4-5")
+    check("an unknown model is priced at the default and named unmatched",
+          _rate("claude-newthing-9", P) == (P["models"]["claude-opus-5-5"], None))
+    check("a synthetic message adds no model row", _model_id("<synthetic>") is None)
 
     # a real home, a scratch "home" that symlinks to it (the 09-24 test servers), a subagent, a ledger
     global HOME, CACHE

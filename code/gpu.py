@@ -553,6 +553,11 @@ def _selftest():
          [w("Stocks"), w("bench", t=c["tiers"].get("Stocks/the Bench", 15))], (), "Stocks"),
         ("the Bench still outranks other projects",
          [w("poker"), w("bench", t=c["tiers"].get("Stocks/the Bench", 15))], (), "bench"),
+        ("a Stocks job outranks desk:search",
+         [w("search", t=c["tiers"].get("data-desk/desk:search", 20)), w("Stocks")], (), "Stocks"),
+        ("desk:search outranks the Bench",
+         [w("bench", t=c["tiers"].get("Stocks/the Bench", 15)),
+          w("search", t=c["tiers"].get("data-desk/desk:search", 20))], (), "search"),
     ]
     bad = 0
     for name, field, resident, want in cases:
