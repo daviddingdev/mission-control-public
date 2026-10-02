@@ -29,6 +29,9 @@ flowchart TB
     P2["poker study system"]:::proj
     P3["client ERP twin"]:::proj
     P4["mobile app"]:::proj
+    P5["outside-data desk"]:::proj
+    P6["thesis engine"]:::proj
+    P7["case-study pipeline"]:::proj
   end
 
   subgraph MC["Mission Control — the back office"]
@@ -36,8 +39,10 @@ flowchart TB
     V["Dashboard :8900<br/>the 30,000 ft view"]:::view
     subgraph S["Shared services"]
       direction LR
+      Q["one Claude session at a time"]:::svc
       M["model role registry"]:::svc
       G["GPU admission control"]:::svc
+      K["data catalog"]:::svc
       B["backup declaration"]:::svc
       N["notifications"]:::svc
       X["memo bus"]:::svc
@@ -48,7 +53,7 @@ flowchart TB
   GPU[["one GPU<br/>local LLM server"]]:::hw
   PHONE["phone push"]:::out
 
-  P1 & P2 & P3 & P4 --> S
+  Projects --> S
   G --> GPU
   J -->|audits| Projects
   J -->|repairs its own files| MC
