@@ -1070,7 +1070,7 @@ def cron_jobs():
 
 KNOWN_PORTS = {
     22: ("SSH", "system"), 443: ("tailscale serve HTTPS → poker app", "poker"),
-    8000: ("clientco wiki (mkdocs)", "clientco-db"), 8001: ("clientco control server", "clientco-db"),
+    8000: ("clientco wiki (static build from 10-07)", "clientco-db"), 8001: ("clientco app: numbers, lead desk, raw books", "clientco-db"),
     8088: ("Poker app (pokerlog.service, tailscale HTTPS)", "poker"),
     8787: ("Stocks dashboard", "Stocks"), 8900: ("Mission Control (this)", "Mission Control"),
     8910: ("HBS casework dashboard", "hbs"), 8790: ("Justin desk — advised book paper mode", "Stocks"),
@@ -1079,13 +1079,15 @@ KNOWN_PORTS = {
     8125: ("StatsD (netdata)", "system"), 51820: ("WireGuard (tailscale)", "system"),
     53: ("DNS", "system"), 11434: ("ollama — local AI models", "Mission Control"),
     11000: ("NVIDIA DGX Dashboard (vendor)", "system"),
-    8090: ("Poker App Store build — dev server (on demand)", "poker-appstore"),
-    8443: ("tailscale serve HTTPS → poker App Store build (on demand)", "poker-appstore"),
+    8090: ("Poker App Store build (pokerapp.service)", "poker-appstore"),
+    8443: ("tailscale serve HTTPS → poker App Store build", "poker-appstore"),
     8911: ("tailscale serve HTTPS → HBS dashboard (:8910)", "hbs"),
 }
 # Ports that listen only while someone works on them (v2.5, polish #15): declared, so a listening one is
 # never "undeclared", and listed as a service only while it listens — off is their normal state, not down.
-ON_DEMAND_PORTS = {8090, 8443}
+# Empty since 2026-10-02: 8090/8443 are always-on (pokerapp.service, enabled since August — memo from
+# poker-appstore), so they list and probe like every other service.
+ON_DEMAND_PORTS = set()
 
 
 def ports():
@@ -2071,14 +2073,158 @@ def bus():
             "ledger": parse_ledger(), "pending": bus_pending(), "memo_titles": memo_titles()}
 
 
+# ---- project leads (2026-10-02, David: "one main agent per project … those are the agents that own
+# everything"). A project with a valid lead (bin/lead.py's roster) has its memo sessions launched
+# through lead.launch(), the ONE launcher the daily pass (bin/memo-process.py) and the weekly
+# upkeep use too: the same brief (prompts/lead_base.md + lead_inbox.md, built by memo-process's
+# lead_batch with David's VERIFIED answers), --agent <lead>, empty MCP, the lead env, a runs.jsonl
+# row. Stocks has no lead ("don't touch stock for now") and keeps the paths below unchanged, and so
+# does any project whose lead is missing or invalid, or whenever lead.py will not load.
+
+_BIN_MODS = {}
+_BIN_LOCK = threading.Lock()
+
+
+def _bin_mod(name):
+    """~/maintenance/bin/<name>.py as a module, loaded again when the file changes: this server runs
+    for days and lead.py / memo-process.py move under it. `lead` is also put in sys.modules, so
+    memo-process's own `import lead` sees the same one."""
+    import importlib.util
+    bindir = os.path.join(os.path.dirname(BASE), "bin")     # this dashboard's own bin/, whatever HOME says
+    path = os.path.join(bindir, f"{name}.py")
+    mt = os.path.getmtime(path)
+    with _BIN_LOCK:
+        hit = _BIN_MODS.get(name)
+        if hit and hit[0] == mt:
+            return hit[1]
+        if bindir not in sys.path:
+            sys.path.insert(0, bindir)
+        spec = importlib.util.spec_from_file_location(name.replace("-", "_"), path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if name == "lead":
+            sys.modules["lead"] = mod
+        _BIN_MODS[name] = (mt, mod)
+        return mod
+
+
+def _lead_entry(target):
+    """lead.py's roster entry for this inbox's project when its lead is VALID, else None (Stocks,
+    no lead yet, an invalid one, or lead.py failing to load: the pre-lead path runs, and the server
+    log says why)."""
+    try:
+        return _bin_mod("lead").leads().get((target or "").lower())
+    except Exception as e:
+        print(f"[dashboard] lead.py: {type(e).__name__}: {e} — {target} memo sessions take the pre-lead path",
+              flush=True)
+        return None
+
+
+def _lead_files(target):
+    """The memos a lead takes from its inbox on David's click: all of them except those waiting on
+    his decision (needs-david) or parked to a date (waiting-until); his verified answers first,
+    then oldest first. No 30-minute floor: the click is the go."""
+    L, MP = _bin_mod("lead"), _bin_mod("memo-process")
+    d = f"{MEMOBUS}/inbox/{target}"
+    rows, out = L.ledger_rows(), []
+    try:
+        names = sorted(f for f in os.listdir(d) if f.endswith(".md"))
+    except OSError:
+        names = []
+    for f in names:
+        try:
+            mt = os.path.getmtime(os.path.join(d, f))
+        except OSError:
+            continue
+        st, _ = L.memo_state(target, f, rows, None, mt)
+        if st in ("needs-david", "waiting") or MP.needs_david(MP.slug_of(f)):
+            continue
+        out.append((not MP.decided(target, f), mt, f))
+    return [f for _, _, f in sorted(out)]
+
+
+def _lead_busy(target):
+    """The Claude-queue job of a lead session for this project that holds or waits for the slot now
+    (the daily pass's, the weekly upkeep's, an earlier click's), else None. A second unattended
+    lead in the same project would work the same memos and the same tree at once."""
+    try:
+        bindir = os.path.join(os.path.dirname(BASE), "bin")
+        if bindir not in sys.path:
+            sys.path.insert(0, bindir)
+        import claudeq
+        h = claudeq._read(claudeq.HOLDER)
+        jobs = ([h.get("job")] if h and claudeq._holder_live(h) else []) + [w.get("job") for w in claudeq._waiters()]
+        return next((j for j in jobs if str(j or "").startswith(f"lead {target}:")), None)
+    except Exception:
+        return None
+
+
+def _lead_headless(target, e, files, preface):
+    """One unattended lead session over `files`, launched in the background through lead.launch:
+    David's click takes the Claude slot with preempt (exempt from the clock, never from the
+    credential), and the detached `lead.py _bg` child holds it, runs the session and records it."""
+    L, MP = _bin_mod("lead"), _bin_mod("memo-process")
+    prompt, est, cap = MP.lead_batch(target, files, e, L=L)
+    r = L.launch(target, e["root"], e["lead"], preface + prompt, "inbox", est, cap,
+                 preempt=True, background=True, prefix=_scoped([]))
+    return r, cap
+
+
+def _lead_live_brief(lead, root, target, fname):
+    """The interactive (tmux) brief for a lead: the dispatch brief, as the lead. Its charter is loaded
+    by --agent; prompts/lead_base.md binds it, except that David may be at this session."""
+    where = "~/" + os.path.basename(root)
+    return (f"You are {lead}, dispatched by David from the Mission Control dashboard to work one memo as "
+            f"the project lead of {where}. Read ~/maintenance/prompts/lead_base.md and your memory "
+            f"({where}/.claude/lead-memory.md) first: their duties bind you here too (checks before and after, "
+            f"commits by explicit path with the trailer `Lead-Run: $SPARK_LEAD_RUN`, the ONE RULE), with one "
+            f"difference: this session is interactive, so where they say nobody is watching and to park, "
+            f"ask David here instead. Your task is the memo at ~/memos/inbox/{target}/{fname} — read it and "
+            f"process it per the protocol in ~/memos/LEDGER.md: assess honestly, implement it in this project "
+            f"OR reject it with clear reasoning; update its ledger row (accepted/implemented with commit hash/"
+            f"rejected with why — never leave 'proposed'); move the file to ~/memos/processed/ with `mv -n` "
+            f"(add a `_{target}` suffix if that name is taken). Work strictly within {root} + ~/memos/. "
+            f"David may join this session live from claude.ai/code — narrate key decisions as you go, and stay "
+            f"available for follow-up when the task is done.")
+
+
+def _lead_tmux_argv(name, root, lead, run_id, slug, prompt):
+    """tmux new-session for an interactive lead: `claude --agent <lead> "<brief>"` in the project root,
+    with the lead env (the lead guard and the commit trailer read it)."""
+    return ["tmux", "new-session", "-d", "-s", name, "-c", root,
+            "-e", f"SPARK_LEAD={lead}", "-e", f"SPARK_LEAD_RUN={run_id}", "-e", f"SPARK_CATALOG_JOB=lead:{slug}",
+            CLAUDE_BIN, "--agent", lead, prompt]
+
+
 def bus_process(target):
-    """Launch the target project's headless session to work its inbox per the LEDGER protocol."""
+    """Launch the target project's headless session to work its inbox per the LEDGER protocol.
+    A project with a lead: ONE lead session over every memo not waiting on David (lead.launch)."""
     root, label = bus_projects()[target]
+    e = _lead_entry(target)
+    if e:
+        busy = _lead_busy(target)
+        if busy:
+            return {"ok": False, "msg": f"{e['lead']} is already at work ({busy}); it takes what is left in "
+                                        f"inbox/{target}/ on its next pass."}
+        try:
+            files = _lead_files(target)
+            if not files:
+                return {"ok": False, "msg": f"Nothing for {e['lead']} to take: inbox/{target}/ is empty, or every "
+                                            f"memo in it waits on your decision or a date."}
+            r, cap = _lead_headless(target, e, files,
+                                    f"You are {e['lead']}, dispatched by David from the Mission Control dashboard "
+                                    f"to work your inbox (unattended: the brief below applies unchanged, the ONE "
+                                    f"RULE included).\n\n")
+        except Exception as x:
+            return {"ok": False, "msg": f"lead launch failed: {type(x).__name__}: {x}"[:160]}
+        return {"ok": bool(r.get("ok")), "run_id": r.get("run_id"),
+                "msg": f"{e['lead']} took {len(files)} memo(s), headless, up to {cap} min (run {r.get('run_id')})."}
     prompt = (f"You are a {label} session. Process the cross-project memo inbox per the protocol in "
               f"~/memos/LEDGER.md: for each file in ~/memos/inbox/{target}/ — read it, assess honestly, "
               f"then implement it in this project OR reject it with clear reasoning. Update its row in "
               f"~/memos/LEDGER.md (accepted/implemented with commit hash/rejected with why — never leave "
-              f"'proposed'), move the file to ~/memos/processed/, and commit your changes if this project "
+              f"'proposed'), move the file to ~/memos/processed/ with `mv -n` (add a `_{target}` suffix "
+              f"if that name is taken), and commit your changes if this project "
               f"is a git repo (never commit paths its .gitignore marks private). If the inbox is empty, "
               f"do nothing. Work strictly within {root} + ~/memos/.")
     log = f"{HOME}/maintenance/logs/memo_process_{target}.log"
@@ -2253,11 +2399,38 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
         except Exception:
             cur = ""
         open(LEDGER, "w").write(cur + row)
+    e = _lead_entry(target)
+    if e:
+        # a project lead: the same memo, through the lead (Stocks and lead-less projects: below, unchanged)
+        try:
+            if interactive:
+                L = _bin_mod("lead")
+                run_id = L.new_run_id(target, "live")
+                name = re.sub(r"[^a-zA-Z0-9_-]", "-", f"lead-{slug[:22]}-{time.strftime('%H%M')}")
+                subprocess.run(_scoped(_lead_tmux_argv(name, e["root"], e["lead"], run_id, target,
+                                                       _lead_live_brief(e["lead"], e["root"], target, fname))),
+                               env=_tmux_env(), timeout=15, check=True)
+                return {"ok": True, "session": name, "run_id": run_id,
+                        "msg": f"Dispatched to {e['lead']} — session '{name}' is live (join from claude.ai/code "
+                               f"or the app)."}
+            busy = _lead_busy(target)
+            if busy:
+                return {"ok": True, "msg": f"Memo dropped in inbox/{target}/. {e['lead']} is already at work "
+                                           f"({busy}), so no second session: its next pass takes this memo."}
+            r, cap = _lead_headless(target, e, [fname],
+                                    f"You are {e['lead']}, dispatched by David from the Mission Control dashboard "
+                                    f"for one memo (unattended: the brief below applies unchanged, the ONE RULE "
+                                    f"included).\n\n")
+            return {"ok": bool(r.get("ok")), "run_id": r.get("run_id"),
+                    "msg": f"Dispatched headless to {e['lead']} (up to {cap} min, run {r.get('run_id')})."}
+        except Exception as x:
+            return {"ok": False, "msg": f"lead launch failed: {type(x).__name__}: {x}"[:160]}
     prompt = (f"You are a {label} session, dispatched by David from the Mission Control dashboard. "
               f"Your task is the memo at ~/memos/inbox/{target}/{fname} — read it and process it per the "
               f"protocol in ~/memos/LEDGER.md: assess honestly, implement it in this project OR reject it "
               f"with clear reasoning; update its ledger row (accepted/implemented with commit hash/"
-              f"rejected with why — never leave 'proposed'); move the file to ~/memos/processed/; commit "
+              f"rejected with why — never leave 'proposed'); move the file to ~/memos/processed/ with "
+              f"`mv -n` (add a `_{target}` suffix if that name is taken); commit "
               f"if this project is a git repo (never paths .gitignore marks private). Work strictly within "
               f"{root} + ~/memos/. David may join this session live from claude.ai/code — narrate key "
               f"decisions as you go, and stay available for follow-up when the task is done.")
@@ -2293,7 +2466,12 @@ def bus_ignore(slug):
             for f in os.listdir(d):
                 if f.endswith(f"_{slug}.md") or f == f"{slug}.md":
                     os.makedirs(f"{MEMOBUS}/processed", exist_ok=True)
-                    os.rename(f"{d}/{f}", f"{MEMOBUS}/processed/{f}")
+                    # processed/ is flat and a fan-out memo's copies share one name: a plain rename
+                    # let the second overwrite the first (2026-10-02, memo from poker-appstore)
+                    dst = f"{MEMOBUS}/processed/{f}"
+                    if os.path.exists(dst):
+                        dst = f"{MEMOBUS}/processed/{f[:-3]}_{proj}.md"
+                    os.rename(f"{d}/{f}", dst)
                     moved.append(f)
                     targets.append(proj)
     # The inbox a file sat in IS its target: that target's newest row, or a new row for it —
@@ -2870,6 +3048,7 @@ HOT_ROUTES = {
     "/api/notifications":   (30, 600, 11),
     "/api/usage":           (120, 1800, 12),
     "/api/crew":            (60, 600, 13),
+    "/api/team":            (30, 600, 14),
 }
 
 
@@ -3104,6 +3283,7 @@ TT_ROUTES = {
     "/api/decisions": ("tt_decide", "state"),       # David's answers to Needs attention (v2.1)
     "/api/live":      ("tt_live", "live"),          # what runs now, and what it touches (v2.2)
     "/api/crew":      ("tt_crew", "crew"),          # the named agents, their state and runs (v2.5)
+    "/api/team":      ("tt_team", "team"),          # one seat per project lead, ?id= its sheet (2026-10-03)
 }
 # v2.5: tt_crew.stamp() puts `agent` + `agent_name` on every run these feeds carry — one namer for
 # the desk, the crew, Recent runs and "Last used by"
@@ -3178,6 +3358,20 @@ def _tt_call(path, strict=False):
         except Exception as e:
             print(f"[dashboard] memo titles: {type(e).__name__}: {e}", flush=True)
     return data
+
+
+def _not_found(path, data):
+    """True when a TT route was asked for something that is not there: /api/team?id=<no such lead> (the last text-fit
+    round, 2026-10-03: it answered 200). The body stays the module's own JSON ({"error": "no seat 'x'", "ids": [...]};
+    a malformed id, {"error": "bad id"}); only the status changes, to 404."""
+    from urllib.parse import urlparse, parse_qs
+    u = urlparse(path)
+    if u.path != "/api/team" or not isinstance(data, dict) or not data.get("error"):
+        return False
+    if not (parse_qs(u.query).get("id") or [""])[0].strip():
+        return False
+    e = str(data["error"])
+    return e.startswith("no seat ") or e == "bad id"
 
 
 def _tt_post(path, body):
@@ -3469,10 +3663,13 @@ class H(BaseHTTPRequestHandler):
                 data, body, etag, gz = e.data, e.body, e.etag, e.gz
             if data is None:
                 self._json({"error": "still building — try again in a moment"}, code=503)
+            elif _not_found(path, data):
+                self._send(404, body, "application/json", gz=gz)
             else:
                 self._send(200, body, "application/json", etag=etag, gz=gz)
         elif path.split("?")[0] in TT_ROUTES:        # fresh=1 / since=: straight through
-            self._json(_tt_call(path))
+            data = _tt_call(path)
+            self._json(data, code=404 if _not_found(path, data) else 200)
         elif path.startswith("/api/overview"):        # unreachable: _hot_spec covers it
             self._json(overview())
         elif path.startswith("/api/memos"):
@@ -3655,7 +3852,7 @@ class H(BaseHTTPRequestHandler):
             if r.get("ok"):
                 # an answered item must never be served as still open: the next status read
                 # waits for the rebuild (tt_decide has already dropped tt_now's own cache)
-                _hot_invalidate("/api/status", "/api/decisions", "/api/timeline")
+                _hot_invalidate("/api/status", "/api/decisions", "/api/timeline", "/api/team")
             self._json(r)
             return
         if m:
@@ -3701,7 +3898,7 @@ class H(BaseHTTPRequestHandler):
             return
         # what a click changes shows on the next read: memos waiting on David, an update
         # running, an experiment's status
-        _hot_invalidate("/api/status", "/api/overview", "/api/timeline")
+        _hot_invalidate("/api/status", "/api/overview", "/api/timeline", "/api/team")
         self._json(r)
 
 
@@ -3964,6 +4161,14 @@ def selftest():
        and not any(k.startswith("/api/live") for k in _HOT),
        "/api/live is a tt route that bypasses the hot cache")
 
+    # the last text-fit round (2026-10-03): /api/team?id=<no such lead> is a 404 with the module's own body
+    ok(_not_found("/api/team?id=bogus", {"error": "no seat 'bogus'", "ids": ["pm"]})
+       and _not_found("/api/team?id=..%2Fx", {"error": "bad id"})
+       and not _not_found("/api/team?id=pm", {"id": "pm"}) and not _not_found("/api/team", {"error": "no seat ''"})
+       and not _not_found("/api/team?id=pm", {"error": "TypeError: x"})
+       and not _not_found("/api/crew?id=bogus", {"error": "no seat 'bogus'"}),
+       "an unknown lead id answers 404 (same JSON body); a known one, a module error or another route keeps its status")
+
     # 4. the memo ledger: a status change touches ONE row
     global LEDGER, MEMOBUS, HOME
     saved = (LEDGER, MEMOBUS, HOME)
@@ -4000,6 +4205,106 @@ def selftest():
             ok(got[2:5] == rows[2:5] and len(got) == 6 and "| hbs | rejected (ignored" in got[5]
                and os.path.exists(os.path.join(MEMOBUS, "processed/2026-09-22_fix-readme.md")),
                "ignore from an inbox with no row: a new row for that target, the others untouched")
+            # 5c. a fan-out memo (one name in several inboxes) never overwrites a processed copy
+            for proj in ("maintenance", "stocks"):
+                open(os.path.join(MEMOBUS, f"inbox/{proj}/2026-09-22_fix-readme.md"), "w").write(proj)
+            bus_ignore("fix-readme")
+            kept = {n: open(os.path.join(MEMOBUS, "processed", n)).read()
+                    for n in os.listdir(os.path.join(MEMOBUS, "processed"))}
+            ok(kept == {"2026-09-22_fix-readme.md": "x", "2026-09-22_fix-readme_maintenance.md": "maintenance",
+                        "2026-09-22_fix-readme_stocks.md": "stocks"},
+               f"ignoring a fan-out memo keeps every copy in processed/: {sorted(kept)}")
+
+            # 5d. memo sessions for a project LEAD go through bin/lead.py's launcher; Stocks (no lead)
+            #     keeps the pre-lead prompts, unchanged (2026-10-02). Nothing is launched: the
+            #     launcher, tmux and Popen are stubs, and the memo files live in this temp bus.
+            G = globals()
+            L = _bin_mod("lead")
+            real = {k: G[k] for k in ("_lead_entry", "_claim_slot", "_lead_busy")}
+            real_launch, real_run, real_popen = L.launch, subprocess.run, subprocess.Popen
+            launched, ran, popened = [], [], []
+            fake = {"slug": "poker", "lead": "poker_lead", "root": os.path.join(tmp, "poker"),
+                    "cfg": {"pilot_until": "2026-10-16"}}
+            os.makedirs(os.path.join(MEMOBUS, "inbox/poker"))
+            os.makedirs(fake["root"])
+            for nm in ("2026-09-01_old-ask.md", "2026-09-02_new-ask.md"):
+                open(os.path.join(MEMOBUS, "inbox/poker", nm), "w").write("# ask\n")
+            os.utime(os.path.join(MEMOBUS, "inbox/poker/2026-09-01_old-ask.md"), (1, 1))
+
+            class _P:
+                pid = 4242
+            try:
+                G["_lead_entry"] = lambda t: fake if t == "poker" else None
+                G["_claim_slot"] = lambda *a, **k: None
+                G["_lead_busy"] = lambda t: None
+                L.launch = lambda *a, **kw: launched.append((a, kw)) or {"ok": True, "state": "launched",
+                                                                         "run_id": "r-1", "pid": 1}
+                subprocess.run = lambda argv, **kw: ran.append(argv) or subprocess.CompletedProcess(argv, 0)
+                subprocess.Popen = lambda argv, **kw: popened.append(argv) or _P()
+                r = bus_process("poker")
+                a, kw = launched[-1] if launched else ((), {})
+                ok(r.get("ok") and a[:3] == ("poker", fake["root"], "poker_lead") and a[4] == "inbox"
+                   and kw.get("preempt") is True and kw.get("background") is True and kw.get("prefix") == _scoped([])
+                   and a[3].startswith("You are poker_lead, dispatched by David")
+                   and a[3].index("2026-09-01_old-ask.md") < a[3].index("2026-09-02_new-ask.md")
+                   and "ONE RULE ABOVE THE PROTOCOL" in a[3] and (a[5], a[6]) == L.inbox_cap(2),
+                   f"process (lead): ONE lead.launch(mode=inbox, preempt, background) over the inbox, oldest "
+                   f"first, the lead brief, est/cap {L.inbox_cap(2)} (lead.inbox_cap) {a[4:7] if a else r}")
+                n0 = len(launched)
+                r = bus_dispatch("poker", "Fix the thing", "Please fix the thing.", interactive=False)
+                a, kw = launched[-1] if len(launched) > n0 else ((), {})
+                ok(r.get("ok") and a and a[4] == "inbox" and kw.get("background") is True
+                   and "~/memos/inbox/poker/" in a[3] and "fix-the-thing.md" in a[3] and "old-ask" not in a[3]
+                   and (a[5], a[6]) == L.inbox_cap(1),
+                   f"dispatch headless (lead): lead.launch over the ONE memo just written, est/cap "
+                   f"{L.inbox_cap(1)} {a[4:7] if a else r}")
+                r = bus_dispatch("poker", "Live one", "Talk me through it.", interactive=True)
+                tm = next((x for x in ran if "new-session" in x), [])
+                i = tm.index("tmux") if "tmux" in tm else 0
+                tm = tm[i:]
+                ok(r.get("ok") and tm[:2] == ["tmux", "new-session"] and tm[tm.index("-c") + 1] == fake["root"]
+                   and "SPARK_LEAD=poker_lead" in tm and any(x.startswith("SPARK_LEAD_RUN=") for x in tm)
+                   and tm[-4:-1] == [CLAUDE_BIN, "--agent", "poker_lead"]
+                   and tm[-1].startswith("You are poker_lead, dispatched by David") and "live-one.md" in tm[-1],
+                   "dispatch interactive (lead): tmux `claude --agent poker_lead \"<brief>\"` in the project root, "
+                   "with the lead env")
+                ran.clear()
+                n0 = len(launched)
+                os.makedirs(os.path.join(tmp, "Stocks"), exist_ok=True)
+                bus_dispatch("stocks", "Stock ask", "Do the stock thing.", interactive=True)
+                bus_dispatch("stocks", "Stock ask 2", "Do it headless.", interactive=False)
+                bus_process("stocks")
+                tm = next((x for x in ran if "new-session" in x), [])
+                ok(len(launched) == n0 and tm and tm[-2] == CLAUDE_BIN and "--agent" not in tm
+                   and "session, dispatched by David from the Mission Control dashboard" in tm[-1]
+                   and len(popened) == 2 and all(CLAUDE_HEADLESS in p and "--agent" not in p for p in popened)
+                   and "dispatched by David" in " ".join(popened[0])
+                   and "Process the cross-project memo inbox" in " ".join(popened[1]),
+                   "Stocks (no lead): the pre-lead tmux, headless and process paths, unchanged — no lead.launch, "
+                   "no --agent")
+                G["_lead_busy"] = lambda t: "lead poker:inbox" if t == "poker" else None
+                n0 = len(launched)
+                r1 = bus_process("poker")
+                r2 = bus_dispatch("poker", "Another", "One more.", interactive=False)
+                ok(len(launched) == n0 and r1.get("ok") is False and "already at work" in r1.get("msg", "")
+                   and r2.get("ok") and "no second session" in r2.get("msg", "")
+                   and os.path.exists(os.path.join(MEMOBUS, "inbox/poker", time.strftime("%Y-%m-%d") + "_another.md")),
+                   "a lead already at work in that project: no second unattended lead (the memo still lands)")
+                G["_lead_entry"] = real["_lead_entry"]
+                ok(_lead_entry("stocks") is None and _lead_entry("no-such-inbox") is None,
+                   "the live roster: stocks has no lead (pre-lead path); an unknown inbox has none")
+                live = {s for s in L.leads()}
+                ok(all((_lead_entry(s) or {}).get("lead") == L.lead_id(s) for s in live),
+                   f"the live roster: every valid lead is found by its inbox slug ({', '.join(sorted(live))})")
+                real_bin = G["_bin_mod"]
+                G["_bin_mod"] = lambda n: (_ for _ in ()).throw(ImportError("planted"))
+                try:
+                    ok(_lead_entry("poker") is None, "lead.py failing to load: no lead, the pre-lead path runs")
+                finally:
+                    G["_bin_mod"] = real_bin
+            finally:
+                G.update(real)
+                L.launch, subprocess.run, subprocess.Popen = real_launch, real_run, real_popen
     finally:
         LEDGER, MEMOBUS, HOME = saved
 

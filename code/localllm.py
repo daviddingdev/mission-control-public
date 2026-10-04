@@ -43,6 +43,16 @@ def __getattr__(name):
 THINK_HEADROOM = 2500
 
 
+def _meter(g, t0, t_body, t_end):
+    """-> (wait_s, hold_s). `secs` in local_usage.jsonl is the inference, never the queue
+    (2026-10-04: t0 was taken before gpu.slot, so a call queued behind the Bench booked its
+    wait as GPU time). The grant time is the slot's own (gpu.Grant.t_grant); a slot that
+    yields nothing — data-desk's _held_slot wrapper, an older gpu.py — falls back to the
+    moment the `with` body began, which is the grant by construction."""
+    t_grant = getattr(g, "t_grant", None) or t_body
+    return max(0.0, t_grant - t0), max(0.0, t_end - t_grant)
+
+
 def ask(prompt, model=None, num_predict=400, temperature=None, timeout=900,
         force_json=False, job=None, think=None, num_ctx=None, system=None):
     """One local-model call. Sampling defaults come from the registry's per-role `options`
@@ -73,12 +83,15 @@ def ask(prompt, model=None, num_predict=400, temperature=None, timeout=900,
     req = urllib.request.Request(models.chat_url(), json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     t0 = time.time()
-    with gpu.slot(job=job, model=model):
+    with gpu.slot(job=job, model=model) as g:
+        t_body = time.time()
         with urllib.request.urlopen(req, timeout=timeout) as r:
             d = json.loads(r.read().decode())
+    wait_s, hold_s = _meter(g, t0, t_body, time.time())
     txt = d.get("message", {}).get("content", "")
     gpu.record_usage(job=job, model=model, prompt_tokens=d.get("prompt_eval_count"),
-                     output_tokens=d.get("eval_count"), seconds=time.time() - t0, text=txt)
+                     output_tokens=d.get("eval_count"), seconds=hold_s, text=txt,
+                     wait_s=wait_s, hold_s=hold_s)
     return re.sub(r"<think>.*?</think>", "", txt, flags=re.S).strip()
 
 
@@ -108,3 +121,69 @@ def _parse_fail(txt, kw):
                                 "num_predict": kw.get("num_predict"), "head": (txt or "")[:300]}) + "\n")
     print(f"localllm: unparseable JSON from job={kw.get('job')} ({len(txt or '')} chars)", file=sys.stderr)
     return {}
+
+
+def _selftest():
+    """The meter, with fakes only: no ollama, no real GPU slot, no write to the live ledger.
+    A fake slot that queues 2 s must book wait_s≈2 and hold≈0 — with a gpu.Grant, and with
+    a wrapper that yields None (data-desk's _held_slot)."""
+    import contextlib
+    real = (gpu.slot, gpu.record_usage, gpu.cfg, models.chat_url, models.options,
+            urllib.request.urlopen)
+    rows = []
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"message": {"content": "ok"}, "prompt_eval_count": 3,
+                               "eval_count": 1}).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake_slot(wait, grant):
+        @contextlib.contextmanager
+        def slot(job=None, model=None, proj=None, timeout=None):
+            g = gpu.Grant(time.time())
+            time.sleep(wait)                 # queued behind someone else
+            g.t_grant, g.held = time.time(), True
+            try:
+                yield g if grant else None
+            finally:
+                g.t_release = time.time()
+        return slot
+
+    bad, cases = 0, []
+    try:
+        gpu.record_usage = lambda **kw: rows.append(kw)
+        gpu.cfg = lambda: {"keep_alive": "1m"}
+        models.chat_url = lambda: "http://127.0.0.1:9/api/chat"
+        models.options = lambda role: {}
+        urllib.request.urlopen = lambda req, timeout=None: _Resp()
+        for name, wait, grant in (("Grant", 2.0, True), ("wrapper yields None", 2.0, False)):
+            gpu.slot = fake_slot(wait, grant)
+            rows.clear()
+            out = ask("p", model="fake:1", job="selftest")
+            r = rows[0] if rows else {}
+            cases += [
+                (f"{name}: answer returned", out, "ok"),
+                (f"{name}: 2 s wait books wait_s~2", abs((r.get("wait_s") or 0) - wait) < 0.25, True),
+                (f"{name}: hold ~0", r.get("hold_s", 9) < 0.25, True),
+                (f"{name}: secs is the hold, not the wait", r.get("seconds") == r.get("hold_s"), True),
+            ]
+    finally:
+        (gpu.slot, gpu.record_usage, gpu.cfg, models.chat_url, models.options,
+         urllib.request.urlopen) = real
+    for name, got, want in cases:
+        ok = got == want
+        bad += not ok
+        print(f"  {'ok ' if ok else 'FAIL'} {name:<44} -> {got}")
+    print(f"{len(cases) - bad}/{len(cases)} passed")
+    return bad
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["selftest"]:
+        sys.exit(1 if _selftest() else 0)
+    print("usage: localllm.py selftest   (a library: from localllm import ask)", file=sys.stderr)
+    sys.exit(2)

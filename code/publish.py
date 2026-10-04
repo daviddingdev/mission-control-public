@@ -28,6 +28,8 @@ never reads a gitignored path, and never runs a command inside a project checkou
                                 not published yet — the "you wrote something worth showing"
                                 report
     publish.py status           what exists, what is held back and why
+  publish and refresh take --dry (= --dry-run); any other argument to them exits 2 and publishes
+  nothing (2026-10-03: until then `publish --dry-run` was a live publish).
 
 Keeping it current is the hard half. The projects change daily, and a public repo that
 describes last month's system is worse for its purpose than no repo. So the split is:
@@ -520,11 +522,34 @@ def selftest():
           [(x["why"].split()[0], x["match"], "PLANTED" in x["text"]) for x in h],
           [("credential", "<redacted>", False), ("absolute", "/home/user", False)])
 
+    # the argv contract (2026-10-03): the two commands that push take only their own arguments
+    check("argv: publish [repo] [--dry|--dry-run] and refresh [--dry|--dry-run] parse",
+          [_write_argv(c, a) for c, a in (("publish", []), ("publish", ["x-public", "--dry-run"]),
+                                          ("refresh", ["--dry"]), ("refresh", ["--dry-run"]))],
+          [(False, ""), (True, ""), (True, ""), (True, "")])
+    check("argv: publish --bogus / -n / two repos, refresh with a repo are errors (exit 2)",
+          all(_write_argv(c, a)[1] for c, a in (("publish", ["--bogus"]), ("publish", ["-n"]),
+                                                ("publish", ["a", "b"]), ("refresh", ["x"]))), True)
+
     bad = [c for c in cases if not c[1]]
     for name, ok, got in cases:
         print(f"  {'ok  ' if ok else 'FAIL'} {name}" + ("" if ok else f"  -> {got!r}"))
     print(f"{len(cases) - len(bad)}/{len(cases)} passed")
     return 1 if bad else 0
+
+
+def _write_argv(cmd, rest):
+    """-> (dry, error) for the two commands that push: `publish [repo]` and `refresh`, each with
+    --dry (= --dry-run). Anything else is an error (exit 2), never a live publish (2026-10-03)."""
+    rest, dry = list(rest), False
+    if cmd == "publish" and rest and not rest[0].startswith("-"):
+        rest.pop(0)
+    for a in rest:
+        if a in ("--dry", "--dry-run"):
+            dry = True
+        else:
+            return dry, f"unknown argument {a!r}"
+    return dry, ""
 
 
 def status():
@@ -553,6 +578,12 @@ if __name__ == "__main__":
         sys.exit(0)
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     arg = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else None
+    if cmd in ("publish", "refresh"):
+        _dry, _err = _write_argv(cmd, sys.argv[2:])
+        if _err:
+            print(f"publish.py {cmd}: {_err} — nothing published. usage: publish.py publish [repo] "
+                  f"[--dry|--dry-run] | publish.py refresh [--dry|--dry-run]", file=sys.stderr)
+            sys.exit(2)
     if cmd == "scan":
         h = scan(arg)
         for x in h:
@@ -562,9 +593,9 @@ if __name__ == "__main__":
     elif cmd == "build":
         print("built:", ", ".join(build(arg)))
     elif cmd == "publish":
-        sys.exit(publish(arg, dry="--dry" in sys.argv))
+        sys.exit(publish(arg, dry=_dry))
     elif cmd == "refresh":
-        sys.exit(1 if refresh(dry="--dry" in sys.argv).get("failed") else 0)
+        sys.exit(1 if refresh(dry=_dry).get("failed") else 0)
     elif cmd == "selftest":
         sys.exit(selftest())
     elif cmd == "candidates":

@@ -31,8 +31,12 @@ Design rules, in case a later session wants to extend it:
     decide   David's answers from the dashboard that the janitor finishes: a mute goes
              into config/backoffice_mute.json with its reason, an in-dev label's new expiry
              into config/dev.json, and a "I'll do it myself" answer is checked and closed
+    history-backfill  one-time seed of each finding's first_ever_seen / reopen_count / history
+             from state/decisions.jsonl and findings.json (--dry prints, writes nothing)
 
-CLI: backoffice.py [census|audit|fix|brief|run|show|selftest] [--dry]
+CLI: backoffice.py [census|audit|fix|brief|run|show|decide|selftest|history-backfill] [--dry|--dry-run]
+     (no command = run; --dry and --dry-run are the same; any other argument exits 2 and runs
+     nothing — 2026-10-03: until then `--dry-run`, or any typo, ran the live pass)
 """
 import json
 import os
@@ -54,6 +58,9 @@ FINDINGS = os.path.join(STATE, "findings.json")
 STATUS = os.path.join(STATE, "project_status.json")
 HISTORY = os.path.join(STATE, "backoffice.jsonl")
 MUTE = os.path.join(CONFIG, "backoffice_mute.json")
+MEMOS = os.path.join(HOME, "memos")                      # the bus: inbox/<slug>/ + LEDGER.md (selftest repoints it)
+BLOCKERS = os.path.join(CONFIG, "known_blockers.json")   # pending decisions that hold a key (repeat-failure)
+REPEAT_ASKED = os.path.join(STATE, "repeat_asked.json")  # key -> the one repeat memo filed for it
 
 # ~ is the project parent (see ~/CLAUDE.md). These top-level folders are infrastructure,
 # not projects: they have no CLAUDE.md contract and no lifecycle of their own.
@@ -952,11 +959,15 @@ ARMED_CHECKS = (
      "requires": ("bin/hook-guard-claude.py",),
      "titles": ("the claude-spawn guard is not armed",)},
     {"id": "claudeq", "control": "claudeq box slot", "layer": "preventive",
-     "standard": "§2a.3", "check": "`claudeq.py audit` (C26): every Claude spawn point goes through the slot",
+     "standard": "§2a.3", "check": "`claudeq.py audit` (C26): every Claude spawn point goes through the slot · "
+                                 "`claudeq.py selftest` (the clock, the fit rule, the cron reader and its "
+                                 "weekday guards, starvation)",
      "requires": ("bin/claudeq.py",),
-     "titles": ("a Claude spawn point goes around the box slot",)},
+     "titles": ("a Claude spawn point goes around the box slot",
+                "claudeq selftest fails — the box slot's clock or fit rule no longer does what was agreed")},
     {"id": "notify", "control": "notify.sh + notify_policy.json", "layer": "preventive",
-     "standard": "§1", "check": "policy parses · `notify_policy.py selftest`",
+     "standard": "§1", "check": "policy parses · `notify_policy.py selftest` (the tier table, and the Daily "
+                                 "rollup's cap_exempt: no channel cap holds it)",
      "requires": ("bin/notify.sh", "bin/notify_policy.py", "config/notify_policy.json"),
      "titles": ("notify_policy.json is unreadable — push tiering is off",
                 "notify_policy selftest fails — a tiering rule no longer does what was agreed")},
@@ -965,10 +976,12 @@ ARMED_CHECKS = (
      "requires": ("bin/hook-memo-inbox.py",),
      "titles": ("the memo-inbox SessionStart hook is not armed",)},
     {"id": "schedule-check", "control": "PreToolUse schedule-check hook", "layer": "preventive",
-     "standard": "§2a", "check": "listed under hooks.PreToolUse · executable · `schedule-check.py --audit` runs",
+     "standard": "§2a", "check": "listed under hooks.PreToolUse · executable · `schedule-check.py selftest` "
+                                 "(the job classifier) · `schedule-check.py --audit` runs",
      "requires": ("bin/hook-guard-schedule.py", "bin/schedule-check.py"),
      "titles": ("the schedule-check PreToolUse hook is not armed",
                 "the schedule-check hook misreads commands — its selftest fails",
+                "schedule-check.py misreads which jobs run a local model — its selftest fails",
                 "schedule-check.py does not run — the crontab hook is calling a broken checker")},
     {"id": "session-ledger", "control": "SessionStart/End session ledger", "layer": "preventive",
      "standard": "—", "check": "both hooks listed · executable · a ledger row in the last 26 h",
@@ -1019,6 +1032,32 @@ ARMED_CHECKS = (
      "standard": "—", "check": "`testparm -s` loads fruit + streams_xattr · no AppleDouble since",
      "requires": (),
      "titles": ("the SMB share no longer loads vfs_fruit — Finder copies leave ._ files again",)},
+    {"id": "sto-owners", "control": "single-threaded owner: every automated thing walks to one lead (rule owner-missing)",
+     "layer": "detective", "standard": "box rule 10",
+     "check": "rule 28 runs over the crons, 30 days of queue jobs, enabled user units, the crew and the catalog · "
+              "`backoffice.py selftest` (the owner-missing fixtures)",
+     "requires": ("bin/backoffice.py", "bin/lead.py", "dashboard/tt_crew.py"),
+     "titles": ("the owner-missing rule did not run — nothing checks that every job has a lead",)},
+    {"id": "patch-guards", "control": "monthly patch guards (GPU and Claude slots held to the reboot, active sessions, sudoers, disk)",
+     "layer": "preventive", "standard": "—",
+     "check": "`spark-update-run.sh selftest`: each guard seen to refuse, argv exits 2, the pause holds "
+              "(no scheduled run before November, or without state/patch/first_pass from a green in-person run)",
+     "requires": ("bin/spark-update-run.sh", "bin/spark-postboot-verify.sh"),
+     "titles": ("the monthly patch's guards fail their selftest — it could reboot under live work",)},
+    {"id": "auto-fix", "control": "auto-fix policy (the never-auto fence, the quiet morning, the 14-day hand-back, "
+                                  "the 7-day reversible memo default)",
+     "layer": "preventive", "standard": "—",
+     "check": "`decisions.py selftest` · `tt_decide.py selftest` · `memo-process.py selftest`: each pins the fence "
+              "(public, money, Stocks, deletes, ports, accounts, security never auto-resolve) and its argv",
+     "requires": ("bin/decisions.py", "dashboard/tt_decide.py", "bin/memo-process.py"),
+     "titles": ("the auto-fix policy's selftests fail — {} could act for David where it must not",)},
+    {"id": "deadman", "control": "dead-box alarm (one scheduled ntfy.sh message the watchdog keeps pushing back)",
+     "layer": "detective", "standard": "—",
+     "check": "`healthcheck.sh selftest` (plan, arm, cancel and the ledger rows on a stub curl) · state/deadman.json "
+              "re-armed in the last 75 min",
+     "requires": ("bin/healthcheck.sh",),
+     "titles": ("the dead-box alarm's selftest fails — a dead box might never page",
+                "the dead-box alarm is not armed — {}")},
     {"id": "sentinel", "control": "sentinel page recheck", "layer": "detective",
      "standard": "—", "check": "`sentinel.py selftest`", "requires": ("bin/sentinel.py",),
      "titles": ("sentinel selftest fails — it can page on a job that already recovered",)},
@@ -1032,6 +1071,24 @@ ARMED_CHECKS = (
      "check": "the canonical dist/ VERSION reads · `backoffice.py selftest` (the mdreader-drift fixtures)",
      "requires": ("shared/mdreader/dist/mdreader.js",),
      "titles": ("the mdreader drift rule cannot read the shared reader's VERSION — it checks nothing",)},
+    {"id": "broker-guard", "control": "PreToolUse broker guard (only the PM places BrokerB orders)",
+     "layer": "preventive", "standard": "—",
+     "check": "listed under hooks.PreToolUse for Bash and mcp__brokerb-trading__.* · executable · "
+              "`hook-guard-broker.py selftest`",
+     "requires": ("bin/hook-guard-broker.py",),
+     "titles": ("the broker guard is not armed — a headless session could place a BrokerB order",)},
+    {"id": "lead-guard", "control": "PreToolUse project-lead guard (a lead's bright lines)",
+     "layer": "preventive", "standard": "§5",
+     "check": "listed under hooks.PreToolUse for Bash and Edit|Write|MultiEdit|NotebookEdit · executable · "
+              "`hook-guard-lead.py selftest`",
+     "requires": ("bin/hook-guard-lead.py",),
+     "titles": ("the project-lead guard is not armed — a lead's bright lines are not enforced",)},
+    {"id": "project-leads", "control": "bin/lead.py: the one lead launcher, the 07:02Z pick, the 07:47Z deadline, push safety",
+     "layer": "preventive", "standard": "§5",
+     "check": "`lead.py selftest` · `lead.py status --json` answers (the lead-* rules read it)",
+     "requires": ("bin/lead.py",),
+     "titles": ("lead.py selftest fails — the weekly pick, the deadline or the push safety no longer hold",
+                "the project-lead rules did not run — `lead.py status` failed")},
 )
 
 
@@ -1131,6 +1188,771 @@ def _catalog_key(r):
     return None
 
 
+# PROJECT LEADS (2026-10-02, David: "one main agent per project, let's call it project_lead ...
+# some projects like clientco won't have much going on, that is fine as long as the lead is there
+# to take memos"). bin/lead.py derives the roster from disk and says, per project, whether its lead
+# is declared, valid and keeping its weekly day; these rules read `lead.py status --json`.
+LEAD_OVERDUE_FROM = "2026-10-12"     # first-week grace: the leads were installed 2026-10-02
+NOTIFICATIONS = os.path.join(STATE, "notifications.jsonl")
+
+
+def _lead_findings(f, status, today=None):
+    """lead-missing / lead-invalid / lead-overdue over `lead.py status --json` rows.
+    A project led in its own harness (kind `external` with a `lead`: Stocks, led by the PM since
+    2026-10-03) HAS a lead, declared in lead.py's EXTERNAL table, so it files nothing here; that
+    declaration replaced the `lead-missing:stocks` mute. An excluded row with no lead still files
+    lead-missing."""
+    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for r in status or []:
+        name, slug = r.get("dir") or r.get("slug") or "?", r.get("slug") or ""
+        lid = slug.replace("-", "_") + "_lead"
+        st = r.get("state")
+        if r.get("kind") == "external" and r.get("lead"):
+            continue
+        if st in ("missing", "excluded"):
+            _finding(f, "lead-missing", "med", f"{name} has no project lead",
+                     (f"lead.py excludes it: {r.get('why')}. " if st == "excluded" else "")
+                     + f"PROJECT_STANDARDS §5 Day-1 item 11: `.claude/agents/{lid}.md` (the charter) and "
+                     f"`.claude/lead.json` (+ `.claude/lead-memory.md`). Without them nobody owns the "
+                     f"project's weekly upkeep, and its memos run one per day on the old path. "
+                     f"`python3 ~/maintenance/bin/lead.py roster` shows every project's lead.",
+                     name, fix="memo", key="")
+        elif st == "invalid":
+            _finding(f, "lead-invalid", "med", f"{name}'s project lead is declared but invalid",
+                     f"`lead.py check` rejects {lid}, so it is not run, weekly or for memos: "
+                     + "; ".join((r.get("problems") or ["no detail"])[:4])[:400],
+                     name, fix="memo", key="")
+        elif st == "ok" and r.get("overdue") and today >= LEAD_OVERDUE_FROM:
+            lr = r.get("last_run") or {}
+            _finding(f, "lead-overdue", "med",
+                     f"{r.get('lead') or lid} has had no good weekly run in {r.get('days_since_ok') or 0:.0f} days",
+                     f"its day is {r.get('weekday') or '?'} 07:02Z; last weekly: {r.get('last_weekly_state') or 'never'}"
+                     + (f"; last run {lr.get('mode')} {lr.get('state')}" + (f" ({lr.get('why')})" if lr.get('why') else "")
+                        if lr else "")
+                     + f"; next: {r.get('next_run') or '?'}. A lead is skipped when the Claude slot is not free "
+                     "by the 07:47Z deadline, when another lead used that morning's one session, or when its "
+                     "run fails. Read ~/maintenance/logs/lead.log and state/lead/runs.jsonl.",
+                     name, fix="human", key="")
+
+
+# SINGLE-THREADED OWNER (2026-10-03, David: "any automated job should be eventually tied to a lead
+# agent if that makes sense ... we should look for single threaded owner as a guiding principle";
+# HOME.md box rule 10). Every automated thing on the box has exactly ONE owning lead: a project's
+# things are its lead's (Stocks': the PM, `pm`, in Stocks' own harness) and box-wide plumbing is
+# maintenance_lead's. Rule owner-missing walks each thing to its lead — a crew claim -> that
+# agent's project -> the project's lead; no claim -> the project the line itself names; no
+# project -> box-wide -> maintenance_lead — and files one finding per project whose things reach
+# no lead, plus one for queue jobs no agent claims and that name no project.
+STO_BOX = ("", "box", "mission control", "maintenance")
+
+
+def _sto_slug(project):
+    p = str(project or "").strip().lower()
+    return "maintenance" if p in STO_BOX else p
+
+
+def _sto_leads(status_rows):
+    """{project slug: lead id} for every project that has a lead: a valid lead.py lead (state ok),
+    or a lead declared in its own harness (kind external: stocks -> pm)."""
+    out = {}
+    for r in status_rows or []:
+        if r.get("lead") and (r.get("state") == "ok" or r.get("kind") == "external"):
+            out[str(r.get("slug") or "").lower()] = r["lead"]
+    return out
+
+
+def _owner_findings(f, things, status_rows, agents):
+    """owner-missing over [{what, name, agent, project}] (`agent` a crew id or None; `project` a
+    project name or slug, "" for box-wide, None for unknown). `agents` is {crew id: agent}; an
+    agent's explicit `owner_lead` wins over its project's lead, but only when it names a real lead.
+    -> {slug: [thing]} of what reached no lead (the selftest reads it)."""
+    leads = _sto_leads(status_rows)
+    on_disk = {str(r.get("slug") or "").lower(): r for r in status_rows or []}
+    real = set(leads.values())
+    miss = {}
+    for t in things:
+        a = agents.get(t.get("agent")) if t.get("agent") else None
+        if a is None and t.get("project") is None:
+            miss.setdefault("?", []).append(t)
+            continue
+        slug = _sto_slug(a.get("project") if a else t.get("project"))
+        lead = (a or {}).get("owner_lead") if (a or {}).get("owner_lead") in real else leads.get(slug)
+        if not lead:
+            miss.setdefault(slug, []).append(t)
+
+    def listing(ts):
+        names = [f"{t['what']} {t['name']}" for t in ts[:8]]
+        return "; ".join(names) + (f" (+{len(ts) - 8} more)" if len(ts) > 8 else "")
+    for slug, ts in sorted(miss.items()):
+        if slug == "?":
+            _finding(f, "owner-missing", "low", f"{len(ts)} queue job(s) reach no lead: no crew agent claims them",
+                     "Single-threaded owner (HOME.md box rule 10): every automated thing walks to exactly one "
+                     "lead through the agent that claims it. These names in state/claudeq/events.jsonl (30 days) "
+                     "match no `queue` entry in config/crew.json and name no project: " + listing(ts)
+                     + ". Claim each on the agent whose work it is (a `queue` entry, exact or a prefix ending "
+                     "in ':' or ' '), or add it to `exclude_queue` if it is a probe.",
+                     project="maintenance", fix="human", key="unclaimed")
+            continue
+        r = on_disk.get(slug)
+        name = (r or {}).get("dir") or slug
+        if r is None and slug != "maintenance":
+            _finding(f, "owner-missing", "med", f"{len(ts)} automated thing(s) belong to '{slug}', which is no project on disk",
+                     "Single-threaded owner (HOME.md box rule 10): a thing's project must be a top-level project "
+                     "folder whose lead owns it. config/crew.json (or the catalog, or a cron line) names a project "
+                     f"lead.py does not see: {listing(ts)}. Fix the project name, or retire the thing.",
+                     project="maintenance", fix="human", key=slug)
+            continue
+        st = (r or {}).get("state") or "missing"
+        _finding(f, "owner-missing", "med", f"{len(ts)} automated thing(s) in {name} have no owning lead",
+                 f"Single-threaded owner (HOME.md box rule 10): every cron job, queue job, service, agent and "
+                 f"dataset has exactly one owning lead, David's one gateway into the project. {name}'s lead is "
+                 f"{st} (lead-missing / lead-invalid says why), so nobody owns: {listing(ts)}. Declare the lead "
+                 f"(PROJECT_STANDARDS §5 Day-1 item 11: the charter + .claude/lead.json), or, for a lead that runs "
+                 f"in the project's own harness, add it to EXTERNAL in bin/lead.py (David's call).",
+                 project=name, fix="memo" if slug != "maintenance" else "human", key=slug)
+    return miss
+
+
+def _sto_queue_jobs(path=None, days=30):
+    """[(job name, kind)] that started in the box Claude queue in the last `days` days."""
+    cut, seen = time.time() - days * 86400, {}
+    try:
+        with open(path or os.path.join(STATE, "claudeq", "events.jsonl"), errors="replace") as fh:
+            for line in fh:
+                if '"start"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if e.get("ev") == "start" and (e.get("at") or 0) >= cut and e.get("job"):
+                    seen[e["job"]] = e.get("kind")
+    except OSError:
+        pass
+    return sorted(seen.items())
+
+
+AUTO_FIX_SELFTESTS = (("decisions.py", "bin/decisions.py"), ("tt_decide.py", "dashboard/tt_decide.py"),
+                      ("memo-process.py", "bin/memo-process.py"))
+DEADMAN_STALE_S = 4500       # healthcheck.sh DM_UNARMED: two missed re-arms (75 min)
+
+
+def _auto_fix_selftests(run=None):
+    """-> [(name, why)] for each auto-fix policy selftest that does not pass (exit 0, an ALL PASS line,
+    no FAIL line). `run(path) -> (rc, output)` is the selftest's hook; by default each runs for real:
+    fixtures only, scratch stores, nothing pushed (each one's argv takes exactly `selftest`)."""
+    def real(path):
+        r = subprocess.run([sys.executable, os.path.join(MC, path), "selftest"], capture_output=True,
+                           text=True, timeout=120)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    bad = []
+    for name, path in AUTO_FIX_SELFTESTS:
+        try:
+            rc, out = (run or real)(path)
+        except Exception as e:
+            rc, out = -1, f"{type(e).__name__}: {e}"
+        fails = [ln for ln in out.splitlines() if ln.startswith("FAIL")]
+        if rc != 0 or fails or not re.search(r"^ALL PASS$", out, re.M):
+            bad.append((name, f"exit {rc}" + (": " + " | ".join(fails)[-200:] if fails else
+                                               "" if rc else ": " + out.strip()[-200:])))
+    return bad
+
+
+def _deadman_why(path=None, now=None):
+    """'' when the dead-box alarm is armed (healthcheck.sh re-armed it in the last 75 min, or it was
+    cancelled for a planned shutdown in that time), else why not, in plain words."""
+    now = int(now or time.time())
+    try:
+        with open(path or os.path.join(STATE, "deadman.json")) as fh:
+            d = json.load(fh)
+        at, cancelled = int(d.get("at") or 0), int(d.get("cancelled") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "state/deadman.json is missing or unreadable, so no alarm is waiting on ntfy.sh"
+    if at and now - at < DEADMAN_STALE_S:
+        return ""
+    if cancelled and now - cancelled < DEADMAN_STALE_S:
+        return ""
+    if cancelled and not at:
+        return (f"it was cancelled {(now - cancelled) // 60} min ago (healthcheck.sh deadman-cancel) and the "
+                "watchdog has not re-armed it since")
+    if not at:
+        return "it has never been armed"
+    return f"its last re-arm was {(now - at) // 60} min ago; the watchdog re-arms it every hour"
+
+
+def _rollup_held(path=None):
+    """-> (row, flags). `row` is the newest "Daily rollup" row in the notifications ledger when it
+    says pushed=false, else None; `flags` says, for each of the last 14 rollups, whether it went out."""
+    rows = []
+    try:
+        with open(path or NOTIFICATIONS, errors="replace") as fh:
+            for line in fh:
+                if '"Daily rollup"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("title") == "Daily rollup" and r.get("channel") == "maintenance":
+                    rows.append(r)
+    except OSError:
+        return None, []
+    flags = [r.get("pushed") is not False for r in rows[-14:]]
+    return (rows[-1] if rows and rows[-1].get("pushed") is False else None), flags
+
+
+def _queue_starved(f, rows, hours=48):
+    """Rule queue-starved (2026-10-03): a job in the box Claude queue that has been STARTABLE for
+    more than `hours` and never started. `rows` is claudeq.starving() (the selftest passes
+    fixtures), which measures from the job's not_before when that is later than its filing, so a
+    job deferred to next Saturday is scheduled, not starving. One finding per job, keyed by the job
+    key, so it resolves the morning the job runs or is dropped. Filed and never pushed on its own
+    (QUIET_KINDS); never a memo — the queue is Mission Control's, and the filer is named."""
+    for r in rows or ():
+        key = str(r.get("key") or "?")
+        _finding(f, "queue-starved", "med", f"a Claude queue job has waited over {hours} h: {key}",
+                 f"{key} (tier {r.get('tier')}, ~{r.get('est_min')}m, filed by {r.get('by') or '?'}) has been "
+                 f"startable for {r.get('waiting_h')} h (filed {r.get('filed_h')} h ago) and the queue has not "
+                 f"started it. Its last refusal: {r.get('skip') or 'none recorded'}. `python3 "
+                 "~/maintenance/bin/claudeq.py status` shows what holds it; if a rule can never admit it, fix "
+                 f"the rule or the job's estimate, and if nobody wants it any more, `claudeq.py drop {key}`.",
+                 project="maintenance", fix="human", key=key)
+
+
+def _jsonl_rows(path):
+    """Every parsable JSON object in a .jsonl file ([] when it is missing); a bad line is skipped."""
+    out = []
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(r, dict):
+                    out.append(r)
+    except OSError:
+        pass
+    return out
+
+
+def _ver(v):
+    """'2.1.280' -> (2, 1, 280); anything unparsable -> None."""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", str(v or ""))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _cli_stale(rows, now_ts=None, days=14, patches=5):
+    """Rule cli-stale's core, pure (memo wa-cli-currency ask 3). `rows` are state/claude_sessions.jsonl
+    records ({time, headless, cli_version}). Compares the newest headless cli_version seen in the last
+    `days` with the newest interactive one in the same window. -> None when headless keeps up, else
+    {headless, interactive, behind, lag_d, why}: `behind` is the patch gap (same major.minor; a newer
+    minor/major counts as behind by `patches`), `lag_d` the days between the two versions' first
+    sighting anywhere in the log. Fires on behind >= patches or lag_d > days."""
+    now_ts = time.time() if now_ts is None else now_ts
+    first, head, inter = {}, None, None
+    for r in rows or ():
+        v, t = _ver(r.get("cli_version")), r.get("time")
+        if not v or not isinstance(t, (int, float)):
+            continue
+        first[v] = min(first.get(v, t), t)
+        if t < now_ts - days * 86400:
+            continue
+        if r.get("headless") is True:
+            head = max(head or v, v)
+        elif r.get("headless") is False:
+            inter = max(inter or v, v)
+    if not head or not inter or head >= inter:
+        return None
+    behind = inter[2] - head[2] if inter[:2] == head[:2] else patches
+    lag_d = round((first[inter] - first[head]) / 86400, 1)
+    why = [w for w, hit in ((f"{behind} patch versions behind", behind >= patches),
+                            (f"first seen {lag_d}d before the interactive version", lag_d > days)) if hit]
+    if not why:
+        return None
+    return {"headless": ".".join(map(str, head)), "interactive": ".".join(map(str, inter)),
+            "behind": behind, "lag_d": lag_d, "why": " and ".join(why)}
+
+
+def _cli_stale_finding(f, rows, now_ts=None):
+    r = _cli_stale(rows, now_ts)
+    if r:
+        _finding(f, "cli-stale", "low",
+                 f"headless Claude runs an older CLI than David's sessions ({r['headless']} vs {r['interactive']})",
+                 f"In the last 14 days the newest headless session ran Claude Code {r['headless']} and the newest "
+                 f"interactive one {r['interactive']}: the headless pin is {r['why']}. Headless jobs miss the fixes "
+                 "David's sessions already have. `python3 ~/maintenance/bin/cli-update.py status` shows the pin and "
+                 "the canary; the canary override (moving the headless pin without a passing canary) is parked "
+                 "with David.", project="maintenance", key="cli-stale")
+    return r
+
+
+def _backup_tamper(rows, sources, broot, now_ts=None, hash_max=200_000_000, hasher=None):
+    """Rule backup-tamper's core (memo wa-backups-integrity ask 3). `rows` are state/backup_sums.jsonl
+    records {ts, source, archive (relative to broot), bytes, sha256}, the last row per archive wins;
+    `sources` is config/backups.json's sources (keep_days). -> [(archive, why)] for:
+      * a recorded archive whose size is not its recorded bytes (a stat: cheap, every archive);
+      * a recorded archive under `hash_max` bytes whose sha256 is not the recorded one (the big ones,
+        hbs at ~700 MB each, are left to `backup.py verify`, which hashes everything);
+      * a recorded archive gone while younger than its source's keep_days less one day of slack
+        (pruning keeps the newest keep_days archives, so a nightly one leaves at ~keep_days old).
+    Stray files (in ~/backups with no record) are not judged in this slice. A source no longer in
+    the config is skipped (it was retired, not tampered with)."""
+    now_ts = time.time() if now_ts is None else now_ts
+    if hasher is None:
+        import backup as _bk
+        hasher = _bk.sha256_file
+    last = {}
+    for r in rows or ():
+        if isinstance(r, dict) and r.get("archive") and r.get("source"):
+            last[r["archive"]] = r
+    out = []
+    for rel, r in sorted(last.items()):
+        spec = (sources or {}).get(r["source"])
+        if not isinstance(spec, dict) or spec.get("delegated_to"):
+            continue
+        path = os.path.join(broot, rel)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            try:
+                age_d = (now_ts - datetime.strptime(r.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ")
+                         .replace(tzinfo=timezone.utc).timestamp()) / 86400
+            except ValueError:
+                continue
+            keep = int(spec.get("keep_days", 30))
+            if age_d < keep - 1:
+                out.append((rel, f"disappeared {age_d:.1f}d after it was written; {r['source']} keeps "
+                                 f"{keep} days, so nothing should have pruned it yet"))
+            continue
+        if isinstance(r.get("bytes"), int) and size != r["bytes"]:
+            out.append((rel, f"is {size} bytes; {r['bytes']} were recorded when it was written"))
+        elif r.get("sha256") and size < hash_max and hasher(path) != r["sha256"]:
+            out.append((rel, f"same size, but its sha256 is not the recorded {str(r['sha256'])[:12]}"))
+    return out
+
+
+def _backup_tamper_finding(f, problems):
+    for rel, why in problems:
+        _finding(f, "backup-tamper", "high", f"a backup archive changed after it was written: {rel}",
+                 f"~/backups/{rel} {why}. An archive is written once and never edited, so this is tampering, "
+                 "disk trouble or a hand edit. Do not prune or restore over it: run `python3 "
+                 "~/maintenance/bin/backup.py verify` (it re-hashes every recorded archive against the sidecar "
+                 "and state/backup_sums.jsonl, which lives outside ~/backups) and compare with the .manifest.json.",
+                 project="maintenance", key=rel)
+
+
+# Finding kinds that are filed (Needs attention, findings.json) but never by themselves make the
+# pass push: a slow signal David reads on the page, not on his phone.
+# ---------------------------------------------------------------- argv-unsafe (rule 34)
+# Memo wa-lessons-propagation ask 1 (2026-10-04): ea7af80's lesson ("an argument a script does not know
+# is exit 2, never the live job") carried to every project. STATIC ONLY: each script is parsed with ast
+# and never imported or run. Heuristics lean to missing some rather than flagging a fixed script: a
+# dispatch with an exit-2 branch, argparse parse_args, or an argv-checking helper counts as guarded.
+ARGV_DIRS = ("bin", "scripts")
+ARGV_OPT_OUT = "# argv: data"
+ARGV_CAP = 15
+ARGV_ASKED = os.path.join(STATE, "argv_asked.json")   # project -> the argv-unsafe memo filed and the list it named
+_ARGV_SKIP = {"__pycache__", "node_modules", ".venv", "venv", "site-packages", ".git"}
+_ARGV_HELPER = re.compile(r"(parse|check|valid|error|guard).*argv|argv.*(error|check|valid|guard)", re.I)
+_ARGV_HARMLESS = {"print", "exit", "quit", "_exit", "SystemExit", "usage", "_usage", "print_usage", "print_help",
+                  "write", "strip", "splitlines", "split", "join", "format", "lower", "upper", "dumps", "get"}
+_ARGV_READONLY = {"list", "status", "show", "report", "help", "usage", "packet", "summary", "check", "ls", "info",
+                  "view", "stats", "print", "doctor", "audit", "scan", "selftest", "test", "dry", "--dry", "--dry-run"}
+
+
+def _is_sys_argv(n):
+    import ast
+    return isinstance(n, ast.Attribute) and n.attr == "argv" and isinstance(n.value, ast.Name) and n.value.id == "sys"
+
+
+def _argv_scan_source(src):
+    """-> [(line, why)] for one script's source. Empty when it has no `__main__` block, never reads
+    sys.argv, opts out with `# argv: data`, or does not parse."""
+    import ast
+    if ARGV_OPT_OUT in src:
+        return []
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return []
+
+    def is_main(t):
+        return (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and t.left.id == "__name__"
+                and any(isinstance(c, ast.Constant) and c.value == "__main__" for c in t.comparators))
+    main = [n for n in tree.body if isinstance(n, ast.If) and is_main(n.test)]
+    if not main:
+        return []
+    funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    scope, seen, argvish, sliced = list(main), set(), set(), set()
+
+    def from_argv(e):
+        return _is_sys_argv(e) or (isinstance(e, ast.Subscript) and _is_sys_argv(e.value)
+                                   and isinstance(e.slice, ast.Slice))
+    # one level into the module functions the main block calls (claudeq's `_cli(sys.argv)` shape)
+    for node in [x for m in main for x in ast.walk(m)]:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in funcs \
+                and node.func.id not in seen:
+            fn = funcs[node.func.id]
+            seen.add(fn.name)
+            scope.append(fn)
+            params = [a.arg for a in fn.args.args]
+            for i, a in enumerate(node.args):
+                if from_argv(a) and i < len(params):
+                    argvish.add(params[i])
+                    if not _is_sys_argv(a):
+                        sliced.add(params[i])
+    nodes = [x for s in scope for x in ast.walk(s)]
+    for n in nodes:                                   # `args = sys.argv[1:]`
+        if isinstance(n, ast.Assign) and from_argv(n.value):
+            argvish.update(t.id for t in n.targets if isinstance(t, ast.Name))
+            if not _is_sys_argv(n.value):
+                sliced.update(t.id for t in n.targets if isinstance(t, ast.Name))
+
+    def is_argv(e):
+        return from_argv(e) or (isinstance(e, ast.Name) and e.id in argvish) or \
+            (isinstance(e, ast.Subscript) and isinstance(e.slice, ast.Slice) and is_argv(e.value))
+    if not any(is_argv(n) for n in nodes) and not any(
+            isinstance(n, ast.Attribute) and n.attr == "parse_known_args" for n in nodes):
+        return []
+
+    def call_name(c):
+        f = c.func
+        return f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
+
+    def nonzero_int(args):
+        return bool(args) and isinstance(args[0], ast.Constant) and isinstance(args[0].value, int) \
+            and not isinstance(args[0].value, bool) and args[0].value != 0
+    guarded = False
+    for n in nodes:
+        if isinstance(n, ast.Call):
+            nm = call_name(n)
+            if nm in ("exit", "_exit", "SystemExit") and nonzero_int(n.args):
+                guarded = True
+            elif nm == "parse_args" or (nm and _ARGV_HELPER.search(nm)):
+                guarded = True
+        elif isinstance(n, ast.Return) and isinstance(n.value, ast.Constant) and n.value.value == 2:
+            guarded = True                            # gpu.py / lead.py: the dispatch returns 2 to sys.exit
+    hits = []
+    for n in nodes:
+        if isinstance(n, ast.Attribute) and n.attr == "parse_known_args":
+            hits.append((n.lineno, "argparse parse_known_args: unknown arguments are ignored"))
+    if guarded:
+        return sorted(set(hits))
+    def data_idx(e):                                  # argv[N] past the command word
+        return isinstance(e, ast.Subscript) and is_argv(e.value) and isinstance(e.slice, ast.Constant) \
+            and isinstance(e.slice.value, int) and e.slice.value >= (1 if (isinstance(e.value, ast.Name)
+                                                                       and e.value.id in sliced) else 2)
+    # statements directly in the main block or a dispatch function's body: a script-wide optional
+    # positional every command shares (hbs learnings_review: `wk = sys.argv[2] if len(sys.argv) > 2 else None`)
+    top = [st for s_ in scope for st in s_.body]
+    cmdvars, defaults = set(), {}
+    for n in nodes:
+        if isinstance(n, ast.Compare) and isinstance(n.left, ast.Constant) and isinstance(n.left.value, str) \
+                and "dry" in n.left.value.lower() and n.left.value.startswith("-") \
+                and any(isinstance(o, (ast.In, ast.NotIn)) for o in n.ops) and any(is_argv(c) for c in n.comparators):
+            hits.append((n.lineno, f"dry flag {n.left.value!r} read by membership: a misspelt dry flag "
+                                   "(--dry-run, -n) is ignored and the live job runs"))
+        elif isinstance(n, ast.Assign) and isinstance(n.value, ast.IfExp) and isinstance(n.value.orelse, ast.Constant) \
+                and isinstance(n.value.orelse.value, str) and isinstance(n.value.body, ast.Subscript) \
+                and is_argv(n.value.body.value):
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    cmdvars.add(t.id)
+                    defaults[t.id] = n.value.orelse.value
+    for st in (top if cmdvars else ()):              # only beside a command word: the `run --dry` shape
+        if isinstance(st, ast.Assign) and isinstance(st.value, ast.IfExp) and data_idx(st.value.body) \
+                and not any(isinstance(c, ast.Call) and not (isinstance(c.func, ast.Name) and c.func.id == "len")
+                            for c in ast.walk(st.value.test)):
+            hits.append((st.lineno, "an optional second argument is taken as data unchecked "
+                                    "(`run --dry` reads '--dry' as that argument and runs live)"))
+
+    def live_calls(stmts):
+        out, stack = [], list(stmts)
+        while stack:
+            x = stack.pop()
+            if isinstance(x, ast.Call):
+                nm = call_name(x)
+                if nm == "print":
+                    continue                          # whatever a print formats is not an action
+                if nm and nm not in _ARGV_HARMLESS:
+                    out.append(nm)
+            stack.extend(ast.iter_child_nodes(x))
+        return out
+    # a command default (`sys.argv[1] if len(sys.argv) > 1 else "run"`) whose if/elif chain ends in a
+    # bare `else:` that calls something: an unknown command runs that live path
+    chained = set()
+    for n in nodes:
+        if not isinstance(n, ast.If) or id(n) in chained:
+            continue
+        t = n.test
+        if not (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and t.left.id in cmdvars):
+            continue
+        if defaults.get(t.left.id, "").lower() in _ARGV_READONLY:
+            continue                                  # an unknown word falls to a read-only default
+        cur = n
+        while len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
+            cur = cur.orelse[0]
+            chained.add(id(cur))
+        if cur is n or not cur.orelse:
+            continue
+        calls = live_calls(cur.orelse)
+        if calls and not any(isinstance(x, ast.Raise) for x in cur.orelse):
+            hits.append((cur.orelse[0].lineno, f"an unknown command falls to a live `else:` ({calls[0]}())"))
+    return sorted(set(hits))
+
+
+def argv_scan(home=None, projects=None):
+    """-> {project: [(relpath, line, why)]} over bin/ and scripts/ of every project in the roster."""
+    home = home or HOME
+    out = {}
+    for proj in (projects if projects is not None else _project_dirs(home)):
+        rows = []
+        for d in ARGV_DIRS:
+            root = os.path.join(home, proj, d)
+            for dp, dns, fns in os.walk(root):
+                dns[:] = sorted(x for x in dns if x not in _ARGV_SKIP and not x.startswith("."))
+                for fn in sorted(fns):
+                    if not fn.endswith(".py"):
+                        continue
+                    p = os.path.join(dp, fn)
+                    try:
+                        src = open(p, encoding="utf-8", errors="replace").read()
+                    except OSError:
+                        continue
+                    rows += [(os.path.relpath(p, os.path.join(home, proj)), ln, why)
+                             for ln, why in _argv_scan_source(src)]
+        if rows:
+            out[proj] = rows
+    return out
+
+
+def _argv_findings(f, scan):
+    for proj, rows in sorted(scan.items()):
+        files = sorted({r[0] for r in rows})
+        lines = [f"{r}:{ln} — {why}" for r, ln, why in rows[:ARGV_CAP]]
+        more = f"\n…and {len(rows) - ARGV_CAP} more" if len(rows) > ARGV_CAP else ""
+        _finding(f, "argv-unsafe", "low",
+                 f"{len(files)} script(s) in {proj} can run a live path on an unknown argument",
+                 "Read statically, never run: each of these dispatches on sys.argv with no exit-2 branch, so a "
+                 "misspelt flag or command runs the live job (Mission Control's 10-03 lesson, commit ea7af80). "
+                 "Fix: unknown arguments exit 2 with one usage line, --dry and --dry-run as one flag, argv cases "
+                 "in the selftest; or mark a script `# argv: data` and ask maintenance to mute it with a reason.\n"
+                 + "\n".join(lines) + more,
+                 project=proj, key="scripts")
+
+
+def _ledger_row_for(name, target):
+    try:
+        with open(os.path.join(MEMOS, "LEDGER.md")) as fh:
+            return any(f"| {name} |" in ln and f"| {target} |" in ln for ln in fh)
+    except OSError:
+        return False
+
+
+def argv_memos(scan, dry=False, now_ts=None):
+    """ONE argv-unsafe memo per non-Stocks project (ARGV_ASKED), filed again only when its list grows
+    (a script:reason not named before). Stocks: the finding only, never a memo, until David reopens it.
+    -> [(project, outcome)], outcome filed:<path> | would-file | held-stocks | asked-before."""
+    now_ts = time.time() if now_ts is None else now_ts
+    asked = load(ARGV_ASKED, {})
+    out, changed = [], False
+    for proj, rows in sorted(scan.items()):
+        target = proj.lower()
+        if target == "stocks":
+            out.append((proj, "held-stocks"))
+            continue
+        cur = sorted({f"{r}: {why}" for r, _, why in rows})
+        prev = asked.get(target)
+        if prev is not None:
+            grew = sorted(set(cur) - set(prev.get("hits") or []))
+            if not grew:
+                out.append((proj, "asked-before"))
+                continue
+        elif _ledger_row_for("argv-unsafe", target):
+            out.append((proj, "asked-before"))
+            continue
+        if dry:
+            out.append((proj, "would-file"))
+            continue
+        lead = "the PM" if target == "stocks" else f"{target.replace('-', '_')}_lead"
+        listing = "\n".join(f"- `{r}:{ln}` — {why}" for r, ln, why in rows[:ARGV_CAP])
+        body = (f"# {proj}: scripts that run a live path on an unknown argument\n\n_From: Mission Control back-office "
+                f"pass · {datetime.fromtimestamp(now_ts, timezone.utc):%Y-%m-%d} · target: {target} ({lead}) · "
+                "rule argv-unsafe_\n\n**Evidence** (static read with ast; nothing was run)\n" + listing +
+                (f"\n- …and {len(rows) - ARGV_CAP} more" if len(rows) > ARGV_CAP else "") +
+                "\n\n**Why.** On 2026-10-03 a checker ran `memo-process.py --selftest`; nothing parsed the argument, the "
+                "live pass ran, and it started a real session in David's evening. Mission Control fixed its own bin/ "
+                "in commit ea7af80 (see `git -C ~/maintenance show ea7af80`).\n\n**Ask.** Apply the same pattern to the "
+                "scripts above: a `parse_argv()` that accepts only the known commands and flags, `--dry` and "
+                "`--dry-run` as one flag, anything else exit 2 with one usage line and nothing run; add argv cases to "
+                "the script's selftest. A script whose second argument really is free data can carry `# argv: data` "
+                "and ask `maintenance` for a mute with its reason (box rule 7).\n\nFiled once; filed again only if the "
+                "list grows. The finding stays on Needs attention until the scan comes back clean.\n")
+        path = _write_memo(target, "argv-unsafe", body, "auto-filed by the daily back-office audit (argv-unsafe)")
+        if path:
+            asked[target] = {"at": datetime.fromtimestamp(now_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                             "path": path, "hits": cur}
+            changed = True
+        out.append((proj, f"filed:{path}" if path else "asked-before"))
+    if changed and not dry:
+        save(ARGV_ASKED, asked)
+    return out
+
+
+# ---------------------------------------------------------------- posture (rule 35)
+# Memo wa-security-detection ask 2 (2026-10-04): the box's outside posture against a written baseline.
+# (a) a GitHub repo turned public, or a new public one; (b) a new SSH key on the GitHub account; (c) a
+# listener off loopback whose port the dashboard's KNOWN_PORTS does not declare. gh is polled at most
+# hourly (state/posture.json); a gh failure is a note there, never a finding.
+EXPECTED_GITHUB = os.path.join(CONFIG, "expected_github.json")
+POSTURE = os.path.join(STATE, "posture.json")
+POSTURE_GH_EVERY_S = 3600
+POSTURE_EPHEMERAL = 30000          # a listener at or above this with no pid of ours is someone else's ephemeral
+PORT_IGNORE = {53, 631, 5355, 11000, 19999, 3493, 4317, 8125, 22, 41641, 5353}   # rule 5's quiet list
+
+
+def _rule5_reports(port, d):
+    """True when rule 5 (port-undeclared) already files this port, so rule 35 does not file it twice."""
+    return (port not in PORT_IGNORE and 1024 <= port < 32768 and port not in d.get("known_ports", [])
+            and port not in d.get("infra_ports", []))
+
+
+def _gh_run(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return r.returncode, r.stdout, (r.stderr or "").strip()[-200:]
+    except Exception as e:
+        return 1, "", f"{type(e).__name__}: {e}"[:200]
+
+
+def _gh_snapshot(owner="userdev", run=None, now_ts=None, cache=None):
+    """-> {"at", "repos": [{name, visibility}] | None, "keys": [id] | None, "notes": [..]}; reuses the
+    cached snapshot younger than POSTURE_GH_EVERY_S (a failed poll included: at most one try an hour)."""
+    run, now_ts, cache = run or _gh_run, time.time() if now_ts is None else now_ts, cache or POSTURE
+    old = load(cache, {})
+    if isinstance(old, dict) and old.get("at") and now_ts - float(old["at"]) < POSTURE_GH_EVERY_S:
+        return old
+    snap = {"at": now_ts, "repos": None, "keys": None, "notes": []}
+    rc, out, err = run(["gh", "repo", "list", owner, "--limit", "100", "--json", "name,visibility"])
+    try:
+        if rc != 0:
+            raise ValueError(f"rc {rc}: {err}")
+        snap["repos"] = [{"name": r["name"], "visibility": str(r["visibility"]).upper()} for r in json.loads(out)]
+    except Exception as e:
+        snap["notes"].append(f"gh repo list failed: {str(e)[:160]}")
+    rc, out, err = run(["gh", "api", "user/keys"])
+    try:
+        if rc != 0:
+            raise ValueError(f"rc {rc}: {err}")
+        snap["keys"] = sorted(int(k["id"]) for k in json.loads(out))
+    except Exception as e:
+        snap["notes"].append(f"gh api user/keys failed: {str(e)[:160]}")
+    try:
+        save(cache, snap)
+    except OSError:
+        pass
+    return snap
+
+
+def _ss_listeners(text):
+    """`ss -ltnp` -> [(addr, port, pid|None)] for the TCP listeners off loopback."""
+    out = []
+    for line in (text or "").splitlines()[1:]:
+        m = re.search(r"^\S+\s+\d+\s+\d+\s+(\S+):(\d+)\s", line)
+        if not m:
+            continue
+        addr = m.group(1).strip("[]").split("%")[0]
+        if addr.startswith("127.") or addr == "::1" or "%lo" in m.group(1):
+            continue
+        pm = re.search(r"pid=(\d+)", line)
+        out.append((addr, int(m.group(2)), int(pm.group(1)) if pm else None))
+    return out
+
+
+def _posture(snap, expected, listeners, known_ports, skip=()):
+    """-> [(sev, title, detail, key)]. Pure: the fixtures feed it fake gh and ss outputs."""
+    probs = []
+    pub, priv = set(expected.get("public") or []), set(expected.get("private") or [])
+    for r in snap.get("repos") or []:
+        if r["visibility"] != "PUBLIC" or r["name"] in pub:
+            continue
+        turned = r["name"] in priv
+        probs.append(("high", f"GitHub repo {r['name']} is {'now public' if turned else 'a new public repo'}",
+                      (f"{r['name']} was private in config/expected_github.json and the account now shows it PUBLIC. "
+                       if turned else f"{r['name']} is public and is not in config/expected_github.json. ")
+                      + "Every project repo is private; only the authored <repo>-public counterparts may be public. "
+                      "If this was not David, make it private now (`gh repo edit userdev/<repo> --visibility "
+                      "private --accept-visibility-change-consequences`) and check the audit log; if it was "
+                      "intended, add it to the file's public list.", f"repo:{r['name']}"))
+    want = {int(k) for k in expected.get("keys") or []}
+    for k in snap.get("keys") or []:
+        if int(k) not in want:
+            probs.append(("high", f"a new SSH key ({k}) is on the GitHub account",
+                          f"`gh api user/keys` lists key id {k}, which config/expected_github.json does not expect. "
+                          "An unknown key can push to every repo. If David did not add it, delete it "
+                          f"(`gh api -X DELETE user/keys/{k}`) and rotate; if he did, add the id to the file.",
+                          f"key:{k}"))
+    seen = set()
+    for addr, port, pid in listeners:
+        if port in known_ports or port in skip or port in seen or (port >= POSTURE_EPHEMERAL and pid is None):
+            continue
+        seen.add(port)
+        wide = addr in ("0.0.0.0", "*", "::")
+        probs.append(("high" if wide else "med", f"port {port} listens off loopback and is not in KNOWN_PORTS",
+                      f"`ss -ltn` shows {addr}:{port}" + (f" (pid {pid})" if pid else "") +
+                      (", on every interface (the home LAN included). " if wide else ". ") +
+                      "Box rule 5: a listening port is declared in the dashboard's KNOWN_PORTS, healthcheck.sh and "
+                      "~/INFRASTRUCTURE.md, tailnet or localhost only. Stop it, or declare it.", f"port:{port}"))
+    return probs
+
+
+def _posture_findings(f, probs):
+    for sev, title, detail, key in probs:
+        _finding(f, "posture", sev, title, detail, project="maintenance", key=key)
+
+
+QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe"}
+
+
+def _push_worthy(new):
+    """The new findings that may make run() push (everything but QUIET_KINDS)."""
+    return [x for x in new if x.get("kind") not in QUIET_KINDS]
+
+
+def _guard_gaps(settings, script, tools, bindir=None):
+    """What keeps a PreToolUse guard from being armed: [] when it is listed for every tool it
+    covers (the matcher read as Claude Code reads it: a regex, "" or "*" for all), executable,
+    and its own fixture selftest passes. audit() files each guard's title as a literal
+    _finding, so the dashboard's guardrail page can read it from source."""
+    try:
+        gaps = []
+        for tool in tools:
+            hit = False
+            for grp in ((settings or {}).get("hooks", {}).get("PreToolUse") or []):
+                mt = grp.get("matcher") or ""
+                try:
+                    m = mt in ("", "*") or re.fullmatch(mt, tool)
+                except re.error:
+                    m = mt == tool
+                if m and any(script in (h.get("command") or "") for h in grp.get("hooks", [])):
+                    hit = True
+            if not hit:
+                gaps.append(tool)
+        out = ["not listed under hooks.PreToolUse for " + ", ".join(gaps)] if gaps else []
+        p = os.path.join(bindir or os.path.join(MC, "bin"), script)
+        if not os.access(p, os.X_OK):
+            return out + ["not executable"]
+        r = subprocess.run([p, "selftest"], capture_output=True, text=True, timeout=60)
+        o = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0 or "ALL PASS" not in o:
+            out.append(f"`{script} selftest` exits {r.returncode}: "
+                       + " | ".join(l for l in o.splitlines() if l.startswith("FAIL"))[-240:])
+        return out
+    except Exception as e:
+        return [f"the armed-check itself raised {type(e).__name__}: {e}"]
+
+
 def audit(c=None):
     c = c or load(CENSUS, None) or census()
     f = []
@@ -1205,16 +2027,9 @@ def audit(c=None):
                      f"{job['log']}", job["project"], key=f"{name}:{job['sched']}")
 
     # 5. a listening port nobody declared (PROJECT_STANDARDS §4 wants it in three places)
-    ignore_ports = {53, 631, 5355, 11000, 19999, 3493, 4317, 8125, 22, 41641, 5353}
     for port in c["ports"]:
-        if port in ignore_ports or port < 1024 or port >= 32768:
-            continue
-        where = []
-        if port not in d["known_ports"]:
-            where.append("dashboard KNOWN_PORTS")
-        if port not in d["infra_ports"]:
-            where.append("INFRASTRUCTURE.md")
-        if len(where) == 2:
+        if _rule5_reports(port, d):
+            where = ["dashboard KNOWN_PORTS", "INFRASTRUCTURE.md"]
             # who is listening (2026-09-26): an owner makes it the owner's finding — a memo when it
             # listens on every interface — instead of a line on Mission Control's list that no one
             # reads (8797 and 8911 were two forgotten test dashboards, open 5 days, project "")
@@ -1611,6 +2426,17 @@ def audit(c=None):
         _finding(f, "guardrail-inert", "high", "a Claude spawn point goes around the box slot",
                  "`claudeq.py audit` (C26) found a launch that does not take the box slot — a "
                  "reservation every other project has to schedule around. Its output: " + _out)
+    # ...and the slot's own rules (2026-10-03): the clock, the fit rule, the cron reader and its
+    # weekday guards. Its selftest sat at 91/98 for days (the pinned config read Stocks' live
+    # pm_days) and nothing ran it, so a broken fit rule would have looked the same as a fine one.
+    _ok, _out = _selfcheck(["claudeq.py", "selftest"], "passed")
+    if not _ok:
+        _finding(f, "guardrail-inert", "high",
+                 "claudeq selftest fails — the box slot's clock or fit rule no longer does what was agreed",
+                 "run `python3 ~/maintenance/bin/claudeq.py selftest`; each FAIL line names the case (the "
+                 "evening block, the trade-session band, a reservation read from the crontab, the 5h budget). "
+                 "Until it passes, the queue can start a Claude session where it must not, or never start "
+                 "one. Its output: " + _out)
     _ok, _out = _selfcheck(["models.py", "check"])
     if not _ok:
         _finding(f, "guardrail-inert", "high", "models.py check fails — a local-model role cannot be served",
@@ -1768,6 +2594,17 @@ def audit(c=None):
                      "run `python3 ~/maintenance/bin/hook-guard-schedule.py selftest`: each FAIL is a "
                      "command it would call an install (or miss). A hook that blocks prose gets "
                      "switched off; one that misses an install is not a guard.")
+        elif os.path.exists(_chk) and subprocess.run([sys.executable, _chk, "selftest"],
+                                                     capture_output=True, text=True,
+                                                     timeout=60).returncode != 0:
+            # ...and the checker must know what kind of job a line is (2026-10-02, memo from
+            # data-desk: every `bin/desk.py <sub>` model line read as a code job, so the :35 lane
+            # and GPU checks never ran on the desk — a check that runs on the wrong kind is inert)
+            _finding(f, "guardrail-inert", "high",
+                     "schedule-check.py misreads which jobs run a local model — its selftest fails",
+                     "run `python3 ~/maintenance/bin/schedule-check.py selftest`: each FAIL is a cron "
+                     "line it would file under the wrong kind, so that kind's window, :35-lane or GPU "
+                     "checks never run on it.")
         elif os.path.exists(_chk):
             # ...and the checker it calls must still run. A hook that shells out to a broken
             # script is the guardrail-inert pattern one level down.
@@ -2119,6 +2956,215 @@ def audit(c=None):
                      "rename it and its <script> tag together.",
                      project=_proj, fix="memo" if _proj != "maintenance" else "human", key=_proj)
 
+    # 25. PROJECT LEADS (2026-10-02): lead-missing, lead-invalid, lead-overdue from `lead.py status
+    #     --json` (helpers above audit()). If lead.py cannot answer, every lead rule is off, which is
+    #     guardrail-inert.
+    _ls = sh([sys.executable, os.path.join(MC, "bin", "lead.py"), "status", "--json"], timeout=90)
+    try:
+        _st_rows = json.loads(_ls or "null")
+        assert isinstance(_st_rows, list), "no JSON list on stdout"
+        _lead_findings(f, _st_rows)
+    except Exception as e:
+        _finding(f, "guardrail-inert", "high", "the project-lead rules did not run — `lead.py status` failed",
+                 f"`python3 ~/maintenance/bin/lead.py status --json` gave no roster ({type(e).__name__}: {e}). "
+                 "Until it does, nothing checks that each project has a valid lead or that the leads keep "
+                 "their weekly day: " + (_ls or "")[:200], project="maintenance")
+    # 25b. ...and the armed-checks for what makes a lead safe to run unattended: the 07:02Z pick,
+    #      the 07:47Z deadline, the fits() re-check at slot grant and the push safety (lead.py
+    #      selftest), and the two PreToolUse guards that hold every unattended session to its bright
+    #      lines (David 2026-10-02: "only pm agent can place live brokerb, nothing else (unless
+    #      it's in a session i'm directly working with)"). Each guard must be registered for every
+    #      tool it covers, executable, and pass its own fixture selftest.
+    try:       # not _selfcheck: one PASS line quotes "'0 FAIL'", so a FAIL is a line that starts with it
+        _r = subprocess.run([sys.executable, os.path.join(MC, "bin", "lead.py"), "selftest"],
+                            capture_output=True, text=True, timeout=120)
+        _o = (_r.stdout or "") + (_r.stderr or "")
+        _ok = (_r.returncode == 0 and "ALL PASS" in _o
+               and not any(l.startswith("FAIL") for l in _o.splitlines()))
+        _out = " | ".join(l for l in _o.splitlines() if l.startswith("FAIL"))[-300:] or _o.strip()[-300:]
+    except Exception as e:
+        _ok, _out = False, f"{type(e).__name__}: {e}"
+    if not _ok:
+        _finding(f, "guardrail-inert", "high",
+                 "lead.py selftest fails — the weekly pick, the deadline or the push safety no longer hold",
+                 "run `python3 ~/maintenance/bin/lead.py selftest`; each FAIL line names the case (weekday and "
+                 "catch-up pick, blackout days, the 07:47Z deadline, fits() under pm_days Mon-Fri, never pushing "
+                 "a -public remote or a red tree, the launch argv). Its output: " + _out, project="maintenance")
+    _hs = load(os.path.expanduser("~/.claude/settings.json"), {}) or {}
+    _gb = _guard_gaps(_hs, "hook-guard-broker.py", ("Bash", "mcp__brokerb-trading__place_equity_order"))
+    if _gb:
+        _finding(f, "guardrail-inert", "high",
+                 "the broker guard is not armed — a headless session could place a BrokerB order",
+                 "bin/hook-guard-broker.py: " + "; ".join(_gb) + " (~/.claude/settings.json). Only the PM's "
+                 "trade session, or a session David is working in, may place, cancel or preview a live "
+                 "BrokerB order, and this hook is the tool-layer choke point for that.", project="maintenance")
+    _gl = _guard_gaps(_hs, "hook-guard-lead.py", ("Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"))
+    if _gl:
+        _finding(f, "guardrail-inert", "high",
+                 "the project-lead guard is not armed — a lead's bright lines are not enforced",
+                 "bin/hook-guard-lead.py: " + "; ".join(_gl) + " (~/.claude/settings.json). It keeps every "
+                 "unattended project lead inside its own project: no force-push, nothing public, no edits "
+                 "to the guardrail files, no deletions or crontab changes in the pilot.", project="maintenance")
+
+    # 26. rollup-held (2026-10-02): the 23:00 Daily rollup is David's one Mission Control push of the
+    #     day, and the 1/day maintenance cap held it on 11 of the 12 days 09-20..10-01 with nothing
+    #     noticing. notify_policy.json `cap_exempt` fixes the cause; this is the detective rule.
+    _rh, _flags = _rollup_held()
+    if _rh:
+        _finding(f, "rollup-held", "high", "the 23:00 Daily rollup was held, not pushed",
+                 f"{datetime.fromtimestamp(_rh.get('time', 0), timezone.utc):%Y-%m-%d %H:%MZ}: "
+                 f"{_rh.get('reason') or 'no reason recorded'}. {_flags.count(False)} of the last "
+                 f"{len(_flags)} rollups were held. It is the only push that carries everything the policy "
+                 "held that day. Check `cap_exempt` in config/notify_policy.json, run "
+                 "`python3 ~/maintenance/bin/notify_policy.py selftest`, and look for an in-dev label in "
+                 "config/dev.json that matches it.", project="maintenance", fix="human", key="")
+
+    # 27. queue-starved (2026-10-03): a job in the box Claude queue startable for more than 48 h and
+    #     never started. `claudeq.py status` showed a Stocks update job "waiting 8078m" and nothing else on the
+    #     box would have said so. claudeq.starving() measures from eligibility; the helper above files.
+    try:
+        import claudeq as _cq
+        _queue_starved(f, _cq.starving(), int(_cq.STARVE_H))
+    except Exception as e:
+        _finding(f, "queue-starved", "med", "the queue-starved rule could not read the Claude queue",
+                 f"claudeq.starving() raised {type(e).__name__}: {str(e)[:160]}. Until it reads, a job that "
+                 "can never start sits in state/claudeq/pending/ unseen. Run `python3 "
+                 "~/maintenance/bin/claudeq.py starving`.", project="maintenance", fix="human", key="")
+
+    # 28. owner-missing (2026-10-03, single-threaded owner; helpers above audit()): every cron job,
+    #     queue job (30 days), enabled user service, crew agent and catalog dataset walks to exactly
+    #     one lead. Reads rule 25's `lead.py status` rows; if those or the crew namer cannot be read
+    #     the rule is off, which is guardrail-inert.
+    try:
+        _dash = os.path.join(MC, "dashboard")
+        if _dash not in sys.path:
+            sys.path.insert(0, _dash)
+        import tt_crew as _tc
+        _ccfg = _tc.load()
+        _things = []
+        for _j in c["crons"]:
+            _cl = _tc.claims(_j.get("cmd"))
+            _things.append({"what": "cron job", "name": (" ".join(_j.get("scripts") or []) or _j.get("cmd", "")[:60]),
+                            "agent": _cl[0] if len(_cl) == 1 else None, "project": _j.get("project") or ""})
+        for _qn, _qk in _sto_queue_jobs():
+            if _tc.skip(qjob=_qn):
+                continue
+            _aid = _tc.agent_for(qjob=_qn)
+            _m = re.match(r"(?:lead|memo) ([A-Za-z0-9_.-]+)[: ]", _qn)
+            _things.append({"what": "queue job", "name": f"{_qn!r} ({_qk})", "agent": _aid,
+                            "project": (_m.group(1) if _m else None) if not _aid else None})
+        _hm = os.path.expanduser("~")
+        for _n, _u in sorted(_units.items()):
+            if _u.get("UnitFileState") != "enabled":
+                continue
+            _rel = os.path.relpath(os.path.realpath(_u.get("FragmentPath") or "/"), _hm)
+            _things.append({"what": "service", "name": _n, "agent": None,
+                            "project": _rel.split(os.sep)[0] if _repo_linked(_u) else ""})
+        for _a in _ccfg["agents"]:
+            _things.append({"what": "agent", "name": f"{_a.get('name')} ({_a['id']})", "agent": _a["id"]})
+        for _did in sorted((load(os.path.join(STATE, "catalog.json"), {}) or {}).get("entries") or {}):
+            _things.append({"what": "dataset", "name": _did, "agent": None, "project": _did.split("/", 1)[0]})
+        if not isinstance(_st_rows, list) or not _st_rows:
+            raise RuntimeError("no lead.py status rows (rule 25 failed)")
+        _owner_findings(f, _things, _st_rows, _ccfg["by_id"])
+    except Exception as e:
+        _finding(f, "guardrail-inert", "med", "the owner-missing rule did not run — nothing checks that every job has a lead",
+                 f"rule 28 raised {type(e).__name__}: {str(e)[:200]}. It walks every cron job, queue job, "
+                 "service, crew agent and dataset to its lead (single-threaded owner, HOME.md box rule 10) "
+                 "through dashboard/tt_crew.py and `lead.py status --json`. `python3 ~/maintenance/bin/backoffice.py "
+                 "selftest` holds its fixtures.", project="maintenance")
+
+    # 29. the monthly patch's guards (2026-10-03, memo wa-alerts-and-boot): spark-update-run.sh
+    #     reboots the box, so each of its guards must be seen to refuse. Its selftest is fixtures
+    #     only (scratch slot state, no apt, no push, no reboot).
+    _pt = sh(["bash", os.path.join(MC, "bin", "spark-update-run.sh"), "selftest"], timeout=240) or ""
+    if not re.search(r"^ALL PASS$", _pt, re.M):
+        _finding(f, "guardrail-inert", "high",
+                 "the monthly patch's guards fail their selftest — it could reboot under live work",
+                 "run `bash ~/maintenance/bin/spark-update-run.sh selftest`: it watches the sudoers, disk, "
+                 "headless, Claude-slot, active-session and GPU-slot guards each refuse, the argv contract and "
+                 "the pause. Do not run --scheduled or --in-person until it passes. Output: "
+                 + " | ".join(l for l in _pt.splitlines() if l.startswith("FAIL"))[-300:], project="maintenance")
+
+    # 30. the auto-fix policy's own proofs (2026-10-03, David: "auto fix is good"): the daily check acts
+    #     for David on an unanswered item and the memo pass takes a lead's reversible default after 7
+    #     days. Each selftest pins the fence (what may NEVER auto-resolve) and its argv; a fence that
+    #     stopped holding would look exactly like one that holds, so all three run every morning.
+    _af = _auto_fix_selftests()
+    if _af:
+        _finding(f, "guardrail-inert", "high",
+                 f"the auto-fix policy's selftests fail — {', '.join(n for n, _ in _af)} could act for David where it must not",
+                 "The auto-fix policy (dashboard/tt_decide.py's policy section, bin/decisions.py at the 07:50 daily "
+                 "check, bin/memo-process.py for the 7-day memo default) carries out the recommended option on an "
+                 "item David left unanswered. Until these pass, it may act on a kind it must never touch (public, "
+                 "money, Stocks, deletes, ports, accounts, security), or never act. Run each `python3 <script> "
+                 "selftest`: " + " · ".join(f"{n}: {w}" for n, w in _af)[:400],
+                 project="maintenance", key="auto-fix-selftests")
+
+    # 31. the dead-box alarm (2026-10-03): healthcheck.sh keeps ONE scheduled "Spark silent for 2h" message
+    #     on ntfy.sh and pushes it back every hour, so a box that is off or offline still pages. Its
+    #     selftest (stub curl) proves the plan, arm and cancel; state/deadman.json proves the live re-arm.
+    _hs = sh(["bash", os.path.join(MC, "bin", "healthcheck.sh"), "selftest"], timeout=60) or ""
+    if not re.search(r"^ALL PASS$", _hs, re.M):
+        _finding(f, "guardrail-inert", "high", "the dead-box alarm's selftest fails — a dead box might never page",
+                 "run `bash ~/maintenance/bin/healthcheck.sh selftest` (a stub curl: nothing is sent). It proves "
+                 "the alarm's plan (re-arm at 55 min, recovered once its time passed), the arm and the cancel. "
+                 "Output: " + " | ".join(l for l in _hs.splitlines() if l.startswith("FAIL"))[-300:],
+                 project="maintenance")
+    _dw = _deadman_why()
+    if _dw:
+        _finding(f, "guardrail-inert", "high", f"the dead-box alarm is not armed — {_dw}",
+                 "If the box went down now, nothing would page David: the scheduled \"Spark silent for 2h\" message "
+                 "on ntfy.sh is what pages for a box that cannot. healthcheck.sh (every 15 min) re-arms it when the "
+                 "last arm is 55+ min old and fails its own run (dead-box-alarm-unarmed) at 75. Check "
+                 "~/maintenance/logs/healthcheck.log and `bash ~/maintenance/bin/healthcheck.sh --dry`.",
+                 project="maintenance", key="deadman-unarmed")
+
+    # 32. cli-stale (2026-10-04, memo wa-cli-currency ask 3): the headless CLI pin lagging David's
+    #     interactive sessions. Low and quiet (QUIET_KINDS); the core is _cli_stale(), pure.
+    try:
+        _cli_stale_finding(f, _jsonl_rows(os.path.join(STATE, "claude_sessions.jsonl")))
+    except Exception as e:
+        _finding(f, "cli-stale", "low", "the cli-stale rule could not read the session ledger",
+                 f"{type(e).__name__}: {str(e)[:160]}. state/claude_sessions.jsonl is what it reads.",
+                 project="maintenance", key="cli-stale-unread")
+
+    # 33. backup-tamper (2026-10-04, memo wa-backups-integrity ask 3): a recorded archive whose size (or,
+    #     under 200 MB, sha256) is not what backup.py recorded, or that vanished inside its keep window.
+    #     Full re-hashing of every archive is `backup.py verify`'s job, not a daily cost here.
+    try:
+        import backup as _bk
+        _backup_tamper_finding(f, _backup_tamper(_jsonl_rows(_bk.SUMS), _bk.cfg().get("sources") or {},
+                                                 _bk.root(), hasher=_bk.sha256_file))
+    except Exception as e:
+        _finding(f, "backup-tamper", "med", "the backup-tamper rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It reads state/backup_sums.jsonl and config/backups.json "
+                 "through bin/backup.py; `python3 ~/maintenance/bin/backup.py verify` checks the same by hand.",
+                 project="maintenance", key="backup-tamper-unread")
+
+    # 34. argv-unsafe (2026-10-04, memo wa-lessons-propagation ask 1): a script in any project's bin/ or
+    #     scripts/ that runs a live path on an unknown argument. Static (ast), low and quiet; the memos
+    #     (one per non-Stocks project, ask-once) are argv_memos(), called from run() only when not dry.
+    try:
+        _argv_findings(f, argv_scan())
+    except Exception as e:
+        _finding(f, "argv-unsafe", "low", "the argv-unsafe rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It parses bin/ and scripts/ of every project with ast.",
+                 project="maintenance", key="argv-unsafe-unread")
+
+    # 35. posture (2026-10-04, memo wa-security-detection ask 2): a repo turned public, a new GitHub key,
+    #     a listener off loopback that KNOWN_PORTS does not declare (one rule 5 already files is skipped).
+    try:
+        _exp = load(EXPECTED_GITHUB, None)
+        _snap = _gh_snapshot() if isinstance(_exp, dict) else {"repos": None, "keys": None}
+        _posture_findings(f, _posture(_snap, _exp if isinstance(_exp, dict) else {},
+                                      _ss_listeners(sh(["ss", "-ltnp"])), d["known_ports"],
+                                      skip={p for p in c["ports"] if _rule5_reports(p, d)}))
+    except Exception as e:
+        _finding(f, "posture", "med", "the posture rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It reads gh (repo list, user/keys), `ss -ltnp` and "
+                 "config/expected_github.json.", project="maintenance", key="posture-unread")
+
     uniq = {}
     for x in f:
         uniq.setdefault(x["id"], x)
@@ -2145,6 +3191,58 @@ def expire_mutes(today=None):
                                              "reason": (cfg.get("_reasons") or {}).pop(k, None)}
     save(MUTE, cfg, indent=1)
     return gone
+
+
+# A key's life across episodes (memo 2026-10-03_wa-repeat-failures, ask 1). first_seen and
+# resolved_at still describe the CURRENT episode; these three fields describe every episode and are
+# never erased when a closed finding reopens: first_ever_seen (set once), reopen_count (+1 each time
+# a closed record comes back) and history (its closed episodes, oldest dropped past HISTORY_CAP).
+HISTORY_CAP = 20
+CLOSED_STATES = ("resolved", "fixed", "muted")
+
+
+def _close(f, how, at=None):
+    """Close the current episode: state = how (resolved | fixed | muted), one history entry."""
+    at = at or now()
+    f["state"] = how
+    f.setdefault("first_ever_seen", f.get("first_seen") or at)
+    f.setdefault("reopen_count", 0)
+    if how == "resolved":
+        f["resolved_at"] = at
+    elif how == "muted":
+        f["muted_at"] = at
+    h = f.setdefault("history", [])
+    h.append({"opened": f.get("first_seen"), "closed": at, "how": how})
+    del h[:-HISTORY_CAP]
+    return f
+
+
+def _carry_life(f, old):
+    """f opens a new episode of the closed record `old`: carry its lifetime over, count a reopen."""
+    if not old:
+        f.setdefault("first_ever_seen", f.get("first_seen") or now())
+        f.setdefault("reopen_count", 0)
+        f.setdefault("history", [])
+        return f
+    f["first_ever_seen"] = min(x for x in (old.get("first_ever_seen"), old.get("first_seen"),
+                                           f.get("first_seen")) if x)
+    f["reopen_count"] = int(old.get("reopen_count") or 0) + 1
+    f["history"] = list(old.get("history") or [])[-HISTORY_CAP:]
+    return f
+
+
+def _prior_closed(store, f):
+    """The closed record a fresh finding re-opens: its own id first, else the newest closed record
+    under the same key (a title whose number moved between episodes)."""
+    old = store.get(f["id"])
+    if old and old.get("state") in CLOSED_STATES and not old.get("reopened_as"):
+        return old
+    k = f.get("key")
+    if not k:
+        return None
+    cands = [x for x in store.values() if x.get("key") == k and x.get("state") in CLOSED_STATES
+             and not x.get("reopened_as")]
+    return max(cands, key=lambda x: x.get("last_seen") or x.get("first_seen") or 0) if cands else None
 
 
 def merge_findings(fresh):
@@ -2184,17 +3282,141 @@ def merge_findings(fresh):
             old.update(title=f["title"], detail=f["detail"], sev=f["sev"], last_seen=now(),
                        key=f.get("key") or old.get("key"))
         else:
+            prior = _prior_closed(store, f)
             f.update(first_seen=now(), last_seen=now(), state="open")
+            _carry_life(f, prior)
+            if prior is not None and prior is not store.get(f["id"]):
+                prior["reopened_as"] = f["id"]       # its life moved to the new id; not counted twice
             store[f["id"]] = f
             new.append(f)
+    # a record that left the open set: "muted" when its id, kind or key is on the mute list (the
+    # problem is still there, we chose to live with it), else "resolved". Both are returned as
+    # `resolved` so the pass line and state/backoffice.jsonl keep counting what left the open set.
     resolved = []
     for fid, f in store.items():
         if f.get("state") == "open" and fid not in seen:
-            f["state"] = "resolved"
-            f["resolved_at"] = now()
+            is_muted = fid in muted or f.get("kind") in muted or (f.get("key") or _key(fid)) in muted
+            _close(f, "muted" if is_muted else "resolved")
             resolved.append(f)
     save(FINDINGS, store)
     return new, resolved, [f for f in store.values() if f.get("state") == "open"]
+
+
+def _answer_episodes(evs):
+    """{key: [episode]} from decisions.jsonl events (oldest first). An answer is an id's first
+    event; it ends at that id's first non-queued event (an `applied` first event ends at once). A
+    later answer for the same key starts a NEW episode only once every earlier one had ended (two
+    answers to one open item are one episode). episode = {first_at, ids, ended_at, how}."""
+    first, ended, how, soft = {}, {}, {}, set()
+    for e in evs:
+        i, k = e.get("id"), e.get("key")
+        if not i or not k or not e.get("at"):
+            continue
+        if i not in first:
+            first[i] = e
+            if (e.get("status") or "queued") == "queued":
+                continue
+        if i not in ended and (e.get("status") or "queued") != "queued":
+            ended[i] = e["at"]
+            if e.get("action") in ("snooze", "ack", "hide") and e is first[i]:
+                soft.add(i)                      # applied at once, but the item stayed open
+            how[i] = ("muted" if e.get("action") == "mute" or first[i].get("action") == "mute"
+                      else "fixed" if e.get("commit") else "resolved")
+    by_key = {}
+    for i, e in sorted(first.items(), key=lambda x: x[1]["at"]):
+        eps = by_key.setdefault(e["key"], [])
+        last = eps[-1] if eps else None
+        if last and (last["ended_at"] is None or last["ended_at"] > e["at"]):
+            last["ids"].append(i)
+            last["ended_at"] = None if (last["ended_at"] is None or i not in ended) \
+                else max(last["ended_at"], ended[i])
+            last["how"] = how.get(i, last["how"])
+        else:
+            eps.append({"first_at": e["at"], "ids": [i], "ended_at": ended.get(i),
+                        "how": how.get(i, "resolved"), "finding_id": e.get("finding_id"),
+                        "soft": i in soft})
+    return by_key
+
+
+def backfill_history(store, evs, at=None):
+    """One-time seed of first_ever_seen / reopen_count / history (memo wa-repeat-failures ask 1)
+    from David's answers and the store itself. Mutates `store`, returns [(id, {field: value})] for
+    what changed. Idempotent: counts only ever rise, history is seeded once (history_backfilled).
+    A prior episode is an answer episode that began before the record's current first_seen; its
+    `opened` is the answer time (an upper bound, marked approx)."""
+    at = at or now()
+    eps = _answer_episodes(evs)
+    # answers attach to ONE record per key: the one carrying the key's life (newest, not superseded)
+    owner = {}
+    for fid, r in store.items():
+        if not isinstance(r, dict) or r.get("reopened_as"):
+            continue
+        k = r.get("key") or _key(fid)
+        cur = owner.get(k)
+        if cur is None or (r.get("last_seen") or 0) > (store[cur].get("last_seen") or 0):
+            owner[k] = fid
+    changes = []
+    for fid, r in store.items():
+        if not isinstance(r, dict):
+            continue
+        k = r.get("key") or _key(fid)
+        mine = [x for kk, lst in eps.items() for x in lst
+                if kk == k or x.get("finding_id") == fid] if owner.get(k) == fid else []
+        fs = r.get("first_seen") or at
+        prior = sorted((x for x in mine if x["first_at"] < fs), key=lambda x: x["first_at"])
+        before = {f: r.get(f) for f in ("first_ever_seen", "reopen_count", "history")}
+        r["first_ever_seen"] = min([v for v in (r.get("first_ever_seen"), fs) if v]
+                                   + [x["first_at"] for x in mine])
+        r["reopen_count"] = max(int(r.get("reopen_count") or 0), len(prior))
+        if not r.get("history_backfilled"):
+            h = []
+            for n, x in enumerate(prior):
+                nxt = prior[n + 1]["first_at"] if n + 1 < len(prior) else fs
+                end = nxt if x.get("soft") else min(x["ended_at"] or nxt, nxt)   # a snooze closes nothing
+                h.append({"opened": x["first_at"], "closed": end,
+                          "how": x["how"], "approx": True, "src": "decisions:" + ",".join(x["ids"])})
+            h += list(r.get("history") or [])
+            st = r.get("state")
+            closed_at = r.get({"resolved": "resolved_at", "fixed": "fixed_at", "muted": "muted_at"}
+                              .get(st, ""), None)
+            if st in CLOSED_STATES and closed_at and not any(y.get("closed") == closed_at for y in h):
+                h.append({"opened": r.get("first_seen"), "closed": closed_at, "how": st})
+            r["history"] = h[-HISTORY_CAP:]
+            r["history_backfilled"] = at
+        diff = {f: r[f] for f in before if before[f] != r[f]}
+        if diff:
+            changes.append((fid, diff))
+    return changes
+
+
+def history_backfill(dry=False):
+    """CLI: `backoffice.py history-backfill [--dry]`. --dry prints and writes nothing."""
+    store = load(FINDINGS, {})
+    try:
+        evs = _decide_mod().events()
+    except Exception as e:
+        print(f"history-backfill: decisions.jsonl unreadable ({type(e).__name__}: {e}) — nothing written",
+              file=sys.stderr)
+        return 1
+    changes = backfill_history(store, evs)
+    fmt = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%MZ") if t else "-"
+    rest = 0
+    for fid, d in sorted(changes, key=lambda x: -(x[1].get("reopen_count") or 0)):
+        r = store[fid]
+        if not r.get("reopen_count") and not any(y.get("approx") for y in r["history"]):
+            rest += 1                            # defaults only: counted, not listed
+            continue
+        print(f"{'would set' if dry else 'set'} {fid[:70]}: reopen_count={r['reopen_count']} "
+              f"first_ever_seen={fmt(r['first_ever_seen'])} history={len(r['history'])}"
+              + (" (from answers)" if any(y.get("approx") for y in r["history"]) else ""))
+    if rest:
+        print(f"{'would seed' if dry else 'seeded'} defaults (reopen_count 0, first_ever_seen = first_seen, "
+              f"the current episode's history) on {rest} more record(s)")
+    print(f"{len(changes)} of {len(store)} record(s) {'would change' if dry else 'changed'}; "
+          f"{sum(1 for r in store.values() if (r.get('reopen_count') or 0) > 0)} with reopens")
+    if not dry and changes:
+        save(FINDINGS, store)                    # atomic (tmp + os.replace), secret-scrubbed
+    return 0
 
 
 # ---------------------------------------------------------------- fix
@@ -2303,7 +3525,7 @@ def fix(open_findings, dry=False):
         save(pcfg_path, pcfg, indent=2)
     for f, _ in done:
         f["fixed_at"] = now()
-        f["state"] = "fixed"
+        _close(f, "fixed", f["fixed_at"])
     if done:
         store = load(FINDINGS, {})
         for f, _ in done:
@@ -2663,6 +3885,22 @@ def brief(c=None):
 
 # ---------------------------------------------------------------- memos
 
+def _write_memo(target, name, body, note):
+    """Drop memo `<date>_<name>.md` in MEMOS/inbox/<target>/ and append its LEDGER row. -> the path,
+    or None when a memo of that name was already filed today (the file is the ask-once for a day)."""
+    day = f"{datetime.now(timezone.utc):%Y-%m-%d}"
+    inbox = os.path.join(MEMOS, "inbox", target)
+    path = os.path.join(inbox, f"{day}_{name}.md")
+    if os.path.exists(path):
+        return None
+    os.makedirs(inbox, exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(body)
+    with open(os.path.join(MEMOS, "LEDGER.md"), "a") as fh:
+        fh.write(f"| {day} | {name} | mission-control | {target} | proposed | {note} |\n")
+    return path
+
+
 def file_memos(new_findings, dry=False):
     """A finding inside another project is a memo, not an edit. High severity only —
     the bus is for things a session must act on, not a nag feed."""
@@ -2670,30 +3908,185 @@ def file_memos(new_findings, dry=False):
     for f in new_findings:
         if f.get("fix") != "memo" or f["sev"] != "high" or not f["project"]:
             continue
-        target = f["project"].lower().replace("stocks", "stocks")
-        inbox = os.path.join(HOME, "memos/inbox", target)
-        slug = f"{datetime.now(timezone.utc):%Y-%m-%d}_backoffice-{f['kind']}.md"
-        path = os.path.join(inbox, slug)
-        if os.path.exists(path) or dry:
+        target = f["project"].lower()
+        if dry:
             continue
-        os.makedirs(inbox, exist_ok=True)
-        with open(path, "w") as fh:
-            fh.write(f"# {f['title']}\n\n_From: Mission Control back-office pass · "
-                     f"{datetime.now(timezone.utc):%Y-%m-%d} · target: {target}_\n\n"
-                     f"{f['detail']}\n\nRaised by the daily audit "
-                     f"(`~/maintenance/bin/backoffice.py`), rule `{f['kind']}`. "
-                     "Fix it in the project, or mute the rule in "
-                     "`~/maintenance/config/backoffice_mute.json` if it's an accepted deviation.\n")
-        ledger = os.path.join(HOME, "memos/LEDGER.md")
-        with open(ledger, "a") as fh:
-            fh.write(f"| {datetime.now(timezone.utc):%Y-%m-%d} | backoffice-{f['kind']} | "
-                     f"mission-control | {target} | proposed | auto-filed by the daily "
-                     f"back-office audit |\n")
-        filed.append(f)
+        body = (f"# {f['title']}\n\n_From: Mission Control back-office pass · "
+                f"{datetime.now(timezone.utc):%Y-%m-%d} · target: {target}_\n\n"
+                f"{f['detail']}\n\nRaised by the daily audit "
+                f"(`~/maintenance/bin/backoffice.py`), rule `{f['kind']}`. "
+                "Fix it in the project, or mute the rule in "
+                "`~/maintenance/config/backoffice_mute.json` if it's an accepted deviation.\n")
+        if _write_memo(target, f"backoffice-{f['kind']}", body, "auto-filed by the daily back-office audit"):
+            filed.append(f)
     return filed
 
 
+# ---------------------------------------------------------------- repeat-failure
+
+REPEAT_EPISODES, REPEAT_WINDOW_D = 3, 30
+
+
+def _episodes_in_window(f, now_ts, days=REPEAT_WINDOW_D):
+    """Episodes of an open finding inside the window: the open one plus each closed history entry
+    (resolved or fixed; a mute is a choice, not a recurrence) that closed inside it."""
+    lo = now_ts - days * 86400
+    return 1 + sum(1 for h in (f.get("history") or ())
+                   if h.get("how") in ("resolved", "fixed") and (h.get("closed") or 0) >= lo)
+
+
+def _is_erp_host(f):
+    """The clientco ERP host (an outside owner's machine): David 09-08, "just stop pinging". A key or
+    title naming the ERP / VENDORERP / ERP-A as a word."""
+    txt = f"{f.get('key') or ''} {f.get('title') or ''}".lower()
+    return bool(re.search(r"(?<![a-z0-9])(erp|vendorerp|erp-a)(?![a-z0-9])", txt))
+
+
+def _blocker_for(key, blockers):
+    for b in blockers or ():
+        try:
+            if b.get("pattern") and re.search(b["pattern"], key or ""):
+                return b
+        except re.error:
+            continue
+    return None
+
+
+def _ledger_has(name):
+    """True when MEMOS/LEDGER.md already carries a row for memo `name` (ask-once survives a lost state file)."""
+    try:
+        with open(os.path.join(MEMOS, "LEDGER.md")) as fh:
+            return any(f"| {name} |" in ln for ln in fh)
+    except OSError:
+        return False
+
+
+def _repeat_slug(key):
+    return re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]+", "-", str(key).lower())).strip("-")[:60] or "item"
+
+
+def repeat_failures(open_findings, dry=False, now_ts=None):
+    """Rule repeat-failure (memo wa-repeat-failures asks 2-3): an open finding on its 3rd episode inside
+    30 days (reopen_count >= 2) changes form. ONE memo per key, ever (REPEAT_ASKED), to the owner's inbox
+    asking for a root-cause slice: fix the cause, or declare it expected and get it muted with a reason
+    (rule 7). Never a push. Held instead of filed:
+      * a key matching config/known_blockers.json: the detail says "blocked by <row>: answer that";
+      * a Stocks-owned key: "held: Stocks is frozen" until David reopens it;
+    and the clientco ERP host's memo asks clientco_db_lead to draft the note and park it as needs-david
+    (a message to a human is David's to send). Annotates each repeating record (`repeat`, and the
+    "×N since" line in its detail). -> [(key, outcome)], outcome one of filed:<path> | held-stocks |
+    blocked:<row> | asked-before."""
+    now_ts = time.time() if now_ts is None else now_ts
+    blockers = load(BLOCKERS, [])
+    blockers = blockers if isinstance(blockers, list) else []
+    asked = load(REPEAT_ASKED, {})
+    out, changed = [], False
+    for f in open_findings:
+        if int(f.get("reopen_count") or 0) < REPEAT_EPISODES - 1:
+            continue
+        n = _episodes_in_window(f, now_ts)
+        if n < REPEAT_EPISODES:
+            continue
+        key = f.get("key") or _key(f.get("id"))
+        since = datetime.fromtimestamp(f.get("first_ever_seen") or f.get("first_seen") or now_ts,
+                                       timezone.utc).strftime("%Y-%m-%d")
+        owner = (f.get("project") or "maintenance").lower()
+        b = _blocker_for(key, blockers)
+        if b:
+            outcome, note = f"blocked:{b.get('row')}", (f"blocked by {b.get('row')}: answer that "
+                                                         f"({b.get('reason', '')}). No repeat memo is filed.")
+        elif owner == "stocks":
+            outcome, note = "held-stocks", "held: Stocks is frozen until David reopens it; no repeat memo is filed."
+        elif key in asked or _ledger_has(f"repeat-{_repeat_slug(key)}"):
+            a = asked.get(key) or {}
+            outcome, note = "asked-before", (f"repeat memo filed {a.get('at', '?')[:10]}: {a.get('path', '?')}" if a
+                                             else f"repeat memo already on the LEDGER (repeat-{_repeat_slug(key)})")
+        else:
+            erp = owner.startswith("clientco") and _is_erp_host(f)
+            ask = ("**Do not contact the ERP host's owner.** clientco_db_lead: draft the note to the outside owner "
+                   "and park it as a `needs-david` LEDGER row. A message to a human is David's to send, and the "
+                   "host is never pinged (David 09-08: \"just stop pinging and try again next month\")."
+                   if erp else
+                   "Take a root-cause slice: fix the cause so it stops coming back, or, if this is expected "
+                   "behaviour, say so in a memo to `maintenance` asking for a mute with its reason "
+                   "(`config/backoffice_mute.json`, box rule 7).")
+            body = (f"# Repeat failure: {f.get('title')}\n\n_From: Mission Control back-office pass · "
+                    f"{datetime.fromtimestamp(now_ts, timezone.utc):%Y-%m-%d} · target: {owner} · rule repeat-failure_\n\n"
+                    f"`{key}` has opened {n} times in {REPEAT_WINDOW_D} days (×{int(f.get('reopen_count') or 0) + 1} "
+                    f"since {since}). Each time it was closed it came back in the same form.\n\n"
+                    f"**Latest detail.** {f.get('detail', '')}\n\n**Ask.** {ask}\n\n"
+                    "This memo is filed once per key; the finding stays on Needs attention with its count.\n")
+            path = None if dry else _write_memo(owner, f"repeat-{_repeat_slug(key)}", body,
+                                                "auto-filed by the daily back-office audit (repeat-failure)"
+                                                + ("; draft only, never a ping" if erp else ""))
+            if path:
+                asked[key] = {"at": datetime.fromtimestamp(now_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                              "path": path}
+                changed = True
+            outcome = f"filed:{path}" if path else ("would-file" if dry else "asked-before")
+            note = f"repeat memo filed to {owner}" + (" (ERP host: draft, never a ping)" if erp else "")
+        line = f"×{n} in {REPEAT_WINDOW_D} days, first seen {since}: {note}"
+        f["repeat"] = {"episodes": n, "since": since, "outcome": outcome}
+        base = (f.get("detail") or "").split("\n\nRepeat: ")[0]
+        f["detail"] = f"{base}\n\nRepeat: {line}"
+        out.append((key, outcome))
+    if not dry:
+        if changed:
+            save(REPEAT_ASKED, asked)
+        if out:
+            store = load(FINDINGS, {})
+            for f in open_findings:
+                if f.get("repeat") and f.get("id") in store:
+                    store[f["id"]].update(repeat=f["repeat"], detail=f["detail"])
+            save(FINDINGS, store)
+    return out
+
+
 # ---------------------------------------------------------------- run
+
+def _sustainability_due(reports_dir=None, today=None, max_age_d=28):
+    """-> True when no reports/YYYY-MM-sustainability.md exists or the newest is older than max_age_d
+    days (memo wa-sustainability-report, 2026-10-04: monthly, ridden by this daily pass so the pilot
+    needs no crontab change)."""
+    d = reports_dir or os.path.join(MC, "reports")
+    try:
+        ms = [os.path.getmtime(os.path.join(d, n)) for n in os.listdir(d)
+              if re.match(r"^\d{4}-\d{2}-sustainability\.md$", n)]
+    except OSError:
+        ms = []
+    t = today if today is not None else time.time()
+    return not ms or (t - max(ms)) > max_age_d * 86400
+
+
+def _sustainability_report():
+    """Write the month's sustainability report (bin/sustainability.py: zero tokens, read-only, deletes
+    nothing) when due, and commit the report by path. -> a line for the pass, or ""."""
+    if not _sustainability_due():
+        return ""
+    r = subprocess.run([sys.executable, os.path.join(MC, "bin", "sustainability.py"), "report"],
+                       capture_output=True, text=True, timeout=1200)
+    if r.returncode != 0:
+        return f"sustainability report failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-160:]}"
+    rep = f"reports/{datetime.now(timezone.utc):%Y-%m}-sustainability.md"
+    sha = _commit([rep], f"sustainability report {datetime.now(timezone.utc):%Y-%m} (backoffice daily pass, monthly)")
+    return f"sustainability report written ({rep}{', ' + sha if sha else ', not committed'})"
+
+
+def _ledger_verify_apply(run=None):
+    """Flip the LEDGER rows whose verify-when clause now passes (`bin/ledger_verify.py apply`, memo
+    wa-lessons-propagation ask 2; zero tokens, its own selftest pins it). -> its summary line. A
+    failure is a line, never an exception: the pass goes on."""
+    run = run or subprocess.run
+    try:
+        r = run([sys.executable, os.path.join(MC, "bin", "ledger_verify.py"), "apply"],
+                capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        return f"ledger verify failed: {type(e).__name__}: {str(e)[:160]}"
+    out = (r.stdout or "").strip().splitlines()
+    if r.returncode != 0:
+        return f"ledger verify failed (rc {r.returncode}): {((r.stderr or '') + ' ' + (out[-1] if out else '')).strip()[-160:]}"
+    return f"ledger verify: {out[-1] if out else 'no output'}"
+
 
 def run(dry=False):
     c = census()
@@ -2703,6 +4096,11 @@ def run(dry=False):
     new, resolved, open_f = merge_findings(fresh)
     fixed = fix(open_f, dry=dry)
     filed = file_memos(new, dry=dry)
+    try:
+        repeats = repeat_failures(open_f, dry=dry)
+    except Exception as e:                       # the repeat rule must never break the pass
+        repeats = []
+        print(f"  repeat-failure rule failed: {type(e).__name__}: {e}")
     status = brief(c)
     still_open = [f for f in load(FINDINGS, {}).values() if f.get("state") == "open"]
     line = (f"census {len(c['projects'])} projects / {len(c['crons'])} crons · "
@@ -2713,9 +4111,27 @@ def run(dry=False):
         print(f"  fixed: {what}")
     for e, what in decided:
         print(f"  decided: {what or 'could not apply'} (decision:{e['id']})")
+    for k, outcome in repeats:
+        print(f"  repeat: {k} -> {outcome}")
     if not dry:
         for p in _clean_stale_pyc():
             print(f"  removed a stale byte-code cache: {os.path.relpath(p, MC)}")
+        try:
+            _sr = _sustainability_report()
+        except Exception as e:                   # a report must never break the pass
+            _sr = f"sustainability report failed: {e}"
+        if _sr:
+            print(f"  {_sr}")
+        try:
+            print(f"  {_ledger_verify_apply()}")
+        except Exception as e:                   # the ledger flip must never break the pass
+            print(f"  ledger verify failed: {e}")
+        try:                                     # rule 34's memos: one per non-Stocks project, ask-once
+            for proj, outcome in argv_memos(argv_scan()):
+                if outcome.startswith("filed:"):
+                    print(f"  argv-unsafe: memo to {proj.lower()} -> {outcome[6:]}")
+        except Exception as e:                   # the memo filing must never break the pass
+            print(f"  argv-unsafe memos failed: {type(e).__name__}: {e}")
     for f in new:
         print(f"  new [{f['sev']}] {f['title']}")
     with open(HISTORY, "a") as fh:
@@ -2723,8 +4139,9 @@ def run(dry=False):
                              "resolved": len(resolved), "open": len(still_open),
                              "briefed": len(status), "decided": len(decided)}) + "\n")
     # state-change doctrine: push only when something actually changed
-    if not dry and (new or fixed or filed):
-        head = [f"{f['title']}" for f in sorted(new, key=lambda x: SEV[x["sev"]])[:3]]
+    loud = _push_worthy(new)                     # QUIET_KINDS are filed, never pushed on their own
+    if not dry and (loud or fixed or filed):
+        head = [f"{f['title']}" for f in sorted(loud, key=lambda x: SEV[x["sev"]])[:3]]
         msg = line + ("\n• " + "\n• ".join(head) if head else "")
         if filed:
             msg += f"\n{len(filed)} memo(s) filed to the bus"
@@ -2753,7 +4170,7 @@ def selftest():
     stored-copy scrub, the diagram rules and the render that must not claim a false repair.
     Nothing here touches the live state, config or git."""
     import tempfile
-    global FINDINGS, MUTE, CONFIG, MC, _commit
+    global FINDINGS, MUTE, CONFIG, MC, _commit, MEMOS, BLOCKERS, REPEAT_ASKED, ARGV_ASKED
     ok = True
 
     def check(name, cond, info=""):
@@ -2802,6 +4219,162 @@ def selftest():
                 ("~/.claude/remote-control/keepalive", "maintenance"), ("echo hi", "")):
             got = _project_of(cmd, names=pn)
             check(f"cron attribution: {cmd[:48]}… → {want or 'nobody'}", got == want, got)
+
+        # project leads (2026-10-02): the three lead rules over `lead.py status --json` rows. Stocks is
+        # led by the PM in its own harness (kind external, 2026-10-03) and files nothing; an excluded
+        # row with no lead still files lead-missing, and a mute by key quiets it; lead-overdue waits
+        # out the first-week grace
+        st_rows = [{"slug": "stocks", "dir": "Stocks", "lead": "pm", "lead_name": "Stocks PM", "kind": "external",
+                    "harness": "Stocks loop.py/ops.py", "state": "excluded", "why": "led by the PM"},
+                   {"slug": "oldproj", "dir": "oldproj", "lead": None, "state": "excluded", "why": "David: not now"},
+                   {"slug": "newproj", "dir": "newproj", "lead": "newproj_lead", "state": "missing",
+                    "problems": ["no charter and no lead.json yet"]},
+                   {"slug": "poker", "dir": "poker", "lead": "poker_lead", "state": "invalid",
+                    "problems": ["lead.json: weekday 'Tues' is not one of Mon, Tue, …"]},
+                   {"slug": "hbs", "dir": "hbs", "lead": "hbs_lead", "state": "ok", "overdue": True,
+                    "days_since_ok": 12.4, "weekday": "Wed", "last_weekly_state": "skipped",
+                    "last_run": {"mode": "weekly", "state": "skipped", "why": "a Claude lead session already ran"},
+                    "next_run": "2026-10-14T07:02+00:00"},
+                   {"slug": "thesis", "dir": "thesis", "lead": "thesis_lead", "state": "ok", "overdue": False}]
+        lf = []
+        _lead_findings(lf, st_rows, today="2026-10-13")
+        kinds = sorted((x["kind"], x["project"], x["key"]) for x in lf)
+        check("leads: missing (an excluded project with no lead too), invalid and overdue, one each, keyed by "
+              "project; Stocks, led by the PM in its own harness, files nothing", kinds == [
+            ("lead-invalid", "poker", "lead-invalid:poker"), ("lead-missing", "newproj", "lead-missing:newproj"),
+            ("lead-missing", "oldproj", "lead-missing:oldproj"), ("lead-overdue", "hbs", "lead-overdue:hbs")], kinds)
+        check("leads: the invalid finding carries lead.py's problem",
+              any("weekday 'Tues'" in x["detail"] for x in lf if x["kind"] == "lead-invalid"))
+        lf2 = []
+        _lead_findings(lf2, st_rows, today="2026-10-11")
+        check("leads: no lead-overdue inside the first-week grace (before 2026-10-12)",
+              not any(x["kind"] == "lead-overdue" for x in lf2), [x["kind"] for x in lf2])
+        _fsave = FINDINGS
+        FINDINGS = f"{t}/findings-leads.json"
+        save(MUTE, {"muted": ["lead-missing:oldproj"]})
+        new, _, _ = merge_findings(lf)
+        check("leads: a mute by key keeps one lead-missing off the list; the rest stay",
+              sorted(x["project"] for x in new) == ["hbs", "newproj", "poker"], [x["id"] for x in new])
+        FINDINGS = _fsave
+        save(MUTE, {"muted": []})
+
+        # owner-missing (2026-10-03, single-threaded owner): every thing walks to one lead
+        ag = {"pm": {"id": "pm", "project": "Stocks"}, "janitor": {"id": "janitor", "project": "Mission Control"},
+              "collector": {"id": "collector", "project": "newproj"}, "ghost": {"id": "ghost", "project": "Atlantis"},
+              "scout": {"id": "scout", "project": "newproj", "owner_lead": "pm"},
+              "liar": {"id": "liar", "project": "newproj", "owner_lead": "nobody_lead"}}
+        th = [{"what": "cron job", "name": "loop.py trade", "agent": "pm", "project": "Stocks"},
+              {"what": "cron job", "name": "backoffice.py", "agent": "janitor", "project": "maintenance"},
+              {"what": "cron job", "name": "healthcheck.sh", "agent": None, "project": ""},
+              {"what": "cron job", "name": "run.py", "agent": None, "project": "newproj"},
+              {"what": "agent", "name": "Collector (collector)", "agent": "collector"},
+              {"what": "agent", "name": "Ghost (ghost)", "agent": "ghost"},
+              {"what": "agent", "name": "Scout (scout)", "agent": "scout"},
+              {"what": "agent", "name": "Liar (liar)", "agent": "liar"},
+              {"what": "queue job", "name": "'pe firms' (pe)", "agent": None, "project": None},
+              {"what": "queue job", "name": "'lead hbs:inbox' (lead)", "agent": None, "project": "hbs"},
+              {"what": "service", "name": "maintenance-dashboard", "agent": None, "project": "maintenance"},
+              {"what": "service", "name": "stocks-thing", "agent": None, "project": "Stocks"},
+              {"what": "dataset", "name": "box/memo_inbox", "agent": None, "project": "box"},
+              {"what": "dataset", "name": "stocks/desk", "agent": None, "project": "stocks"}]
+        sto_rows = st_rows + [{"slug": "maintenance", "dir": "maintenance", "lead": "maintenance_lead", "state": "ok"}]
+        of = []
+        miss = _owner_findings(of, th, sto_rows, ag)
+        check("owner-missing: Stocks' things (cron, service, dataset, the PM itself) walk to pm; box-wide "
+              "things and Mission Control's agents walk to maintenance_lead; an agent's owner_lead naming a "
+              "real lead wins", "stocks" not in miss and "maintenance" not in miss and "box" not in miss
+              and not any(t["name"].startswith("Scout") for ts in miss.values() for t in ts), sorted(miss))
+        check("owner-missing: a project without a lead, a project not on disk, a fake owner_lead and an "
+              "unclaimed queue job each file, one finding per project; a queue job naming a project with a "
+              "lead (lead hbs:inbox) is owned",
+              sorted((x["project"], x["key"]) for x in of) == [
+                  ("maintenance", "owner-missing:maintenance:atlantis"),
+                  ("maintenance", "owner-missing:maintenance:unclaimed"), ("newproj", "owner-missing:newproj:newproj")]
+              and len(miss["newproj"]) == 3, sorted((x["project"], x["key"]) for x in of))
+        of2 = []
+        _owner_findings(of2, th, [r for r in sto_rows if r["slug"] != "maintenance"]
+                        + [{"slug": "maintenance", "dir": "maintenance", "lead": "maintenance_lead", "state": "invalid"}], ag)
+        check("owner-missing: with maintenance_lead invalid, the box-wide plumbing has no owner either",
+              any(x["key"] == "owner-missing:maintenance:maintenance" and "healthcheck.sh" in x["detail"] for x in of2),
+              [x["key"] for x in of2])
+        qp = f"{t}/cq_events.jsonl"
+        with open(qp, "w") as fh:
+            fh.write(json.dumps({"at": int(time.time()) - 3600, "ev": "start", "job": "pe firms", "kind": "pe"}) + "\n"
+                     + json.dumps({"at": int(time.time()) - 40 * 86400, "ev": "start", "job": "old one", "kind": "x"}) + "\n"
+                     + json.dumps({"at": int(time.time()) - 60, "ev": "release", "job": "rel", "kind": "x"}) + "\n")
+        check("owner-missing: queue jobs are the starts of the last 30 days",
+              _sto_queue_jobs(qp) == [("pe firms", "pe")], _sto_queue_jobs(qp))
+
+        # armed: the auto-fix policy's three selftests and the dead-box alarm (2026-10-03)
+        outs = {"bin/decisions.py": (0, "PASS a\nALL PASS\n"), "dashboard/tt_decide.py": (0, "PASS b\nALL PASS"),
+                "bin/memo-process.py": (0, "PASS c\nALL PASS")}
+        _af0 = _auto_fix_selftests(lambda p: outs[p])
+        check("auto-fix armed: all three pass -> nothing", _af0 == [], _af0)
+        outs["dashboard/tt_decide.py"] = (1, "PASS b\nFAIL policy: never auto: money\n1 FAILED")
+        outs["bin/memo-process.py"] = (0, "PASS c")                # no ALL PASS line: it did not finish
+        bad = _auto_fix_selftests(lambda p: outs[p])
+        check("auto-fix armed: a FAIL line or a missing ALL PASS names the script and why",
+              [n for n, _ in bad] == ["tt_decide.py", "memo-process.py"] and "never auto: money" in bad[0][1], bad)
+        dm, now0 = f"{t}/deadman.json", 1791100000
+        save(dm, {"at": now0 - 3600, "due": now0 + 3600, "seq": "spark-deadman"})
+        fresh = _deadman_why(dm, now0)
+        save(dm, {"at": now0 - 4600, "due": now0 + 2600})
+        stale = _deadman_why(dm, now0)
+        save(dm, {"at": 0, "due": 0, "cancelled": now0 - 600})
+        cancel_new = _deadman_why(dm, now0)
+        save(dm, {"at": 0, "due": 0, "cancelled": now0 - 9000})
+        cancel_old = _deadman_why(dm, now0)
+        check("deadman armed: re-armed 60 min ago or cancelled 10 min ago -> armed; 76 min, a cancel left 2.5 h "
+              "and a missing file -> not, in plain words",
+              (fresh, cancel_new, "76 min ago" in stale, "cancelled 150 min ago" in cancel_old,
+               "missing" in _deadman_why(f"{t}/nope.json", now0)) == ("", "", True, True, True),
+              (fresh, stale, cancel_new, cancel_old))
+
+        # rollup-held (2026-10-02): only the NEWEST Daily rollup row counts
+        nl = f"{t}/notifications.jsonl"
+        roll = lambda ts, pushed: {"time": ts, "channel": "maintenance", "title": "Daily rollup", "tier": "actionable",
+                                   "pushed": pushed, "reason": "maintenance at its 1/day cap — held" if not pushed else "sent"}
+        with open(nl, "w") as fh:
+            for r in (roll(1, False), roll(2, True), {"time": 3, "channel": "maintenance", "title": "Memo needs your call",
+                                                       "pushed": True}):
+                fh.write(json.dumps(r) + "\n")
+        check("rollup-held: quiet when the newest rollup went out", _rollup_held(nl) == (None, [False, True]),
+              _rollup_held(nl))
+        with open(nl, "a") as fh:
+            fh.write(json.dumps(roll(4, False)) + "\n")
+        row, fl = _rollup_held(nl)
+        check("rollup-held: fires on a held newest rollup, with the 14-day count",
+              row and row["time"] == 4 and fl == [False, True, False], (row, fl))
+        check("rollup-held: no ledger, nothing to say", _rollup_held(f"{t}/missing.jsonl") == (None, []))
+
+        # the two guard hooks' armed-check (2026-10-02): listed for every tool they cover (matchers
+        # read as regexes), executable, own selftest passes
+        gb = f"{t}/guardbin"
+        os.makedirs(gb)
+        for name, body, mode in (("good.py", "print('PASS a')\nprint('ALL PASS')\n", 0o755),
+                                 ("bad.py", "import sys\nprint('FAIL deny path')\nsys.exit(1)\n", 0o755),
+                                 ("noexec.py", "print('ALL PASS')\n", 0o644)):
+            with open(f"{gb}/{name}", "w") as fh:
+                fh.write("#!/usr/bin/env python3\n" + body)
+            os.chmod(f"{gb}/{name}", mode)
+        cmd = lambda n: {"type": "command", "command": f"{gb}/{n}", "timeout": 10}
+        hs = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [cmd("good.py"), cmd("bad.py")]},
+                                       {"matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [cmd("good.py")]},
+                                       {"matcher": "mcp__brokerb-trading__.*", "hooks": [cmd("bad.py")]}]}}
+        check("guard armed-check: registered for every tool, executable, selftest passes -> armed",
+              _guard_gaps(hs, "good.py", ("Bash", "Edit", "Write", "NotebookEdit"), gb) == [],
+              _guard_gaps(hs, "good.py", ("Bash", "Edit", "Write", "NotebookEdit"), gb))
+        g = _guard_gaps(hs, "good.py", ("Bash", "mcp__brokerb-trading__place_equity_order"), gb)
+        check("guard armed-check: a tool the matchers do not route to the hook is named",
+              g == ["not listed under hooks.PreToolUse for mcp__brokerb-trading__place_equity_order"], g)
+        g = _guard_gaps(hs, "bad.py", ("Bash", "mcp__brokerb-trading__cancel_equity_order"), gb)
+        check("guard armed-check: a failing selftest is named with its FAIL line",
+              len(g) == 1 and "exits 1" in g[0] and "FAIL deny path" in g[0], g)
+        g = _guard_gaps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [cmd("noexec.py")]}]}},
+                        "noexec.py", ("Bash",), gb)
+        check("guard armed-check: not executable", g == ["not executable"], g)
+        check("guard armed-check: no hooks at all", _guard_gaps({}, "good.py", ("Bash",), gb)
+              == ["not listed under hooks.PreToolUse for Bash"])
 
         # handover-ready (2026-09-29): one high finding per lane at parity_ok on a declared
         # `<slug>/handover` board, keyed by the lane; nothing for shadow/stays/requested lanes,
@@ -3227,16 +4800,431 @@ def selftest():
             os.environ.pop("MC_DECISIONS_FILE", None)
         else:
             os.environ["MC_DECISIONS_FILE"] = saved[5]
+    # queue-starved (2026-10-03): one med finding per starving job, keyed by the job; filed, not pushed
+    qf = []
+    _queue_starved(qf, [{"key": "update:OLD", "tier": 20, "est_min": 15, "by": "cli", "waiting_h": 49.0,
+                         "filed_h": 49.0, "skip": "15m would run into pe_claude.py at 05:40Z"}])
+    _queue_starved(qf, [])
+    check("queue-starved: one med finding for the starving job, keyed by it, naming filer and refusal",
+          [(x["kind"], x["sev"], x["project"], x["fix"]) for x in qf] == [("queue-starved", "med", "maintenance", "human")]
+          and "update:OLD" in qf[0]["title"] and qf[0]["key"] == _key("queue-starved:maintenance:update:OLD")
+          and "by cli" in qf[0]["detail"] and "pe_claude" in qf[0]["detail"], qf)
+    check("queue-starved: filed, never pushed on its own; any other new finding still pushes",
+          _push_worthy(qf) == [] and len(_push_worthy(qf + [{"kind": "rollup-held"}])) == 1)
+    try:
+        import claudeq as _cq
+        _t0 = datetime(2026, 10, 3, 6, 10, tzinfo=timezone.utc)
+        _deferred = {"key": "update:TICKER", "since": 1790523096.9, "not_before": 1791000300.0, "by": "plane-rescore"}
+        _late = dict(_deferred, key="update:LATE", not_before=None, since=_t0.timestamp() - 50 * 3600)
+        check("queue-starved: claudeq.starving() skips a job deferred by not_before (a Stocks update, filed 09-27, "
+              "held to 10-03 04:05Z) and returns one startable 50 h",
+              [r["key"] for r in _cq.starving(_t0, jobs=[_deferred, _late])] == ["update:LATE"])
+    except Exception as e:
+        check("queue-starved: claudeq.starving() is importable", False, f"{type(e).__name__}: {e}")
+
+    # the monthly sustainability report rides this pass (memo wa-sustainability-report, 2026-10-04)
+    ts_ = tempfile.mkdtemp(prefix="backoffice-sust.")
+    try:
+        _n0 = time.time()
+        _due0 = _sustainability_due(ts_, _n0)
+        open(f"{ts_}/2026-10-sustainability.md", "w").write("x")
+        open(f"{ts_}/2026-10.md", "w").write("x")        # the sweep's report is not this one
+        _due1 = _sustainability_due(ts_, _n0)
+        _due2 = _sustainability_due(ts_, _n0 + 29 * 86400)
+        check("sustainability: due with no report, not due with a fresh one, due again after 28 days",
+              (_due0, _due1, _due2) == (True, False, True), (_due0, _due1, _due2))
+    finally:
+        shutil.rmtree(ts_, ignore_errors=True)
+
+    # a key's life across episodes (memo 2026-10-03_wa-repeat-failures, ask 1): a reopen keeps
+    # first_ever_seen / reopen_count / history; a mute is recorded as muted, not resolved
+    saved_fm = (FINDINGS, MUTE)
+    th = tempfile.mkdtemp(prefix="backoffice-history.")
+    try:
+        FINDINGS, MUTE = f"{th}/findings.json", f"{th}/mute.json"
+        save(MUTE, {"muted": []})
+        save(FINDINGS, {})
+        base = []
+        _finding(base, "dashboard-broken", "high", "a fixture check is failing", "d")
+        fid = base[0]["id"]
+        fresh = lambda: [dict(base[0])]
+        n_h, _, _ = merge_findings(fresh())
+        first0 = load(FINDINGS, {})[fid]["first_ever_seen"]
+        reopens = []
+        for _ in range(3):
+            _, r_h, _ = merge_findings([])           # gone -> resolved
+            n_h, _, _ = merge_findings(fresh())      # back -> reopened
+            reopens.append(bool(n_h) and n_h[0]["id"] == fid)
+        rec = load(FINDINGS, {})[fid]
+        check("history: a finding that reopens 3 times has reopen_count 3, first_ever_seen unchanged, "
+              "3 closed episodes in its history, and is new (pushed) each time it reopens",
+              rec["reopen_count"] == 3 and rec["first_ever_seen"] == first0 and len(rec["history"]) >= 3
+              and all(y["how"] == "resolved" and y["closed"] for y in rec["history"])
+              and rec["state"] == "open" and all(reopens), rec)
+        save(MUTE, {"muted": [base[0]["key"]]})
+        _, r_m, _ = merge_findings(fresh())
+        rec = load(FINDINGS, {})[fid]
+        check("history: a muted finding is recorded as state muted (not resolved), still counted as "
+              "leaving the open set, its history noting how=muted",
+              rec["state"] == "muted" and rec.get("muted_at")
+              and [x["id"] for x in r_m] == [fid] and rec["history"][-1]["how"] == "muted", rec)
+        save(MUTE, {"muted": []})
+        merge_findings(fresh())
+        rec = load(FINDINGS, {})[fid]
+        check("history: unmuted and found again is a 4th reopen, the lifetime carried over",
+              rec["state"] == "open" and rec["reopen_count"] == 4 and rec["first_ever_seen"] == first0
+              and len(rec["history"]) == 4, rec)
+        big = {"history": [{"opened": i, "closed": i, "how": "resolved"} for i in range(HISTORY_CAP)],
+               "first_seen": 5}
+        _close(big, "fixed", 99)
+        check("history: capped at HISTORY_CAP, the oldest dropped",
+              len(big["history"]) == HISTORY_CAP and big["history"][0]["opened"] == 1
+              and big["history"][-1] == {"opened": 5, "closed": 99, "how": "fixed"} and big["state"] == "fixed")
+        # moved key: a title whose number changed between episodes still carries the life
+        st_k = {"x:p:has-1-thing": {"id": "x:p:has-1-thing", "key": "x:p:thing", "kind": "x", "state": "resolved",
+                                    "first_seen": 10, "first_ever_seen": 5, "reopen_count": 2, "last_seen": 20,
+                                    "history": [{"opened": 10, "closed": 30, "how": "resolved"}]}}
+        save(FINDINGS, st_k)
+        merge_findings([{"id": "x:p:has-2-thing", "key": "x:p:thing", "kind": "x", "sev": "low",
+                         "title": "has 2 thing", "detail": "d", "project": "p", "fix": "human"}])
+        st_k = load(FINDINGS, {})
+        check("history: a reopen under a new id (same key) carries first_ever_seen/reopen_count/history and "
+              "marks the old record reopened_as",
+              st_k["x:p:has-2-thing"]["reopen_count"] == 3 and st_k["x:p:has-2-thing"]["first_ever_seen"] == 5
+              and len(st_k["x:p:has-2-thing"]["history"]) == 1
+              and st_k["x:p:has-1-thing"].get("reopened_as") == "x:p:has-2-thing", st_k)
+        # the one-time backfill, on the 09-26 → 10-01 shape of dashboard-broken (decisions.jsonl)
+        K = "dashboard-broken::a-dashboard-check-is-failing"
+        bf = {K: {"id": K, "key": K, "kind": "dashboard-broken", "state": "resolved", "first_seen": 1000,
+                  "last_seen": 1100, "resolved_at": 1200},
+              "other::x": {"id": "other::x", "key": "other::x", "state": "open", "first_seen": 50}}
+        evs = [{"id": "a1", "at": 100, "key": K, "finding_id": K, "status": "queued", "by": "david"},
+               {"id": "a1", "at": 150, "key": K, "status": "done", "by": "daily check", "commit": "abc"},
+               {"id": "a2", "at": 300, "key": K, "finding_id": K, "status": "queued", "by": "david"},
+               {"id": "a2", "at": 350, "key": K, "status": "done", "by": "daily check"},
+               {"id": "a3", "at": 600, "key": K, "status": "applied", "action": "snooze", "by": "david"},
+               {"id": "a3b", "at": 610, "key": K, "status": "queued", "by": "david"},   # a snooze ends its answer: new episode
+               {"id": "a4", "at": 1050, "key": K, "status": "queued", "by": "david"},  # the current episode
+               {"id": "a4", "at": 1150, "key": K, "status": "done", "by": "daily check"}]
+        ch = backfill_history(bf, evs, at=2000)
+        r = bf[K]
+        check("backfill: answers before the current episode seed reopen_count, first_ever_seen is the first "
+              "answer, history holds the prior episodes (approx) and the current one",
+              r["reopen_count"] == 4 and r["first_ever_seen"] == 100 and len(r["history"]) == 5
+              and r["history"][0] == {"opened": 100, "closed": 150, "how": "fixed", "approx": True, "src": "decisions:a1"}
+              and r["history"][2]["closed"] == 610 and r["history"][-1] == {"opened": 1000, "closed": 1200,
+                                                                           "how": "resolved"}
+              and bf["other::x"]["reopen_count"] == 0 and bf["other::x"]["first_ever_seen"] == 50
+              and bf["other::x"]["history"] == [] and {c[0] for c in ch} == {K, "other::x"}, r)
+        check("backfill: a second run changes nothing (counts only rise, history seeded once)",
+              backfill_history(bf, evs, at=3000) == [] and bf[K]["reopen_count"] == 4)
+        live = os.path.join(STATE, "findings.json")
+        check("history: every fixture write went to the temp store, never the live findings.json",
+              FINDINGS.startswith(th) and os.path.realpath(FINDINGS) != os.path.realpath(live))
+    finally:
+        FINDINGS, MUTE = saved_fm
+        shutil.rmtree(th, ignore_errors=True)
+
+    # cli-stale (2026-10-04): the headless CLI pin against David's interactive sessions, pure core
+    D, T0 = 86400, 2_000_000_000
+    cs = lambda h, i, hf=None, inf=None: ([{"time": hf or T0 - D, "headless": True, "cli_version": h},
+                                           {"time": inf or T0 - D, "headless": False, "cli_version": i}])
+    r6 = _cli_stale(cs("2.1.280", "2.1.286"), T0)
+    check("cli-stale: 6 patches behind fires and names both versions",
+          bool(r6) and r6["headless"] == "2.1.280" and r6["interactive"] == "2.1.286" and r6["behind"] == 6, r6)
+    check("cli-stale: 4 patches behind with close first sightings is quiet; headless ahead or equal is quiet",
+          _cli_stale(cs("2.1.282", "2.1.286"), T0) is None and _cli_stale(cs("2.1.286", "2.1.286"), T0) is None
+          and _cli_stale(cs("2.1.290", "2.1.286"), T0) is None, _cli_stale(cs("2.1.282", "2.1.286"), T0))
+    old_first = [{"time": T0 - 40 * D, "headless": True, "cli_version": "2.1.282"}]
+    r_lag = _cli_stale(old_first + cs("2.1.282", "2.1.284", inf=T0 - 2 * D), T0)
+    check("cli-stale: 2 patches behind fires when the headless version was first seen >14d before the interactive one",
+          bool(r_lag) and r_lag["behind"] == 2 and r_lag["lag_d"] == 38.0, r_lag)
+    check("cli-stale: rows older than 14 days do not count; no interactive row is quiet; a newer minor counts as behind",
+          _cli_stale(cs("2.1.280", "2.1.286", hf=T0 - 20 * D, inf=T0 - 20 * D), T0) is None
+          and _cli_stale(cs("2.1.280", "x"), T0) is None
+          and (_cli_stale(cs("2.1.299", "2.2.0"), T0) or {}).get("behind") == 5)
+    fc = []
+    _cli_stale_finding(fc, cs("2.1.280", "2.1.286"), T0)
+    check("cli-stale: one low finding keyed cli-stale, quiet (never pushed), detail names cli-update.py status and the parked canary",
+          len(fc) == 1 and fc[0]["sev"] == "low" and fc[0]["key"] == "cli-stale:maintenance:cli-stale"
+          and "cli-update.py status" in fc[0]["detail"] and "parked" in fc[0]["detail"]
+          and _push_worthy(fc) == [], fc)
+
+    # backup-tamper (2026-10-04): a recorded archive that changed size or hash, or vanished in its keep window
+    import hashlib as _hl
+    tb = tempfile.mkdtemp(prefix="backoffice-bt.")
+    try:
+        os.makedirs(f"{tb}/poker")
+        stamp = lambda d: datetime.fromtimestamp(T0 - d * D, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        brows = []
+        for n, body, age in (("a", b"alpha", 1), ("b", b"bravo", 2), ("c", b"charlie", 3), ("old", b"o", 40)):
+            with open(f"{tb}/poker/{n}.tar.gz", "wb") as fh:
+                fh.write(body)
+            brows.append({"ts": stamp(age), "source": "poker", "archive": f"poker/{n}.tar.gz",
+                          "bytes": len(body), "sha256": _hl.sha256(body).hexdigest()})
+        os.unlink(f"{tb}/poker/old.tar.gz")      # pruned at 40 days: fine
+        srcs = {"poker": {"keep_days": 21}}
+        hz = lambda p: _hl.sha256(open(p, "rb").read()).hexdigest()
+        check("backup-tamper: a clean recorded set (and an archive pruned past keep_days) files nothing",
+              _backup_tamper(brows, srcs, tb, T0, hasher=hz) == [], _backup_tamper(brows, srcs, tb, T0, hasher=hz))
+        with open(f"{tb}/poker/a.tar.gz", "ab") as fh:
+            fh.write(b"x")
+        os.unlink(f"{tb}/poker/b.tar.gz")
+        with open(f"{tb}/poker/c.tar.gz", "wb") as fh:
+            fh.write(b"CHARLIE")             # same size, different bytes
+        bt = _backup_tamper(brows, srcs, tb, T0, hasher=hz)
+        fb = []
+        _backup_tamper_finding(fb, bt)
+        check("backup-tamper: a size change, a deleted young archive and a same-size edit each file one high finding",
+              [r for r, _ in bt] == ["poker/a.tar.gz", "poker/b.tar.gz", "poker/c.tar.gz"]
+              and len(fb) == 3 and all(x["sev"] == "high" for x in fb) and "disappeared" in bt[1][1], bt)
+        check("backup-tamper: over the hash limit only the size is judged; a delegated or unknown source is skipped",
+              [r for r, _ in _backup_tamper(brows, srcs, tb, T0, hash_max=3, hasher=hz)] == ["poker/a.tar.gz", "poker/b.tar.gz"]
+              and _backup_tamper(brows, {"poker": {"delegated_to": "x"}}, tb, T0, hasher=hz) == []
+              and _backup_tamper(brows, {}, tb, T0, hasher=hz) == [])
+    finally:
+        shutil.rmtree(tb, ignore_errors=True)
+
+    # repeat-failure (2026-10-04): the 3rd episode in 30 days files ONE memo to the owner; Stocks is
+    # held, a known blocker names its row, the ERP host gets a draft-and-park memo, never a ping
+    saved_rp = (MEMOS, BLOCKERS, REPEAT_ASKED, FINDINGS)
+    tr = tempfile.mkdtemp(prefix="backoffice-repeat.")
+    try:
+        MEMOS, BLOCKERS = f"{tr}/memos", f"{tr}/known_blockers.json"
+        REPEAT_ASKED, FINDINGS = f"{tr}/repeat_asked.json", f"{tr}/findings.json"
+        os.makedirs(f"{tr}/memos/inbox")
+        open(f"{tr}/memos/LEDGER.md", "w").write("| date | memo |\n")
+        save(BLOCKERS, [{"pattern": "^job-failed:00ab0ae3$", "row": "reopen-stocks-for-broker-gate",
+                         "reason": "Stocks is closed", "since": "2026-10-03"}])
+        hist = lambda *ages: [{"opened": T0 - (a + 1) * D, "closed": T0 - a * D, "how": "resolved"} for a in ages]
+        rec = lambda key, proj, rc, h, title="a check is failing": {
+            "id": key, "key": key, "kind": key.split(":")[0], "sev": "med", "title": title, "detail": "it failed.",
+            "project": proj, "state": "open", "first_seen": T0 - 3600, "first_ever_seen": T0 - 20 * D,
+            "reopen_count": rc, "history": h}
+        recs = [rec("dashboard-broken::x", "", 2, hist(10, 3)),                 # 3rd episode: one memo
+                rec("unit-dead:Stocks:y", "Stocks", 2, hist(9, 2)),             # Stocks: held
+                rec("job-failed:00ab0ae3", "maintenance", 3, hist(8, 5, 1)),    # blocked
+                rec("dashboard-broken::old", "", 2, hist(60, 45)),              # episodes older than 30 days
+                rec("unit-dead:clientco-db:erp-host-down", "clientco-db", 2, hist(7, 4), "the ERP host is down"),
+                rec("dashboard-broken::twice", "", 1, hist(3))]                 # only the 2nd episode
+        save(FINDINGS, {r["id"]: dict(r) for r in recs})
+        rp = dict(repeat_failures(recs, now_ts=T0))
+        inbox = lambda slug: sorted(os.listdir(f"{tr}/memos/inbox/{slug}")) if os.path.isdir(f"{tr}/memos/inbox/{slug}") else []
+        led = open(f"{tr}/memos/LEDGER.md").read()
+        check("repeat-failure: a key on its 3rd episode in 30 days files exactly one memo to its owner, plus one LEDGER row",
+              rp.get("dashboard-broken::x", "").startswith("filed:") and len(inbox("maintenance")) == 1
+              and inbox("maintenance")[0].endswith("_repeat-dashboard-broken-x.md")
+              and led.count("| repeat-dashboard-broken-x |") == 1, (rp, inbox("maintenance")))
+        check("repeat-failure: a Stocks key files nothing and its detail says held: Stocks is frozen",
+              rp.get("unit-dead:Stocks:y") == "held-stocks" and inbox("stocks") == []
+              and "held: Stocks is frozen" in recs[1]["detail"], recs[1]["detail"])
+        check("repeat-failure: a key under a known blocker files nothing and names the blocker",
+              rp.get("job-failed:00ab0ae3") == "blocked:reopen-stocks-for-broker-gate"
+              and "blocked by reopen-stocks-for-broker-gate: answer that" in recs[2]["detail"]
+              and len(inbox("maintenance")) == 1, recs[2]["detail"])
+        erp_memo = inbox("clientco-db")
+        check("repeat-failure: the clientco ERP host files one memo asking clientco_db_lead to draft and park the note, never a ping",
+              len(erp_memo) == 1 and "clientco_db_lead" in open(f"{tr}/memos/inbox/clientco-db/{erp_memo[0]}").read()
+              and "needs-david" in open(f"{tr}/memos/inbox/clientco-db/{erp_memo[0]}").read()
+              and "never a ping" in led, erp_memo)
+        check("repeat-failure: episodes older than 30 days and a 2nd episode file nothing",
+              "dashboard-broken::old" not in rp and "dashboard-broken::twice" not in rp, rp)
+        st = load(FINDINGS, {})
+        check("repeat-failure: the store keeps the count (×3) on the record",
+              st["dashboard-broken::x"]["repeat"]["episodes"] == 3 and "×3 in 30 days" in st["dashboard-broken::x"]["detail"],
+              st["dashboard-broken::x"].get("detail"))
+        for r in recs:
+            r["detail"] = "it failed."               # merge_findings rewrites the detail from the fresh finding
+        rp2 = dict(repeat_failures(recs, now_ts=T0 + D))
+        check("repeat-failure: a second pass (next day) files nothing more and says it asked before",
+              rp2.get("dashboard-broken::x") == "asked-before" and len(inbox("maintenance")) == 1
+              and len(inbox("clientco-db")) == 1 and open(f"{tr}/memos/LEDGER.md").read() == led
+              and recs[0]["detail"].count("Repeat: ") == 1, rp2)
+        os.unlink(REPEAT_ASKED)
+        check("repeat-failure: with the state file lost, the LEDGER row still stops a second memo",
+              dict(repeat_failures(recs, now_ts=T0 + 2 * D)).get("dashboard-broken::x") == "asked-before"
+              and len(inbox("maintenance")) == 1)
+        check("repeat-failure: a dry pass files nothing", all(not o.startswith("filed:") for _, o in
+              repeat_failures([rec("dashboard-broken::z", "", 2, hist(5, 2))], dry=True, now_ts=T0)))
+    finally:
+        MEMOS, BLOCKERS, REPEAT_ASKED, FINDINGS = saved_rp
+        shutil.rmtree(tr, ignore_errors=True)
+
+    # argv-unsafe (2026-10-04, rule 34): ea7af80's pre-fix scripts are flagged, the fixed ones are not;
+    # one memo per non-Stocks project, ask-once, again only when the list grows; Stocks a finding only
+    _mc_real = os.path.join(HOME, "maintenance")
+    _git_old = lambda f: subprocess.run(["git", "-C", _mc_real, "show", f"ea7af80^:bin/{f}"],
+                                        capture_output=True, text=True).stdout
+    _olds = {f: _git_old(f) for f in ("backoffice.py", "publish.py", "sentinel.py")}
+    check("argv-unsafe: ea7af80^ backoffice.py, publish.py and sentinel.py are flagged (dry flag by membership, live else:)",
+          all(_olds.values()) and all(_argv_scan_source(v) for v in _olds.values())
+          and any("live `else:`" in w for _, w in _argv_scan_source(_olds["backoffice.py"])),
+          {f: _argv_scan_source(v) for f, v in _olds.items()})
+    _cur = {f: open(os.path.join(_mc_real, "bin", f)).read() for f in
+            ("backoffice.py", "publish.py", "sentinel.py", "memo-process.py", "lead.py", "claudeq.py", "gpu.py")}
+    check("argv-unsafe: the fixed versions (and lead.py, claudeq.py, gpu.py, memo-process.py) are not flagged",
+          not any(_argv_scan_source(v) for v in _cur.values()),
+          {f: _argv_scan_source(v) for f, v in _cur.items() if _argv_scan_source(v)})
+    _hbs = ('import sys\nif __name__ == "__main__":\n    cmd = sys.argv[1] if len(sys.argv) > 1 else "packet"\n'
+            '    wk = sys.argv[2] if len(sys.argv) > 2 else None\n    if cmd == "packet":\n        print(wk)\n'
+            '    elif cmd == "run":\n        sys.exit(run(wk))\n    else:\n        sys.exit(__doc__)\n')
+    _ap = lambda m: ('import argparse\nif __name__ == "__main__":\n    p = argparse.ArgumentParser()\n'
+                     f'    a = p.{m}()\n    run(a)\n')
+    check("argv-unsafe: an optional second argument beside a command word is flagged (hbs learnings_review shape), "
+          "`# argv: data` opts out, parse_args is clean, parse_known_args is flagged, no __main__ is clean",
+          [ln for ln, _ in _argv_scan_source(_hbs)] == [4] and _argv_scan_source("# argv: data\n" + _hbs) == []
+          and _argv_scan_source(_ap("parse_args")) == [] and len(_argv_scan_source(_ap("parse_known_args"))) == 1
+          and _argv_scan_source("import sys\nprint(sys.argv[2])\n") == [] and _argv_scan_source("def (:") == [],
+          _argv_scan_source(_hbs))
+    saved_av = (MEMOS, ARGV_ASKED)
+    ta = tempfile.mkdtemp(prefix="backoffice-argv.")
+    try:
+        for proj, src in (("hbs", _hbs), ("Stocks", _olds["publish.py"]), ("clean", _cur["backoffice.py"])):
+            os.makedirs(f"{ta}/home/{proj}/.git")
+            os.makedirs(f"{ta}/home/{proj}/bin")
+            open(f"{ta}/home/{proj}/bin/job.py", "w").write(src)
+        os.makedirs(f"{ta}/home/hbs/scripts/__pycache__")
+        open(f"{ta}/home/hbs/scripts/__pycache__/x.py", "w").write(_hbs)
+        open(f"{ta}/home/notaproject.py", "w").write(_hbs)
+        sc = argv_scan(home=f"{ta}/home")
+        check("argv-unsafe: the scan walks every project's bin/ (skips caches) and names file:line",
+              sorted(sc) == ["Stocks", "hbs"] and sc["hbs"] == [("bin/job.py", 4, sc["hbs"][0][2])], sc)
+        fa = []
+        _argv_findings(fa, sc)
+        check("argv-unsafe: one low, quiet finding per project (Stocks included), stable key",
+              len(fa) == 2 and all(x["sev"] == "low" and x["kind"] in QUIET_KINDS for x in fa)
+              and {x["key"] for x in fa} == {"argv-unsafe:hbs:scripts", "argv-unsafe:stocks:scripts"}
+              and "bin/job.py:4" in [x for x in fa if x["project"] == "hbs"][0]["detail"], fa)
+        MEMOS, ARGV_ASKED = f"{ta}/memos", f"{ta}/argv_asked.json"
+        os.makedirs(f"{ta}/memos/inbox")
+        open(f"{ta}/memos/LEDGER.md", "w").write("| date | memo |\n")
+        ainbox = lambda slug: sorted(os.listdir(f"{ta}/memos/inbox/{slug}")) if os.path.isdir(f"{ta}/memos/inbox/{slug}") else []
+        check("argv-unsafe: a dry pass files nothing", dict(argv_memos(sc, dry=True)) ==
+              {"Stocks": "held-stocks", "hbs": "would-file"} and ainbox("hbs") == [] and not os.path.exists(ARGV_ASKED))
+        am = dict(argv_memos(sc))
+        led = open(f"{ta}/memos/LEDGER.md").read()
+        body = open(f"{ta}/memos/inbox/hbs/{ainbox('hbs')[0]}").read() if ainbox("hbs") else ""
+        check("argv-unsafe: ONE memo to hbs (asks hbs_lead for the ea7af80 pattern) plus a LEDGER row; Stocks gets none",
+              am["hbs"].startswith("filed:") and am["Stocks"] == "held-stocks" and len(ainbox("hbs")) == 1
+              and ainbox("hbs")[0].endswith("_argv-unsafe.md") and "ea7af80" in body and "hbs_lead" in body
+              and ainbox("stocks") == [] and ainbox("Stocks") == [] and led.count("| argv-unsafe |") == 1, (am, led))
+        check("argv-unsafe: the next pass with the same list files nothing more",
+              dict(argv_memos(sc))["hbs"] == "asked-before" and len(ainbox("hbs")) == 1
+              and open(f"{ta}/memos/LEDGER.md").read() == led)
+        os.rename(f"{ta}/memos/inbox/hbs/{ainbox('hbs')[0]}", f"{ta}/memos/inbox/hbs/2000-01-01_argv-unsafe.md")
+        grown = {"hbs": sc["hbs"] + [("bin/other.py", 9, "a dry flag '--dry' read by membership")]}
+        check("argv-unsafe: a list that grows files again (next day)", dict(argv_memos(grown))["hbs"].startswith("filed:")
+              and len(ainbox("hbs")) == 2 and load(ARGV_ASKED, {})["hbs"]["hits"][0].startswith("bin/job.py"))
+        os.unlink(ARGV_ASKED)
+        check("argv-unsafe: with the state file lost, the LEDGER row still stops a repeat memo",
+              dict(argv_memos(sc))["hbs"] == "asked-before")
+    finally:
+        MEMOS, ARGV_ASKED = saved_av
+        shutil.rmtree(ta, ignore_errors=True)
+
+    # posture (2026-10-04, rule 35): a repo turned public + a new GitHub key + an undeclared off-loopback
+    # listener are 3 findings; the baseline is 0; gh is polled at most hourly and a gh failure is a note only
+    tp = tempfile.mkdtemp(prefix="backoffice-posture.")
+    try:
+        exp = {"public": ["stocks-public"], "private": ["stocks", "hbs"], "keys": [11, 22]}
+        base_repos = [{"name": "stocks-public", "visibility": "PUBLIC"}, {"name": "stocks", "visibility": "PRIVATE"},
+                      {"name": "hbs", "visibility": "PRIVATE"}]
+        ss_txt = ("State Recv-Q Send-Q Local Address:Port Peer Address:PortProcess\n"
+                  "LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\n"
+                  "LISTEN 0 5 <host-ip>:8088 0.0.0.0:*\n"
+                  "LISTEN 0 4096 127.0.0.1:11434 0.0.0.0:*\n"
+                  "LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n"
+                  "LISTEN 0 16 [::1]:3493 [::]:*\n"
+                  "LISTEN 0 4096 [fd7a:115c:a1e0::9b01:ed99]:38244 [::]:*\n")
+        calls = []
+
+        def fake_gh(repos, keys, rc=0):
+            def run(cmd):
+                calls.append(cmd)
+                if rc:
+                    return rc, "", "HTTP 401: Bad credentials"
+                return 0, json.dumps(repos if "repo" in cmd else [{"id": k} for k in keys]), ""
+            return run
+        cache = f"{tp}/posture.json"
+        snap0 = _gh_snapshot(run=fake_gh(base_repos, [11, 22]), now_ts=T0, cache=cache)
+        lst0 = _ss_listeners(ss_txt)
+        check("posture: the baseline (gh as expected, listeners declared, loopback and a foreign ephemeral ignored) is 0",
+              _posture(snap0, exp, lst0, [22, 8088]) == [] and {p for _, p, _ in lst0} == {22, 8088, 38244}, lst0)
+        flipped = [dict(r, visibility="PUBLIC") if r["name"] == "hbs" else r for r in base_repos]
+        snap1 = _gh_snapshot(run=fake_gh(flipped, [11, 22, 33]), now_ts=T0 + 4000, cache=cache)
+        pr = _posture(snap1, exp, _ss_listeners(ss_txt + "LISTEN 0 5 0.0.0.0:9555 0.0.0.0:* users:((\"x\",pid=7,fd=3))\n"),
+                      [22, 8088])
+        fp = []
+        _posture_findings(fp, pr)
+        check("posture: a flipped repo + an extra key + an extra port are 3 high findings with stable keys",
+              len(fp) == 3 and all(x["sev"] == "high" and x["kind"] == "posture" for x in fp)
+              and {x["key"] for x in fp} == {"posture:maintenance:repo:hbs", "posture:maintenance:key:33",
+                                            "posture:maintenance:port:9555"}
+              and "now public" in [x for x in fp if "hbs" in x["title"]][0]["title"], [x["key"] for x in fp])
+        check("posture: a port rule 5 already files is skipped; a new public repo not on either list is flagged",
+              _posture(snap0, exp, [("0.0.0.0", 9555, 7)], [22], skip={9555}) == []
+              and "a new public repo" in _posture({"repos": [{"name": "x", "visibility": "PUBLIC"}]}, exp, [], [])[0][1])
+        n = len(calls)
+        again = _gh_snapshot(run=fake_gh([], []), now_ts=T0 + 4000 + 1800, cache=cache)
+        check("posture: gh is polled at most hourly (a second call inside the hour reuses the cache)",
+              len(calls) == n and again["keys"] == [11, 22, 33])
+        bad = _gh_snapshot(run=fake_gh([], [], rc=1), now_ts=T0 + 9000, cache=cache)
+        check("posture: a gh failure is a note, never a finding",
+              bad["repos"] is None and bad["keys"] is None and len(bad["notes"]) == 2
+              and _posture(bad, exp, [], []) == [], bad)
+        check("posture: rule 5's predicate (the shared quiet list, below 1024 and ephemeral skipped)",
+              _rule5_reports(9555, {"known_ports": [], "infra_ports": []})
+              and not _rule5_reports(22, {}) and not _rule5_reports(40000, {})
+              and not _rule5_reports(8088, {"known_ports": [8088], "infra_ports": []}))
+    finally:
+        shutil.rmtree(tp, ignore_errors=True)
+
+    # the argv contract (2026-10-03): an argument this does not know is exit 2, never the live pass
+    P = parse_argv
+    check("argv: history-backfill takes --dry / --dry-run, and an unknown flag after it is exit 2",
+          P(["history-backfill", "--dry"]) == ("history-backfill", True, "")
+          and P(["history-backfill"]) == ("history-backfill", False, "")
+          and bool(P(["history-backfill", "--force"])[2]))
+    check("argv: no command is run; --dry and --dry-run are the same dry run; commands keep their flag",
+          [P(a) for a in ([], ["--dry"], ["--dry-run"], ["run"], ["fix", "--dry-run"], ["selftest"])]
+          == [("run", False, ""), ("run", True, ""), ("run", True, ""), ("run", False, ""), ("fix", True, ""),
+              ("selftest", False, "")], [P(a) for a in ([], ["--dry-run"], ["fix", "--dry-run"])])
+    check("argv: --selftest, --bogus, -n, a misspelt command, run --force are errors (exit 2)",
+          all(P(a)[2] for a in (["--selftest"], ["--bogus"], ["-n"], ["rnu"], ["run", "--force"])),
+          [P(a) for a in (["--selftest"], ["rnu"])])
     print("ALL PASS" if ok else "SOME FAILED")
     return 0 if ok else 1
+
+
+COMMANDS = ("census", "audit", "fix", "brief", "run", "show", "decide", "selftest", "history-backfill")
+USAGE = ("usage: backoffice.py [census|audit|fix|brief|run|show|decide|selftest|history-backfill] "
+         "[--dry|--dry-run] | --help")
+
+
+def parse_argv(argv):
+    """-> (cmd, dry, error). No command is `run`; --dry and --dry-run are one flag. Anything else
+    is an error the caller turns into exit 2 — never the live pass (2026-10-03)."""
+    cmd, dry, rest = "run", False, list(argv)
+    if rest and not rest[0].startswith("-"):
+        cmd = rest.pop(0)
+        if cmd not in COMMANDS:
+            return cmd, dry, f"unknown command {cmd!r}"
+    for a in rest:
+        if a in ("--dry", "--dry-run"):
+            dry = True
+        else:
+            return cmd, dry, f"unknown argument {a!r}"
+    return cmd, dry, ""
 
 
 if __name__ == "__main__":
     if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
         print((__doc__ or "").strip() or "usage: see the header of " + __file__)
         sys.exit(0)
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    dry = "--dry" in sys.argv
+    cmd, dry, _err = parse_argv(sys.argv[1:])
+    if _err:
+        print(f"backoffice.py: {_err} — nothing run. {USAGE}", file=sys.stderr)
+        sys.exit(2)
     if cmd == "census":
         c = census(); print(json.dumps({k: len(v) if isinstance(v, (list, dict)) else v
                                         for k, v in c.items()}, indent=1))
@@ -3259,5 +5247,7 @@ if __name__ == "__main__":
             print(("would: " if dry else "done: ") + (what or "could not apply") + f" (decision:{e['id']})")
     elif cmd == "selftest":
         sys.exit(selftest())
-    else:
+    elif cmd == "history-backfill":
+        sys.exit(history_backfill(dry=dry))
+    elif cmd == "run":
         sys.exit(run(dry=dry))

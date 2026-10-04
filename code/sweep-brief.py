@@ -4,6 +4,12 @@ Runs 1st of month 09:35 UTC (quiet window), 85 min before the Claude sweep: dige
 month of logs + git history into state/sweep_brief.md so the expensive sweep session
 reads a brief and verifies claims, instead of trawling everything raw."""
 import json, os, subprocess, sys, time
+if __name__ == "__main__" and sys.argv[1:] and not any(a in ("-h", "--help") for a in sys.argv[1:]):
+    # no modes and no dry run: any argument exits 2 and runs nothing (2026-10-03 — until then an
+    # argument nobody parsed, `--dry` included, ran the live job)
+    print(f"sweep-brief.py: unknown argument(s) {' '.join(sys.argv[1:])!r} — nothing run. "
+          "usage: sweep-brief.py | --help  (it takes no arguments and has no dry mode)", file=sys.stderr)
+    sys.exit(2)
 
 HOME = os.path.expanduser("~")
 sys.path.insert(0, f"{HOME}/maintenance/bin")

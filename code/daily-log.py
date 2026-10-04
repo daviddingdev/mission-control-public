@@ -4,6 +4,12 @@ Snapshots every cron job's state + writes a plain-English narrative via the LOCA
 model (ollama — zero Claude tokens; the token-saving pilot). Appends one record/day
 to state/dailylog.jsonl; the dashboard's Box › Archive (daily log) renders it."""
 import json, os, sys, time, urllib.request
+if __name__ == "__main__" and sys.argv[1:] and not any(a in ("-h", "--help") for a in sys.argv[1:]):
+    # no modes and no dry run: any argument exits 2 and runs nothing (2026-10-03 — until then an
+    # argument nobody parsed, `--dry` included, ran the live job)
+    print(f"daily-log.py: unknown argument(s) {' '.join(sys.argv[1:])!r} — nothing run. "
+          "usage: daily-log.py | --help  (it takes no arguments and has no dry mode)", file=sys.stderr)
+    sys.exit(2)
 
 HOME = os.path.expanduser("~")
 sys.path.insert(0, f"{HOME}/maintenance/dashboard")

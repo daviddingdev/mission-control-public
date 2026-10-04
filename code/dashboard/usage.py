@@ -276,12 +276,22 @@ def _ledger_kinds():
     """{session id: 'scheduled' | 'interactive'} from the session ledger (claude-session-notify.sh
     writes `headless` for every session since 2026-08-12). Who ran a session is a fact there; the
     prompt-prefix guess in _classify missed every job not in JOB_PREFIXES — 302 headless sessions,
-    most of Stocks, were counted as David's own (2026-09-26)."""
+    most of Stocks, were counted as David's own (2026-09-26).
+
+    A session's last row decides, except that a row carrying `remote_control: true` (the RC-parent
+    rule, 2026-10-03) makes the session David's for good: a phone session the old argv rule
+    ledgered headless and that was later resumed under the new rule is his, not a job's.
+
+    NOTE for anyone reading state/usage_cache.json directly: an entry's stored `kind` is ONLY the
+    prompt-prefix guess (_classify), fixed at parse time. The split the page shows is resolved here
+    at read time; usage()['split'] reports it, with how many sessions the ledger decided (2026-10-04:
+    a review counted the raw cache field, 1,701 interactive / 113 scheduled, and filed the page as
+    wrong when the page already agreed with the ledger)."""
     p = f"{HOME}/maintenance/state/claude_sessions.jsonl"
     sig = _file_sig(p)
     if sig and sig == _LEDGER["sig"]:
         return _LEDGER["kinds"]
-    kinds = {}
+    kinds, rc = {}, set()
     try:
         with open(p, errors="replace") as fh:
             for line in fh:
@@ -289,13 +299,27 @@ def _ledger_kinds():
                     r = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(r, dict):
+                    continue
                 sid, h = r.get("session"), r.get("headless")
-                if sid and isinstance(h, bool):
+                if not sid:
+                    continue
+                if r.get("remote_control") is True:
+                    rc.add(sid)
+                if isinstance(h, bool):
                     kinds[sid] = "scheduled" if h else "interactive"
     except OSError:
         pass
+    for sid in rc:
+        kinds[sid] = "interactive"
     _LEDGER.update(sig=sig, kinds=kinds)
     return kinds
+
+
+def _proj_dir(name):
+    """'-home-user-Stocks' -> 'Stocks'; a worktree folder -> its project; the home folder -> 'home'."""
+    proj = name.replace("-home-user", "").strip("-") or "home"
+    return proj.split("--claude-worktrees")[0].strip("-") or "home"
 
 
 def _usage(days_back):
@@ -318,8 +342,7 @@ def _usage(days_back):
         changed = True
     seen = set()
     for d in glob.glob(f"{HOME}/.claude/projects/*/"):
-        proj = os.path.basename(d.rstrip("/")).replace("-home-user", "").strip("-") or "home"
-        proj = proj.split("--claude-worktrees")[0].strip("-") or "home"
+        proj = _proj_dir(os.path.basename(d.rstrip("/")))
         # the session's own transcript, and (2026-09-26) every subagent and workflow agent it ran:
         # <sid>/subagents/**.jsonl is real Claude work on the same window — 764 MB of transcripts
         # in 30 days against 670 MB of top-level ones, none of it counted before
@@ -358,7 +381,7 @@ def _usage(days_back):
     lk = _ledger_kinds()
     top = {e.get("sid"): e for e in cache.values() if isinstance(e, dict) and not e.get("sub")}
 
-    def who(e):
+    def who(e, key=""):
         base = top.get(e.get("sid"), e) if e.get("sub") else e
         kind, label, group = base.get("kind"), base.get("label"), base.get("group")
         k = lk.get(e.get("sid"))
@@ -367,18 +390,24 @@ def _usage(days_back):
             label = str(label or "").replace("interactive · ", "headless · ", 1) or "headless"
             group = str(group or "").replace("Sessions — ", "Scheduled — ", 1) or "Other scheduled"
         elif k == "interactive" and kind != "interactive":
+            # the ledger says David ran it though its first prompt looks like a job's (he pasted a
+            # job prompt, or a phone session): his project's label, not the job's (2026-10-04)
             kind = "interactive"
-        return kind or "interactive", label or "interactive", group
+            p = _proj_dir(key[len(root):].split(os.sep)[0]) if key.startswith(root) else "general"
+            p = p.split("--")[0] or "general"
+            label, group = f"interactive · {p}", f"Sessions — {_nice(p)}"
+        return kind or "interactive", label or "interactive", group, ("ledger" if k else "prompt")
     # aggregate
     # `days_back` Eastern days INCLUDING today — "30 days" means 30 bars, not 31 (2026-09-26 polish)
     cutoff = _et_today(days_back - 1)
     P = prices()
     daily, jobs = {}, {}
     by_model, parts_tot, legacy_usd, legacy_days = {}, {}, 0.0, 0
-    for e in cache.values():
+    split = {"sessions": {"scheduled": 0, "interactive": 0}, "kind_from": {"ledger": 0, "prompt": 0}}
+    for key, e in cache.items():
         if not isinstance(e, dict) or "days" not in e:
             continue
-        kind, label, _g = who(e)
+        kind, label, _g, src = who(e, key)
         touched = False
         for day, u in e["days"].items():
             if day < cutoff:
@@ -416,15 +445,17 @@ def _usage(days_back):
                     parts_tot[pk] = parts_tot.get(pk, 0.0) + pv
         if touched and not e.get("sub"):
             jobs[label]["sessions"] += 1        # one top-level transcript = one session
+            split["sessions"][kind] += 1
+            split["kind_from"][src] += 1
     # aggregate labels into work-type groups (cache entries may predate 'group' field)
     groups = {}
-    for e in cache.values():
+    for key, e in cache.items():
         if not isinstance(e, dict) or "days" not in e:
             continue
         recent = {d: u for d, u in e["days"].items() if d >= cutoff}
         if not recent:
             continue
-        kind, _l, g = who(e)
+        kind, _l, g, _src = who(e, key)
         g = g or _classify_label_fallback(e)
         gg = groups.setdefault(g, {"kind": kind, "sessions": 0, "proc": 0, "out": 0, "cr": 0, "usd": 0.0})
         gg["sessions"] += 0 if e.get("sub") else 1
@@ -460,7 +491,10 @@ def _usage(days_back):
     for r in rows:
         r["usd_scheduled"] = round(r["usd_scheduled"], 2)
         r["usd_interactive"] = round(r["usd_interactive"], 2)
-    return {"daily": rows, "groups": group_rows, "cost": cost, "generated_at": int(time.time())}
+    # the interactive/scheduled split in sessions, and who decided it: the ledger's headless flag, or
+    # the prompt-prefix guess for a session the ledger never saw (before 2026-08-12)
+    split["usd"] = {"scheduled": round(usd_s, 2), "interactive": round(usd_i, 2)}
+    return {"daily": rows, "groups": group_rows, "cost": cost, "split": split, "generated_at": int(time.time())}
 
 
 def _classify_label_fallback(e):
@@ -585,6 +619,54 @@ def selftest():
         r2 = _usage(3650)
         check("an entry from outside the real projects root is dropped", r2["daily"] == r["daily"]
               and "/elsewhere/.claude/projects/x/old.jsonl" not in json.load(open(CACHE)))
+
+        # who ran it, case by case (2026-10-04, memo wa-cost-attribution ask 1): the ledger's headless
+        # flag first, remote_control over it, the prompt guess only for a session the ledger never saw
+        r3 = os.path.join(d, "r3")
+        p3 = os.path.join(r3, ".claude", "projects", "-home-user-Stocks")
+        os.makedirs(os.path.join(p3, "h1", "subagents"))
+        os.makedirs(os.path.join(r3, "maintenance", "state"))
+        tr = lambda prompt, mid: (json.dumps({"type": "user", "message": {"content": prompt}}) + "\n"
+                                  + ln(mid, u2, "text"))
+        files = {"h1.jsonl": tr("hello, a job with no known prefix", "a1"),             # ledger headless
+                 os.path.join("h1", "subagents", "agent-x.jsonl"): tr("look at this", "a2"),  # its subagent
+                 "u1.jsonl": tr("hi", "a3"),                                           # not in ledger: yours
+                 "u2.jsonl": tr("Refresh the weekly candidate board now", "a4"),       # not in ledger: a job
+                 "rc1.jsonl": tr("from the phone", "a5"),                              # RC beats headless
+                 "i1.jsonl": tr("Refresh the weekly candidate board, by hand", "a6")}  # ledger says yours
+        for n, body in files.items():
+            with open(os.path.join(p3, n), "w") as fh:
+                fh.write(body)
+        with open(os.path.join(r3, "maintenance", "state", "claude_sessions.jsonl"), "w") as fh:
+            for row in ({"session": "h1", "headless": True}, {"session": "rc1", "headless": True},
+                        {"session": "rc1", "headless": True, "remote_control": True},
+                        {"session": "rc1", "headless": True}, {"session": "i1", "headless": False}):
+                fh.write(json.dumps(row) + "\n")
+        HOME, CACHE = r3, os.path.join(r3, "maintenance", "state", "usage_cache.json")
+        _MEM.update(sig=None, cache=None)
+        _LEDGER.update(sig=None, kinds={})
+        r = _usage(3650)
+        lk = _ledger_kinds()
+        check("a session the ledger marks headless is scheduled, though its prompt matches no job",
+              lk.get("h1") == "scheduled", lk)
+        check("remote_control on any of its rows makes a session David's", lk.get("rc1") == "interactive", lk)
+        sp = r.get("split") or {}
+        check("split: h1 + u2 scheduled, u1 + rc1 + i1 interactive; the subagent is no session",
+              sp.get("sessions") == {"scheduled": 2, "interactive": 3}, sp)
+        check("split: three decided by the ledger (h1, rc1, i1), the two it never saw fell back to the prompt"
+              " guess (u1, u2), and the subagent is not counted", sp.get("kind_from") == {"ledger": 3, "prompt": 2}, sp)
+        g = {x["group"]: x for x in r["groups"]}
+        check("the headless session's subagent inherits scheduled (its tokens are in the job's group)",
+              g.get("Scheduled — Stocks", {}).get("proc") == 241 * 2
+              and g.get("Scheduled — Stocks", {}).get("sessions") == 1, g)
+        check("an unknown session with a job's prompt falls back to that job",
+              g.get("Investing research (scheduled)", {}).get("sessions") == 1, g)
+        check("a job-looking prompt the ledger calls David's is filed under his project, not the job",
+              g.get("Sessions — Stocks", {}).get("sessions") == 3
+              and g.get("Sessions — Stocks", {}).get("kind") == "interactive", g)
+        day = r["daily"][0]
+        check("daily: scheduled = h1 + its subagent + u2, interactive = u1 + rc1 + i1",
+              day["scheduled"] == 241 * 3 and day["interactive"] == 241 * 3, day)
     finally:
         HOME, CACHE = saved[0], saved[1]
         _MEM.clear(); _MEM.update(saved[2])
@@ -594,6 +676,10 @@ def selftest():
 
 if __name__ == "__main__":
     import sys
-    if sys.argv[1:] == ["selftest"]:
+    a = sys.argv[1:]
+    if a == ["selftest"]:
         sys.exit(0 if selftest() else 1)
+    if a:                       # an argument it does not know is never the live job (CLAUDE.md, 2026-10-03)
+        print(f"usage.py: unknown argument(s) {a!r}; usage: usage.py [selftest]", file=sys.stderr)
+        sys.exit(2)
     print(json.dumps(usage(), indent=1)[:2000])

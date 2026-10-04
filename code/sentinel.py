@@ -2,7 +2,14 @@
 """Log-anomaly sentinel — hourly, zero Claude tokens.
 The local model reads every job's status + last log line and flags anything that looks
 broken. Alerts (ntfy `alerts`) only on NEW issues, with a 24h per-issue cooldown — the
-layer that would have caught the clientco silent failure within an hour."""
+layer that would have caught the clientco silent failure within an hour.
+
+    sentinel.py              the hourly pass (local model; may page `alerts`)
+    sentinel.py --dry        print the prompt the model would get; no model call, no push
+                             (--dry-run is the same thing)
+    sentinel.py selftest     the 09-23 replay with the model, job table and notify.sh stubbed
+  Any other argument exits 2 with the usage line and runs nothing (2026-10-03: until then
+  `--dry-run`, or any typo, ran the live pass — the GPU, the state file, maybe a page)."""
 import json, os, re, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
@@ -173,7 +180,7 @@ def main():
         f"WATCHDOG: {'green' if w['ok'] else 'FAILING: ' + w['state']} · last ran {w_age} "
         f"(every 15m; its state file only changes on a transition, so a quiet file is healthy)\n"
         + "\n".join(lines))
-    if "--dry" in sys.argv:
+    if "--dry" in sys.argv or "--dry-run" in sys.argv:
         print(prompt)
         return
     verdict = ask_json(prompt, num_predict=400)
@@ -302,14 +309,35 @@ def _selftest(target=None):
             print(f"{'PASS' if good else 'FAIL'}  {name}: paged={paged} held={held} "
                   f"cooldown={stamped} (want paged={want_page})")
             bad += [] if good else [name]
+    for label, a, want in (("argv: the cron line, --dry, --dry-run and selftest are the modes",
+                            ([], ["--dry"], ["--dry-run"], ["selftest"]), False),
+                           ("argv: --selftest, --bogus, -n, selftest --dry, a bare word are errors (exit 2)",
+                            (["--selftest"], ["--bogus"], ["-n"], ["selftest", "--dry"], ["dry"]), True)):
+        good = all(bool(argv_error(x)) == want for x in a)
+        print(f"{'PASS' if good else 'FAIL'}  {label}")
+        bad += [] if good else [label]
     print("ALL PASS" if not bad else f"{len(bad)} FAIL")
     return not bad
+
+
+USAGE = "usage: sentinel.py [--dry|--dry-run] | selftest | --help"
+
+
+def argv_error(argv):
+    """'' when argv is one of this script's modes, else why not (the caller exits 2, runs nothing)."""
+    if argv in ([], ["selftest"], ["--dry"], ["--dry-run"]):
+        return ""
+    return f"unknown argument(s) {' '.join(argv)!r}"
 
 
 if __name__ == "__main__":
     if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
         print((__doc__ or "").strip() or "usage: see the header of " + __file__)
         sys.exit(0)
+    _err = argv_error(sys.argv[1:])
+    if _err:
+        print(f"sentinel.py: {_err} — nothing run. {USAGE}", file=sys.stderr)
+        sys.exit(2)
     if sys.argv[1:2] == ["selftest"]:
         sys.exit(0 if _selftest() else 1)
     main()

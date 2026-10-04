@@ -324,9 +324,35 @@ def _announce(me):
                              stdout=null, stderr=null)
 
 
+class Grant:
+    """What `with gpu.slot(...) as g:` hands back — the slot's own clock, so a caller can
+    meter the inference apart from the queue (2026-10-04: localllm's `secs` used to start
+    before the slot and so counted the wait as GPU time).
+
+    t_request  when slot() was entered          t_grant  when the work may start (granted,
+    wait_s     t_grant - t_request                        or the fail-open bypass moment)
+    held       True on a real grant, False on a bypass
+    hold_s()   seconds since t_grant (final once the slot is released: t_release is set)
+    Existing callers that write `with gpu.slot(...):` without `as` are unaffected."""
+    __slots__ = ("t_request", "t_grant", "t_release", "held")
+
+    def __init__(self, t_request):
+        self.t_request = self.t_grant = t_request
+        self.t_release = None
+        self.held = False
+
+    @property
+    def wait_s(self):
+        return max(0.0, self.t_grant - self.t_request)
+
+    def hold_s(self):
+        return max(0.0, (self.t_release or time.time()) - self.t_grant)
+
+
 @contextlib.contextmanager
 def slot(job=None, model=None, proj=None, timeout=None):
     """Hold the GPU for one inference. Blocks until this caller is the best waiter.
+    Yields a Grant (t_grant, wait_s, hold_s()) for callers that meter the inference.
 
     Fails open: any internal error, or a wait past the timeout, lets the call proceed and
     records a `bypass` event rather than blocking a job forever.
@@ -334,6 +360,7 @@ def slot(job=None, model=None, proj=None, timeout=None):
     c = cfg()
     me, held, t0 = None, False, time.time()
     t_grant = t0   # updated when the slot is actually granted; separates wait from hold
+    g = Grant(t0)
     try:
         _ensure()
         me = {"id": uuid.uuid4().hex[:12], "pid": os.getpid(), "since": t0,
@@ -361,9 +388,13 @@ def slot(job=None, model=None, proj=None, timeout=None):
         event("bypass", job=job or "?", reason=f"{type(e).__name__}: {e}"[:120])
     if me:                                       # inference proceeds on both paths
         _announce(me)
+    # the work starts now on every path: a real grant (t_grant), or a bypass after the wait
+    g.held = held
+    g.t_grant = t_grant if held else time.time()
     try:
-        yield
+        yield g
     finally:
+        g.t_release = time.time()
         with contextlib.suppress(Exception):
             if me:
                 with contextlib.suppress(OSError):
@@ -407,12 +438,16 @@ REFUSAL = re.compile(r"I can'?t (help|assist|provide|comply)|I'?m (unable|not ab
 
 
 def record_usage(job=None, model=None, prompt_tokens=0, output_tokens=0, seconds=None,
-                 proj=None, text=None):
+                 proj=None, text=None, wait_s=None, hold_s=None):
     """Log one local inference's token counts.
 
     Recorded here rather than in each caller because this module already knows who is
     asking — the project and job labels are the same ones the queue orders by, so usage
     and priority are reported in the same terms.
+
+    `seconds` is the inference (time HELD). A caller that knows the slot's clock also passes
+    `hold_s` and `wait_s` (gpu.Grant), written as their own fields so a queue wait is never
+    read as GPU time; both are optional and appended last, so every older caller still fits.
 
     Purely observational: any failure is swallowed. A ledger that can break a job is worse
     than no ledger.
@@ -424,6 +459,8 @@ def record_usage(job=None, model=None, prompt_tokens=0, output_tokens=0, seconds
                 "job": job or os.path.basename(sys.argv[0]), "model": model,
                 "in": int(prompt_tokens or 0), "out": int(output_tokens or 0),
                 "secs": round(seconds, 1) if seconds else None,
+                **({"hold_s": round(hold_s, 1)} if hold_s is not None else {}),
+                **({"wait_s": round(wait_s, 1)} if wait_s is not None else {}),
                 # A refusal is a successful HTTP call returning nothing usable — the exact
                 # silent-failure shape this box treats as the cardinal sin. Counted so the
                 # "should we run an uncensored model?" question stays a measurement.
@@ -519,9 +556,10 @@ def _cli(argv):
         except FileNotFoundError:
             print("no events yet")
     elif cmd == "selftest":
-        _selftest()
-    else:
-        print(__doc__.strip().splitlines()[-1])
+        return 1 if _selftest() else 0
+    else:                                        # an unknown argument never runs a mode
+        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+        return 2
 
 
 def _selftest():
@@ -596,7 +634,36 @@ def _selftest():
         ok = got == want
         bad += not ok
         print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
-    total = len(cases) + len(announce_cases) + len(zombie_cases)
+    # the meter (2026-10-04): a Grant splits queue wait from hold, and record_usage writes
+    # both apart — no real slot is taken and the live ledger is never touched
+    import tempfile
+    g = Grant(now)
+    g.t_grant, g.t_release, g.held = now + 2.0, now + 2.0, True
+    global USAGE
+    real_usage, fd = USAGE, tempfile.NamedTemporaryFile("w+", suffix=".jsonl", delete=False)
+    fd.close()
+    try:
+        USAGE = fd.name
+        record_usage(job="selftest", model="fake", prompt_tokens=1, output_tokens=1,
+                     seconds=g.hold_s(), proj="selftest", wait_s=g.wait_s, hold_s=g.hold_s())
+        record_usage("selftest", "fake", 1, 1, 0.5, "selftest", None)   # an old positional caller
+        rows = [json.loads(l) for l in open(fd.name) if l.strip()]
+    finally:
+        USAGE = real_usage
+        os.unlink(fd.name)
+    meter_cases = [
+        ("a 2 s queue wait books wait_s=2", abs(g.wait_s - 2.0) < 1e-6, True),
+        ("and holds ~0 s", g.hold_s() < 1e-6, True),
+        ("usage row carries wait_s and hold_s apart",
+         (rows[0].get("wait_s"), rows[0].get("hold_s"), rows[0].get("secs")), (2.0, 0.0, None)),
+        ("an older caller's row is unchanged",
+         ("wait_s" in rows[1] or "hold_s" in rows[1], rows[1].get("secs")), (False, 0.5)),
+    ]
+    for name, got, want in meter_cases:
+        ok = got == want
+        bad += not ok
+        print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
+    total = len(cases) + len(announce_cases) + len(zombie_cases) + len(meter_cases)
     print(f"{total - bad}/{total} passed")
     return bad
 

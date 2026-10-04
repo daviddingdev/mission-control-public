@@ -9,6 +9,12 @@ from localllm import ask
 if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
     print((__doc__ or "").strip() or "usage: see the header of " + __file__)
     sys.exit(0)
+if __name__ == "__main__" and sys.argv[1:] and not any(a in ("-h", "--help") for a in sys.argv[1:]):
+    # no modes and no dry run: any argument exits 2 and runs nothing (2026-10-03 — until then an
+    # argument nobody parsed, `--dry` included, ran the live job)
+    print(f"build-journal.py: unknown argument(s) {' '.join(sys.argv[1:])!r} — nothing run. "
+          "usage: build-journal.py | --help  (it takes no arguments and has no dry mode)", file=sys.stderr)
+    sys.exit(2)
 
 # derived, not declared: every project on the box is whatever has a git repo in ~,
 # so a new project appears in the journal without anyone editing this line

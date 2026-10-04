@@ -18,11 +18,24 @@ from localllm import ask
 if any(a in ("-h", "--help") for a in sys.argv[1:]):   # `--help` never runs the job (2026-09-26)
     print((__doc__ or "").strip() or "usage: see the header of " + __file__)
     sys.exit(0)
+if __name__ == "__main__" and sys.argv[1:] and not any(a in ("-h", "--help") for a in sys.argv[1:]):
+    # no modes and no dry run: any argument exits 2 and runs nothing (2026-10-03 — until then an
+    # argument nobody parsed, `--dry` included, ran the live job)
+    print(f"memo-triage.py: unknown argument(s) {' '.join(sys.argv[1:])!r} — nothing run. "
+          "usage: memo-triage.py | --help  (it takes no arguments and has no dry mode)", file=sys.stderr)
+    sys.exit(2)
 
 BUS = f"{HOME}/memos"
-# memo-process.py runs daily at 08:20Z and takes 3 memos per run, one per inbox. A memo that
-# has survived seven of those passes is not waiting its turn — it is stuck.
+# memo-process.py runs daily at 08:20Z: one session per inbox (a project lead takes its whole
+# inbox, Stocks one memo), up to 4 inboxes a run. A memo that has survived seven of those passes is
+# not waiting its turn — it is stuck. One parked on purpose with `waiting-until <date>` (a lead's
+# gate, at most 30 days, lead.memo_state) is not, until that day: it is left out (2026-10-02).
 STUCK_H = 24 * 7
+try:
+    import lead as _lead
+    _rows = _lead.ledger_rows()
+except Exception:                               # the backstop never depends on the lead code
+    _lead, _rows = None, []
 LEDGER_STUCK_D = 14
 stale, now = [], time.time()
 
@@ -32,6 +45,11 @@ for proj in sorted(os.listdir(f"{BUS}/inbox")) if os.path.isdir(f"{BUS}/inbox") 
         p = os.path.join(d, f)
         age_h = (now - os.path.getmtime(p)) / 3600
         if age_h > STUCK_H:
+            try:
+                if _lead and _lead.memo_state(proj, f, _rows, None, os.path.getmtime(p))[0] == "waiting":
+                    continue
+            except Exception:
+                pass
             head = open(p, errors="replace").read()[:600]
             try:
                 one = ask(f"One line (<=15 words): what does this memo ask for?\n\n{head}",
