@@ -7,7 +7,8 @@ layer that would have caught the clientco silent failure within an hour.
     sentinel.py              the hourly pass (local model; may page `alerts`)
     sentinel.py --dry        print the prompt the model would get; no model call, no push
                              (--dry-run is the same thing)
-    sentinel.py selftest     the 09-23 replay with the model, job table and notify.sh stubbed
+    sentinel.py selftest     the 09-23 replay and the 10-04 dedupe cases, with the model, job
+                             table, state files, notifications log and notify.sh stubbed
   Any other argument exits 2 with the usage line and runs nothing (2026-10-03: until then
   `--dry-run`, or any typo, ran the live pass — the GPU, the state file, maybe a page)."""
 import json, os, re, subprocess, sys, time
@@ -20,6 +21,24 @@ import server
 
 STATE = f"{HOME}/maintenance/state/sentinel.json"
 COOLDOWN = 24 * 3600
+# memo review-dedupe-pages (2026-10-05): the clientco outage of 10-03/10-04 paged David five times
+# for ONE stuck cycle (10-03 04:21, 10-04 01:20 in his protected hours, 06:20, ...) under three
+# job keys (factory-data-refresh, factory-cycle-retry, project:clientco-db) while its owner,
+# run_cycle.py, had already paged "ClientCo refresh FAILED - snapshot.py". A page now goes out only
+# when its CAUSE (project + failing script/job, digits stripped) is new: not paged by us in 6 h,
+# not already paged by its owner in 24 h, and -- inside 20:00-04:00Z -- not seen in the last 24 h.
+# Every drop is a log line and an entry in PAGED_STATE with its reason; nothing is silent.
+PAGED_STATE = f"{HOME}/maintenance/state/sentinel_paged.json"
+NOTIFY_LOG = f"{HOME}/maintenance/state/notifications.jsonl"
+CAUSE_REPAGE = 6 * 3600
+OWNER_WINDOW = 24 * 3600
+KNOWN_WINDOW = 24 * 3600
+PROTECTED = (20, 4)        # David's HBS hours, UTC: hour >= 20 or hour < 4
+SELF_TITLES = ("sentinel",)
+
+
+def _clock():
+    return int(time.time())
 # Authoritative state files — these OUTRANK log tails (day-1 lesson: a stale
 # "CYCLE CHECK FAIL" tail caused a false alarm while cycle_state.json said ok).
 # Catalog ids, not paths (box rule 8; the 2026-W39 catalog review found this the one hard-coded
@@ -126,6 +145,136 @@ def _rekey(issues, jobs, below=()):
     return out
 
 
+_SCRIPT = re.compile(r"\b([a-z_][a-z0-9_.-]*\.(?:py|sh|js))\b")
+_STOP = {"the", "a", "an", "is", "are", "was", "and", "or", "of", "in", "on", "for", "with", "to",
+         "after", "due", "job", "jobs", "its", "has", "have", "been", "status", "failed", "failing",
+         "fails", "failure", "error", "errors", "stuck", "since", "last", "run", "ran", "ago",
+         "expected", "every", "not", "from", "but"}
+
+
+def _proj_token(project):
+    return re.split(r"[\s-]+", project.lower().strip())[0]
+
+
+def _cause(issue, jobs):
+    """-> (cause key, project, what): the incident's identity, never its phrasing. Project is the
+    job's (or the one the summary names); what is the failing script if one is named (the
+    10-04 summaries named three different jobs but always snapshot.py), else the job, else the
+    summary's first content words with digits, dates and times stripped."""
+    text = str(issue.get("summary", "")).lower()
+    job = next((j for j in jobs if _job_key(j["desc"]) == issue.get("key")), None)
+    if job is not None:
+        project = job["project"]
+    else:
+        projects = sorted({j["project"] for j in jobs}, key=len, reverse=True)
+        project = next((p for p in projects
+                        if p.lower() in text or _proj_token(p) in text), "misc")
+    m = _SCRIPT.search(text)
+    if m:
+        what = re.sub(r"\d+", "", m.group(1))
+    elif job is not None:
+        what = _job_key(job["desc"])[4:]
+    else:
+        words = [w for w in re.findall(r"[a-z]+", re.sub(r"\d[\d:.\-tz]*", " ", text))
+                 if len(w) > 2 and w not in _STOP and w != _proj_token(project)]
+        what = "-".join(words[:4]) or "unknown"
+    project = project.lower()
+    return f"{project}:{what}", project, (m and m.group(1)) or (job and job["desc"]) or ""
+
+
+def _owner_rows(now, path=None):
+    """Critical pushes from anyone but the sentinel in the last OWNER_WINDOW."""
+    out = []
+    try:
+        with open(path or NOTIFY_LOG) as f:
+            for line in f:
+                if '"critical"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if (r.get("tier") == "critical" and r.get("pushed") is not False
+                        and 0 <= now - int(r.get("time", 0)) <= OWNER_WINDOW
+                        and not str(r.get("title", "")).lower().startswith(SELF_TITLES)):
+                    out.append(r)
+    except OSError:
+        pass
+    return out
+
+
+def _owner_paged(project, what, rows):
+    """The owner's own critical row naming the same cause: the script (or a job name of 8+
+    characters) as a whole word, and the project's first word. -> that row, or None."""
+    if not what or len(what) < 8 and not what.endswith((".py", ".sh", ".js")):
+        return None
+    pat = re.compile(r"(?<![\w.])" + re.escape(what.lower()) + r"(?![\w])")
+    tok = _proj_token(project)
+    for r in rows:
+        blob = f"{r.get('title', '')} {r.get('message', '')} {r.get('channel', '')}".lower()
+        if pat.search(blob) and tok in blob:
+            return r
+    return None
+
+
+_DOWN = re.compile(r"\bDOWN\b:?\s*([^\n]*)")
+
+
+def _down_paged(summary, rows):
+    """memo ask (c) "Health on :8001: one page per outage": healthcheck.sh's own critical
+    "Spark health" / "DOWN: ClientCoApp(:8001) ..." row is the owner's page for any finding that
+    names one of the DOWN services or its port (10-04 19:15 DOWN, 19:20 sentinel page). Ports stay
+    in this match even though the word key strips digits. A "Recovered"/UP row names no DOWN
+    service, so it never counts. -> (row, the service it matched) or (None, None)."""
+    text = str(summary or "")
+    for r in rows:
+        for seg in _DOWN.findall(f"{r.get('title', '')}\n{r.get('message', '')}"):
+            for tok in re.split(r"[\s,;]+", seg):
+                name = re.match(r"[A-Za-z][\w.-]*", tok)
+                port = re.search(r"\(:(\d+)\)", tok)
+                if name and len(name.group(0)) >= 4 and re.search(
+                        r"(?<![\w.-])" + re.escape(name.group(0)) + r"(?![\w-])", text, re.I):
+                    return r, tok
+                if port and re.search(r"(?:[:]|\bport\s*)" + port.group(1) + r"(?!\d)", text, re.I):
+                    return r, tok
+    return None, None
+
+
+def _night(now):
+    h = time.gmtime(now).tm_hour
+    return h >= PROTECTED[0] or h < PROTECTED[1]
+
+
+def _gate(fresh, jobs, now, pstate, owner_rows, seen_before):
+    """Split the issues about to page into (page, dropped). Order of reasons: the owner already
+    paged it, we paged this cause < 6 h ago, it is a known incident inside David's hours.
+    `seen_before` is the cause -> last-seen map as it stood BEFORE this run."""
+    page, dropped = [], []
+    for i in fresh:
+        cause, project, what = _cause(i, jobs)
+        i["cause"] = cause
+        reason = None
+        own = _owner_paged(project, what, owner_rows)
+        down = None
+        if own is None:
+            own, down = _down_paged(i.get("summary"), owner_rows)
+        last = pstate.get("paged", {}).get(cause, 0)
+        if own is not None:
+            reason = (f"owner-paged: {str(own.get('title', ''))[:60]!r}"
+                      f"{f' DOWN {down}' if down else ''} at "
+                      f"{time.strftime('%m-%d %H:%MZ', time.gmtime(int(own['time'])))}")
+        elif now - last < CAUSE_REPAGE:
+            reason = f"repeat: paged {(now - last) // 60} min ago"
+        elif _night(now) and now - seen_before.get(cause, 0) < KNOWN_WINDOW:
+            reason = (f"protected-hours: known since "
+                      f"{time.strftime('%m-%d %H:%MZ', time.gmtime(seen_before[cause]))}")
+        if reason:
+            dropped.append(dict(i, reason=reason))
+        else:
+            page.append(i)
+    return page, dropped
+
+
 def main():
     jobs = server.cron_jobs()
     # Exclude narrative local-AI jobs: their log tails are LLM prose (including THIS
@@ -195,7 +344,7 @@ def main():
         state = json.load(open(STATE))
     except Exception:
         pass
-    now = int(time.time())
+    now = _clock()
     fresh = [i for i in issues
              if isinstance(i, dict) and i.get("key")
              and now - state.get(i["key"], 0) > COOLDOWN]
@@ -213,10 +362,36 @@ def main():
                 i["recovered_at"] = at
                 back.append(i)
         fresh = [i for i in fresh if "recovered_at" not in i]
+    # Dedupe by CAUSE (memo review-dedupe-pages). Every issue the model raised this run is a
+    # sighting; the gate reads the sightings from BEFORE this run.
+    pstate = {}
+    try:
+        pstate = json.load(open(PAGED_STATE))
+    except Exception:
+        pass
+    seen = pstate.setdefault("seen", {})
+    seen_before = dict(seen)
+    fresh, dropped = _gate(fresh, jobs, now, pstate, _owner_rows(now), seen_before)
+    for i in issues:
+        seen[_cause(i, jobs)[0]] = now
     for i in fresh:
         state[i["key"]] = now
+        pstate.setdefault("paged", {})[i["cause"]] = now
+    log = pstate.setdefault("dropped", [])
+    for d in dropped:
+        log.append({"at": now, "cause": d["cause"], "key": d["key"], "reason": d["reason"],
+                    "summary": str(d.get("summary", ""))[:160]})
+        print(f"{time.strftime('%F %T', time.gmtime(now))} DROPPED page ({d['reason']}): "
+              f"{d['cause']} — {str(d.get('summary', ''))[:120]}")
+    pstate["dropped"] = log[-300:]
+    week = now - 7 * 86400
+    for k in ("seen", "paged"):
+        pstate[k] = {c: t for c, t in pstate.get(k, {}).items() if t >= week}
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     json.dump(state, open(STATE, "w"))
+    tmp = PAGED_STATE + ".tmp"
+    json.dump(pstate, open(tmp, "w"), indent=1)
+    os.replace(tmp, PAGED_STATE)
 
     if back:
         # "at most put it in the digest": held, never pushed; the 23:00 rollup's HELD line names it.
@@ -232,7 +407,8 @@ def main():
                         "Sentinel (local model)", msg], timeout=30)
         print(f"{time.strftime('%F %T')} ALERT: {msg}")
     elif not back:
-        print(f"{time.strftime('%F %T')} clear ({len(issues)} known/cooldown)")
+        print(f"{time.strftime('%F %T')} clear ({len(issues)} known/cooldown"
+              f"{f', {len(dropped)} page(s) dropped' if dropped else ''})")
 
 
 # ---------- selftest: `sentinel.py selftest` (back office runs it daily, rule guardrail-inert) ----
@@ -275,7 +451,8 @@ def _selftest(target=None):
         ("data-desk: a third failure in a row (3x) pages", desk(3), desk(3),
          desk_verdict, "job:same-day-filings", True, False),
     ]
-    saved = {k: getattr(t, k) for k in ("server", "ask_json", "subprocess", "STATE")}
+    saved = {k: getattr(t, k) for k in ("server", "ask_json", "subprocess", "STATE",
+                                         "PAGED_STATE", "NOTIFY_LOG", "_clock")}
     argv, bad = sys.argv, []
     head = '{\n "status": "degraded",\n "at": "2026-10-01T10:20:00Z",\n "worse": [\n  "embed:retrying"\n ],'
     for label, h, want in (("health head: retrying only", head, True),
@@ -294,6 +471,8 @@ def _selftest(target=None):
             t.ask_json = lambda *a, **k: json.loads(json.dumps(verdict))
             t.subprocess = types.SimpleNamespace(run=lambda cmd, **k: calls.append(cmd))
             t.STATE = os.path.join(tmp, f"sentinel{n}.json")
+            t.PAGED_STATE = os.path.join(tmp, f"paged{n}.json")
+            t.NOTIFY_LOG = os.path.join(tmp, "no-notifications.jsonl")
             sys.argv = ["sentinel.py"]
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -309,6 +488,7 @@ def _selftest(target=None):
             print(f"{'PASS' if good else 'FAIL'}  {name}: paged={paged} held={held} "
                   f"cooldown={stamped} (want paged={want_page})")
             bad += [] if good else [name]
+        bad += _selftest_dedupe(t, tmp, saved)
     for label, a, want in (("argv: the cron line, --dry, --dry-run and selftest are the modes",
                             ([], ["--dry"], ["--dry-run"], ["selftest"]), False),
                            ("argv: --selftest, --bogus, -n, selftest --dry, a bare word are errors (exit 2)",
@@ -318,6 +498,110 @@ def _selftest(target=None):
         bad += [] if good else [label]
     print("ALL PASS" if not bad else f"{len(bad)} FAIL")
     return not bad
+
+
+def _selftest_dedupe(t, tmp, saved):
+    """memo review-dedupe-pages: the 10-04 clientco pages, replayed. Summaries and the owner's title
+    are the real rows from state/notifications.jsonl (10-03 04:21 .. 10-05 06:21)."""
+    import calendar, contextlib, io, types
+    at = lambda s: calendar.timegm(time.strptime(s, "%Y-%m-%d %H:%M"))
+    fl = [{"project": "clientco-db", "desc": d, "log": "/replay/refresh.log", "schedule": c,
+           "expect_min": None, "age_min": 600, "last_run": at("2026-10-04 09:00"),
+           "tail": "CYCLE ABORTED in snapshot.py"}
+          for d, c in (("Factory data refresh", "0 4 3 * *"), ("Factory cycle retry", "0 9 * * *"))]
+    fl.append({"project": "Stocks", "desc": "Mcp sync", "log": "/replay/agent_sync.log",
+               "schedule": "*/15 14-19 * * 1-5", "expect_min": 15, "age_min": 5,
+               "last_run": at("2026-10-04 00:15"), "tail": "Errno -3 name resolution"})
+    stuck = "ClientCo monthly cycle (2026-10) is stuck in 'pending' status after 2 failed attempts due to snapshot.py crash."
+    retry = "Factory cycle retry job aborted with 'CYCLE ABORTED in snapshot.py'."
+    refresh = "ClientCo-db Factory data refresh and retry jobs are failing with 'CYCLE ABORTED in snapshot.py'."
+    dns = "MCP sync job failing with DNS resolution errors (Temporary failure in name resolution)"
+    owner = {"time": at("2026-10-03 08:20"), "channel": "alerts", "tier": "critical", "pushed": True,
+             "title": "ClientCo refresh FAILED - snapshot.py",
+             "message": "Attempt 2 for cycle 2026-10 died in snapshot.py."}
+    own_sentinel = dict(owner, title="Sentinel (local model)", message=refresh)
+    snap = "clientco-db:snapshot.py"
+    app = "ClientCoApp (:8001) is failing health checks (last ran 4m ago, expected every 15m)"
+    wiki = "ClientCoWiki (:8000) is failing health checks (last ran 4m ago, expected every 15m)"
+    down = {"time": at("2026-10-04 19:15"), "channel": "alerts", "tier": "critical", "pushed": True,
+            "title": "Spark health", "message": "DOWN: ClientCoApp(:8001)"}
+    cases = [  # (name, now, summary, paged state, notifications rows, page?, reason starts)
+        ("repeat of one cause within 6 h is dropped (10-05 05:20 after 03:20, another job key)",
+         at("2026-10-05 05:20"), retry, {"paged": {snap: at("2026-10-05 03:20")}}, [],
+         False, "repeat"),
+        ("the owner already paged it (10-04 06:20, run_cycle.py paged 10-03 08:20) is dropped",
+         at("2026-10-04 06:20"), stuck, {"paged": {snap: at("2026-10-03 04:21")}}, [owner],
+         False, "owner-paged"),
+        ("the sentinel's own past page is not an owner page", at("2026-10-04 12:20"), stuck,
+         {}, [own_sentinel], True, ""),
+        ("a known incident at 01:20Z is dropped (seen 10-03 23:20)", at("2026-10-04 01:20"), refresh,
+         {"seen": {snap: at("2026-10-03 23:20")}, "paged": {snap: at("2026-10-03 04:21")}}, [],
+         False, "protected-hours"),
+        ("a NEW incident at 01:20Z still pages", at("2026-10-04 01:20"), refresh, {}, [], True, ""),
+        ("a known incident at 01:20Z seen 25 h ago pages", at("2026-10-04 01:20"), refresh,
+         {"seen": {snap: at("2026-10-03 00:20")}}, [], True, ""),
+        ("a different cause pages beside a dropped one (6 h repeat of clientco)",
+         at("2026-10-05 05:20"), [retry, dns], {"paged": {snap: at("2026-10-05 03:20")}}, [owner],
+         True, "repeat"),
+        ("health :8001 (10-04 19:20): healthcheck's DOWN ClientCoApp(:8001) at 19:15 is the owner page",
+         at("2026-10-04 19:20"), app, {}, [down], False, "owner-paged"),
+        ("health: the same DOWN row, a finding about another service still pages",
+         at("2026-10-04 19:20"), wiki, {}, [down], True, ""),
+        ("health: a Recovered row is not an owner page", at("2026-10-04 19:20"), app, {},
+         [dict(down, message="Recovered — all checks green"),
+          dict(down, message="UP: ClientCoApp(:8001)")], True, ""),
+        ("health: a port-only finding (:8001) matches the DOWN row's port", at("2026-10-04 19:20"),
+         "Service on :8001 is not answering health checks", {}, [down], False, "owner-paged"),
+        ("past 6 h, the owner silent > 24 h, daytime: the same cause pages again",
+         at("2026-10-05 12:30"), stuck, {"paged": {snap: at("2026-10-05 06:21")}}, [owner], True, ""),
+    ]
+    bad = []
+    for n, (name, now, summ, pst, notes, want_page, want_reason) in enumerate(cases):
+        summs = summ if isinstance(summ, list) else [summ]
+        verdict = {"issues": [{"key": f"k{k}", "summary": x} for k, x in enumerate(summs)]}
+        calls = []
+        t.server = types.SimpleNamespace(
+            cron_jobs=lambda: fl,
+            watchdog=lambda: {"ok": True, "state": "", "last_check": time.time()})
+        t.ask_json = lambda *a, **k: json.loads(json.dumps(verdict))
+        t.subprocess = types.SimpleNamespace(run=lambda cmd, **k: calls.append(cmd))
+        t.STATE = os.path.join(tmp, f"dd{n}.json")
+        t.PAGED_STATE = os.path.join(tmp, f"ddpaged{n}.json")
+        json.dump(pst, open(t.PAGED_STATE, "w"))
+        t.NOTIFY_LOG = os.path.join(tmp, f"ddnotes{n}.jsonl")
+        with open(t.NOTIFY_LOG, "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in notes)
+        t._clock = lambda now=now: now
+        out = io.StringIO()
+        argv = sys.argv
+        sys.argv = ["sentinel.py"]
+        try:
+            with contextlib.redirect_stdout(out):
+                t.main()
+        finally:
+            sys.argv = argv
+            for k, v in saved.items():
+                setattr(t, k, v)
+        paged = [c for c in calls if "alerts" in c]
+        after = json.load(open(os.path.join(tmp, f"ddpaged{n}.json")))
+        drops = after.get("dropped", [])
+        reason_ok = (not want_reason or (drops and drops[-1]["reason"].startswith(want_reason)
+                                         and "DROPPED page (" + want_reason in out.getvalue()))
+        page_ok = bool(paged) == want_page
+        if want_page and want_reason:      # the mixed case: only the new cause is in the push
+            page_ok = page_ok and "DNS" in paged[0][-1] and "snapshot" not in paged[0][-1]
+        seen_ok = snap in after.get("seen", {}) if "snapshot" in " ".join(summs) else True
+        good = page_ok and reason_ok and seen_ok and (want_page or not want_reason or drops)
+        print(f"{'PASS' if good else 'FAIL'}  dedupe: {name}: paged={bool(paged)} "
+              f"dropped={drops[-1]['reason'] if drops else None}")
+        bad += [] if good else [name]
+    # the cause key is identity, not phrasing: the three 10-04 summaries are ONE cause
+    keys = {_cause(i, fl)[0] for i in _rekey([{"key": "x", "summary": x}
+                                            for x in (stuck, retry, refresh)], fl)}
+    good = keys == {snap}
+    print(f"{'PASS' if good else 'FAIL'}  dedupe: three phrasings, three job keys -> one cause {sorted(keys)}")
+    bad += [] if good else ["cause key"]
+    return bad
 
 
 USAGE = "usage: sentinel.py [--dry|--dry-run] | selftest | --help"

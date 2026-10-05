@@ -328,8 +328,14 @@ def decide_line(st):
 def _seat_name(s):
     """A lead's seat as David reads it: its project ('thesis', 'Mission Control', 'Stocks'), for
     every seat. The Stocks seat's own name is "Stocks PM · lead" (its lead is the PM), and the
-    count after it read "Stocks PM · lead 3", as if it were lead number 3 (2026-10-03)."""
-    return s.get("project_name") or s.get("project") or s.get("name") or str(s.get("id") or "")
+    count after it read "Stocks PM · lead 3", as if it were lead number 3 (2026-10-03). Since
+    2026-10-04 a seat's `name` IS its project's display name from config/projects.json identity
+    ("HBS", "Data Desk", "Pocket Tells"; David: "there should be a cleaner distinction between each
+    of the project lead UI's"), so it wins; the folder slug is only the fallback."""
+    n = str(s.get("name") or "")
+    if n and not re.search(r"(?:\bPM\s*·\s*)?\blead$|_lead$", n):   # an old-style "<x> lead" label never wins
+        return n
+    return s.get("project_name") or s.get("project") or n or str(s.get("id") or "")
 
 
 def _wrap(label, bits, width=78):
@@ -433,10 +439,27 @@ def _needs_item(status):
     ('**needs-david — keep the teal accent?** Item 1 …' -> 'keep the teal accent?'), else
     everything after the marker. None when there is no text."""
     raw = str(status or "")
-    m = re.search(r"\*\*\s*needs-david\b[\s—:–-]*(.+?)\*\*", raw, re.I)
+    # the class tag after the word (2026-10-04, `needs-david [public] — …`) is not part of the question
+    m = re.search(r"\*\*\s*needs-david\b\s*(?:\[[^\]]*\])?[\s—:–-]*(.+?)\*\*", raw, re.I)
     if not m:
-        m = re.search(r"needs-david\b[\s—:–-]*(.+)", re.sub(r"[*`]", "", raw), re.I)
+        m = re.search(r"needs-david\b\s*(?:\[[^\]]*\])?[\s—:–-]*(.+)", re.sub(r"[*`]", "", raw), re.I)
     return (m.group(1).strip() or None) if m else None
+
+
+def _is_davids(r):
+    """A needs-david ledger row that is David's under the 2026-10-04 gate: its Status STARTS with needs-david
+    (tt_now.parse_needs_david) and it is one of his seven classes (tt_decide.memo_tier: a class tag, target
+    stocks, a public push). An untagged row is team work: the memo pass decides it, so it never makes a
+    project "needs you". When the dashboard modules will not load, any needs-david row counts, as before."""
+    try:
+        if f"{MC}/dashboard" not in sys.path:
+            sys.path.insert(0, f"{MC}/dashboard")
+        import tt_now
+        import tt_decide
+    except Exception:
+        return "needs-david" in re.sub(r"[*_`]", "", str(r.get("status", ""))).lower()
+    nd = tt_now.parse_needs_david(r.get("status"))
+    return nd is not None and tt_decide.memo_tier(r.get("target"), nd)[0] == "david"
 
 
 def _outcome(e, wk, mine, needs, overdue, wd):
@@ -495,8 +518,7 @@ def leads_lines(now=None, rs=None, ros=None, rows=None, inst=None):
     for e in ros:
         slug = e["slug"]
         al = aliases(slug, e.get("dir") or slug)
-        nd = [r for r in rows if str(r.get("target", "")).lower() in al
-              and "needs-david" in re.sub(r"[*_`]", "", str(r.get("status", ""))).lower()]
+        nd = [r for r in rows if str(r.get("target", "")).lower() in al and _is_davids(r)]
         needs += [(r.get("date", ""), slug, _needs_item(r.get("status")) or r.get("memo", "?")) for r in nd]
         cfg = e.get("cfg") or {}
         pu = str(cfg.get("pilot_until") or "")
@@ -635,18 +657,25 @@ def _leads_selftest(check):
           {"ts": sun - 2 * day, "slug": "maintenance", "mode": "inbox", "state": "ok", "claude": True, "commits": 0},
           {"ts": sun - 20 * day, "slug": "poker", "mode": "weekly", "state": "ok", "claude": True, "commits": 9}]
     rows = [{"date": "2026-10-10", "memo": "first-draft", "target": "thesis",
-             "status": "**needs-david — pick the first draft** (two options in the memo)"},
+             "status": "**needs-david [taste] — pick the first draft** (two options in the memo)"},
             {"date": "2026-09-29", "memo": "teal", "target": "poker-appstore",
-             "status": "needs-david — keep the teal accent? Item 1 implemented"},
+             "status": "needs-david [taste] — keep the teal accent? Item 1 implemented"},
+            # untagged = team work since 2026-10-04: the memo pass decides it, hbs does not "need you"
+            {"date": "2026-10-10", "memo": "workbooks", "target": "hbs",
+             "status": "needs-david — who updates the text? (1) hbs_lead (2) leave it · if nothing: (1)"},
             {"date": "2026-10-11", "memo": "x", "target": "stocks", "status": "needs-david — not a lead project"},
             {"date": "2026-10-09", "memo": "y", "target": "poker", "status": "**verified 2026-10-09**"}]
     inst = {r["slug"]: sun - 15 * day for r in ros}
     got = leads_lines(sun, rs, ros, rows, inst)
     check("WEEK: counts the week (looked after, commits); needs-you is DECIDE's and LEADS' daily", got[0],
           "WEEK    4 looked after · 3 fixed in place")
-    check("LEADS: the question is the bolded span, else the text after the marker",
+    check("LEADS: the question is the bolded span, else the text after the marker (the class tag is not the question)",
           [_needs_item(rows[0]["status"]), _needs_item(rows[1]["status"]), _needs_item("needs-david")],
           ["pick the first draft", "keep the teal accent? Item 1 implemented", None])
+    check("WEEK: only a David-tier needs-david row (a class tag, Stocks, a public push) makes a project need him; an "
+          "untagged one is team work; a row that only mentions the word is none",
+          [_is_davids(r) for r in rows] + [_is_davids({"target": "poker", "status": "**verified** (was needs-david)"})],
+          [True, True, False, True, False, False])
     check("LEADS: in the pilot every lead project is named with its outcome", " · ".join(
         x.strip() for x in got[1:]).split(" · "),
           ["data-desk run failed", "hbs ran out of time", "maintenance memos handled", "poker nothing needed",
@@ -659,7 +688,7 @@ def _leads_selftest(check):
           " · ".join(x.strip() for x in got[1:]).split(" · "),
           ["data-desk run failed", "hbs ran out of time", "poker-appstore needs you", "thesis needs you"])
     clean = [r for r in rs if r["slug"] in ("thesis", "poker")]
-    got = leads_lines(sun, clean, [e for e in post if e["slug"] in ("thesis", "poker")], rows[2:], inst)
+    got = leads_lines(sun, clean, [e for e in post if e["slug"] in ("thesis", "poker")], rows[3:], inst)
     check("LEADS: a clean week after the pilot is one line", got,
           ["WEEK    2 looked after · 2 fixed in place"])
     ext = [dict(lead("stocks", None), state="external", kind="external", cfg={"kind": "external"})]

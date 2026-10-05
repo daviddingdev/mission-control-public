@@ -40,6 +40,28 @@ Design notes for whoever extends this:
     reorder within a tier and never across one.
   * A DEAD HOLDER CANNOT WEDGE IT. The lease carries a pid and a TTL; the next waiter
     reclaims it.
+  * BACKFILL IS BELOW EVERYTHING AND NEVER AGES (2026-10-04, the COO build; David: "the gpu
+    allocation is properly being divided based on priorities (and fully utilized)"). A process
+    started with SPARK_GPU_BACKFILL=1 (bin/gpu_backfill.py launches idle-time work that way)
+    takes the `backfill` tier (40, below maintenance's 30) unless a human is at the terminal,
+    and a backfill waiter gets no ageing bonus, so it can never tie real work however long it
+    waits: it only ever takes a slot nobody else wants. Nothing changes for any other caller.
+  * A JOB CAN DECLARE ITSELF BACKFILL (2026-10-05, the COO's GPU classes; David 2026-10-04: "other
+    leads should be encouraged to define the priority of their gpu jobs as backfil jobs or time
+    sensitive. the COO can manage all that scheduling through coded rules"). Each owner declares in
+    ~/<project>/.claude/gpu_jobs.json; bin/coo.py build compiles them into state/coo/gpu_classes.json
+    (catalog id maintenance/gpu_classes), and tier() reads that file, mtime-cached and fail-open: a
+    "<project>/<job>" (or "prefix*") of class `backfill` takes the backfill tier with no ageing, exactly
+    as SPARK_GPU_BACKFILL=1 does. time-sensitive and unclassified jobs keep today's tier, and a Stocks
+    entry is never applied while Stocks is closed (its tiers stay config/gpu.json's). A missing, corrupt
+    or half-written file changes nothing.
+  * THE EVENT LOG IS THE QUEUE'S RECORD (state/gpu/events.jsonl, catalog id
+    maintenance/gpu_events). `release` carries the tier; a `grant` is written when the wait was
+    over 1 s OR other waiters were in the field, and carries `others` and `others_min_tier`, so
+    a lower tier winning over a higher one is countable (an inversion is granted tier >
+    others_min_tier that `aged` does not explain). The file keeps the last EVENT_CAP lines,
+    trimmed once it passes EVENT_TRIM_BYTES: at ~13k calls/day that is three to four days, the
+    48 h the COO's GPU ledger needs with margin (it was 4000 lines, ~11 h, before 10-04).
 
 CLI:  gpu.py status | queue | events [n] | selftest
 """
@@ -64,13 +86,22 @@ HOLDER = os.path.join(DIR, "holder.json")
 LOCK = os.path.join(DIR, "lock")
 EVENTS = os.path.join(DIR, "events.jsonl")
 ANNOUNCE = os.path.join(DIR, "announce")
-EVENT_CAP = 4000
+# Kept: the last EVENT_CAP lines. A trim is considered on ~2% of writes but only reads the file
+# once it is past EVENT_TRIM_BYTES (a stat, not a read, on every other try), so a trim happens
+# about once a day and the record always holds 60k-80k lines: >= 48 h at 25k events/day.
+EVENT_CAP = 60000
+EVENT_TRIM_BYTES = 10_000_000
+STATUS_TAIL_BYTES = 2_000_000      # status() reads this much of the tail: ~16k events, about a day
+BACKFILL_TIER = 40                 # when config/gpu.json predates the backfill tier
+CLASSES = os.path.join(MC, "state/coo/gpu_classes.json")   # coo.py build compiles it daily
+CLASS_PREFIX_MIN = 3               # a "prefix*" shorter than this is ignored (coo.py drops it too)
 
 DEFAULTS = {
     "slots": 1, "lease_ttl_s": 1800, "wait_timeout_s": 2700, "age_step_s": 120,
     "max_age_bonus": 25, "affinity_bonus": 5, "poll_s": 0.4, "keep_alive": "30m",
-    "tiers": {"interactive": 0, "Stocks": 10, "maintenance": 30}, "default_tier": 20,
-    "announce_pushes": True, "announce_min_gap_s": 600,
+    "tiers": {"interactive": 0, "Stocks": 10, "maintenance": 30, "backfill": BACKFILL_TIER},
+    "default_tier": 20, "announce_pushes": True, "announce_min_gap_s": 600,
+    "box_target_hours_per_day": 20,
 }
 _cfg_cache = {"mt": 0, "v": None}
 
@@ -127,15 +158,77 @@ def _interactive():
         return False
 
 
-def tier(proj=None, job=None, interactive=None):
+def backfill_tier():
+    return cfg().get("tiers", {}).get("backfill", BACKFILL_TIER)
+
+
+def _backfill_env():
+    return os.environ.get("SPARK_GPU_BACKFILL") == "1"
+
+
+_cls_cache = {"key": None, "exact": frozenset(), "prefix": ()}
+
+
+def _load_classes():
+    """(exact {"<project>/<job>"}, prefix ((project, prefix), ...)) of the declared-backfill jobs, re-read
+    only when the file's mtime or size changes. Fail-open: no file, bad JSON or a wrong shape -> empty,
+    so every caller keeps its config/gpu.json tier. Stocks entries are skipped (Stocks is closed)."""
+    try:
+        st = os.stat(CLASSES)
+    except OSError:
+        _cls_cache.update(key=None, exact=frozenset(), prefix=())
+        return _cls_cache["exact"], _cls_cache["prefix"]
+    key = (CLASSES, st.st_mtime_ns, st.st_size)
+    if _cls_cache["key"] != key:
+        exact, prefix = set(), []
+        try:
+            with open(CLASSES) as f:
+                jobs = json.load(f).get("jobs") or {}
+            for k, e in jobs.items():
+                if not isinstance(e, dict) or e.get("class") != "backfill" or e.get("applied") is False:
+                    continue
+                gp = str(e.get("gpu_project") or str(k).split("/", 1)[0])
+                label = str(e.get("label") or str(k).split("/", 1)[-1])
+                if gp.lower() == "stocks" or str(e.get("project") or "").lower() == "stocks" or not label:
+                    continue
+                if label.endswith("*"):
+                    if len(label) - 1 >= CLASS_PREFIX_MIN:
+                        prefix.append((gp, label[:-1]))
+                else:
+                    exact.add(f"{gp}/{label}")
+        except Exception:
+            exact, prefix = set(), []
+        _cls_cache.update(key=key, exact=frozenset(exact), prefix=tuple(prefix))
+    return _cls_cache["exact"], _cls_cache["prefix"]
+
+
+def declared_backfill(proj, job):
+    """True when the owner declared this job `backfill` in its .claude/gpu_jobs.json (compiled by coo.py).
+    Never for Stocks; never raises."""
+    try:
+        if not proj or not job or str(proj).lower() == "stocks":
+            return False
+        exact, prefix = _load_classes()
+        return f"{proj}/{job}" in exact or any(proj == p and job.startswith(x) for p, x in prefix)
+    except Exception:
+        return False
+
+
+def tier(proj=None, job=None, interactive=None, backfill=None):
     """Tier for this caller. A "<project>/<job>" key wins over the bare project, so one
     job can be ranked apart from its siblings — the Bench is Stocks work, but it is
     5 hours of opportunistic background reading and must not outrank a market-hours job
-    from the same project."""
+    from the same project. A process launched as idle-time backfill (SPARK_GPU_BACKFILL=1)
+    is the backfill tier whatever its project — unless a human is at the terminal. So is a job its
+    owner declared `backfill` (state/coo/gpu_classes.json; never a Stocks job)."""
     c = cfg()
     if interactive if interactive is not None else _interactive():
         return c["tiers"].get("interactive", 0)
+    if backfill if backfill is not None else _backfill_env():
+        return backfill_tier()
     proj = proj or project()
+    if declared_backfill(proj, job):
+        return backfill_tier()
     if job and f"{proj}/{job}" in c["tiers"]:
         return c["tiers"][f"{proj}/{job}"]
     return c["tiers"].get(proj, c["default_tier"])
@@ -194,11 +287,50 @@ def event(ev, **kw):
         with open(EVENTS, "a") as f:
             f.write(json.dumps({"at": int(time.time()), "ev": ev, **kw}) + "\n")
         if random.random() < 0.02:          # amortised trim; the file is a rolling record
-            lines = open(EVENTS).readlines()
-            if len(lines) > EVENT_CAP:
-                open(EVENTS, "w").writelines(lines[-EVENT_CAP:])
+            _trim_events()
     except Exception:
         pass
+
+
+def _trim_events(path=None, cap=None, trigger_bytes=None):
+    """Keep the last `cap` lines once the file is past `trigger_bytes`. Written to a temp file
+    and swapped in (an appender racing the swap loses at most its one line; the old in-place
+    rewrite could interleave a concurrent append into the middle of the file)."""
+    path, cap = path or EVENTS, cap or EVENT_CAP
+    if os.path.getsize(path) <= (trigger_bytes or EVENT_TRIM_BYTES):
+        return False
+    with open(path, errors="replace") as f:
+        lines = f.readlines()
+    if len(lines) <= cap:
+        return False
+    tmp = f"{path}.{os.getpid()}.trim"
+    with open(tmp, "w") as f:
+        f.writelines(lines[-cap:])
+    os.replace(tmp, path)
+    return True
+
+
+def tail_events(nbytes=STATUS_TAIL_BYTES, path=None):
+    """The newest events, reading at most `nbytes` from the end (the first partial line is
+    dropped). Read-only; [] when there is no log."""
+    try:
+        with open(path or EVENTS, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            buf = f.read()
+    except OSError:
+        return []
+    lines = buf.decode(errors="replace").splitlines()
+    if size > nbytes and lines:
+        lines = lines[1:]
+    out = []
+    for l in lines:
+        try:
+            out.append(json.loads(l))
+        except Exception:
+            continue
+    return out
 
 
 _ps = {"at": 0.0, "models": []}
@@ -228,7 +360,9 @@ def _base():
 
 # ---------------------------------------------------------------- scheduling
 
-def _waiters():
+def _waiters(clean=True):
+    """The live waiters. clean=False is the read-only form (a sampler or a status page): a
+    dead waiter's file is skipped, not deleted."""
     out = []
     try:
         for name in os.listdir(WAITERS):
@@ -236,8 +370,9 @@ def _waiters():
             if not w:
                 continue
             if not _alive(w.get("pid", -1)):     # crashed before it got its turn
-                with contextlib.suppress(OSError):
-                    os.unlink(os.path.join(WAITERS, name))
+                if clean:
+                    with contextlib.suppress(OSError):
+                        os.unlink(os.path.join(WAITERS, name))
                 continue
             out.append(w)
     except FileNotFoundError:
@@ -245,22 +380,40 @@ def _waiters():
     return out
 
 
-def score(w, now, resident):
-    """Lower wins. tier − ageing − affinity. The affinity bonus is capped below one tier
-    gap on purpose: it may reorder equals, never overtake a more important project."""
+def is_backfill(w):
+    """A backfill waiter: flagged by slot(), or any tier number at or past backfill's (40+)."""
+    return bool(w.get("backfill")) or w.get("tier", cfg()["default_tier"]) >= backfill_tier()
+
+
+def aged(w, now):
+    """Ageing points this waiter has earned. Backfill earns none: it must never tie real work."""
     c = cfg()
+    if is_backfill(w):
+        return 0
     age = max(0, now - w.get("since", now))
-    aged = min(c["max_age_bonus"], int(age // max(1, c["age_step_s"])))
+    return min(c["max_age_bonus"], int(age // max(1, c["age_step_s"])))
+
+
+def score(w, now, resident):
+    """Lower wins. tier − ageing − affinity (backfill: tier − affinity). The affinity bonus is
+    capped below one tier gap on purpose: it may reorder equals, never overtake a more
+    important project."""
+    c = cfg()
     aff = c["affinity_bonus"] if w.get("model") and w["model"] in resident else 0
-    return w.get("tier", c["default_tier"]) - aged - aff
+    return w.get("tier", c["default_tier"]) - aged(w, now) - aff
 
 
 def _holder_valid(h, now):
     return bool(h) and _alive(h.get("pid", -1)) and h.get("expires", 0) > now
 
 
-def _try_admit(me):
+def _try_admit(me, seen=None):
+    """True when `me` now holds the slot. `seen`, when given, is filled with the tiers of the
+    OTHER live waiters in the field this decision was made against (the grant event's
+    others / others_min_tier)."""
     now = time.time()
+    if seen is not None:
+        seen["others"] = []
     h = _read(HOLDER)
     if _holder_valid(h, now):
         return h.get("id") == me["id"]
@@ -274,6 +427,9 @@ def _try_admit(me):
     best = min(field, key=lambda w: (score(w, now, resident), w.get("since", 0)))
     if best["id"] != me["id"]:
         return False
+    if seen is not None:
+        seen["others"] = [w.get("tier", cfg()["default_tier"]) for w in field if w.get("id") != me["id"]]
+        seen["aged"] = aged(me, now)
     _write_atomic(HOLDER, {**me, "acquired": now, "expires": now + cfg()["lease_ttl_s"]})
     return True
 
@@ -361,28 +517,33 @@ def slot(job=None, model=None, proj=None, timeout=None):
     me, held, t0 = None, False, time.time()
     t_grant = t0   # updated when the slot is actually granted; separates wait from hold
     g = Grant(t0)
+    seen = {}
     try:
         _ensure()
         me = {"id": uuid.uuid4().hex[:12], "pid": os.getpid(), "since": t0,
               "project": proj or project() or "?", "job": job or os.path.basename(sys.argv[0]),
               "model": model}
         me["tier"] = tier(me["project"], me["job"])
+        if me["tier"] == backfill_tier() and (_backfill_env() or declared_backfill(me["project"], me["job"])):
+            me["backfill"] = True                # no ageing (score); the holder shows it too
         _write_atomic(_waiter_path(me["id"]), me)
         deadline = t0 + (timeout or c["wait_timeout_s"])
         while time.time() < deadline:
             with _locked():
-                if _try_admit(me):
+                if _try_admit(me, seen):
                     held = True
                     t_grant = time.time()
                     break
             time.sleep(c["poll_s"] * (1 + random.random() * 0.5))
         wait_s = round(t_grant - t0, 1)
         if held:
-            if wait_s > 1:
+            others = seen.get("others") or []
+            if wait_s > 1 or others:
                 event("grant", project=me["project"], job=me["job"], wait_s=wait_s,
-                      tier=me["tier"], model=model)
+                      tier=me["tier"], model=model, others=len(others),
+                      others_min_tier=min(others) if others else None, aged=seen.get("aged", 0))
         else:
-            event("bypass", project=me["project"], job=me["job"],
+            event("bypass", project=me["project"], job=me["job"], tier=me["tier"],
                   wait_s=round(time.time() - t0, 1), reason="wait timeout")
     except Exception as e:                       # never let the scheduler break the work
         event("bypass", job=job or "?", reason=f"{type(e).__name__}: {e}"[:120])
@@ -406,7 +567,7 @@ def slot(job=None, model=None, proj=None, timeout=None):
                             with contextlib.suppress(OSError):
                                 os.unlink(HOLDER)
                     event("release", project=me["project"], job=me["job"],
-                          held_s=round(time.time() - t_grant, 1), model=model)
+                          held_s=round(time.time() - t_grant, 1), model=model, tier=me["tier"])
 
 
 def should_yield(proj=None, job=None):
@@ -477,15 +638,13 @@ def status():
     h = _read(HOLDER)
     if not _holder_valid(h, now):
         h = None
-    field = sorted(_waiters(), key=lambda w: score(w, now, loaded_models()))
-    ev = []
-    try:
-        with open(EVENTS) as f:
-            ev = [json.loads(l) for l in f.readlines()[-600:] if l.strip()]
-    except Exception:
-        pass
+    field = sorted(_waiters(clean=False), key=lambda w: score(w, now, loaded_models()))  # read-only
+    ev = tail_events()
     day = now - 86400
     recent = [e for e in ev if e.get("at", 0) > day]
+    # the window these numbers really cover: 24 h, or less when the tail read (or the log
+    # itself) starts later. It used to say "24h" over the last 600 lines, ~6 h (2026-10-04).
+    window_s = int(now - max(day, min((e.get("at", now) for e in ev), default=now)))
     by = {}
     # every call logs a `release`; only a call that actually queued logs a `grant`. Count
     # calls from releases and average the wait over the contended ones, or an idle-box run
@@ -517,11 +676,15 @@ def status():
                    "waiting_s": round(now - w["since"], 1),
                    "score": score(w, now, loaded_models())} for w in field],
         "resident": loaded_models(),
-        "day": {"by_project": by,
+        "day": {"by_project": by, "window_s": window_s, "window": _window_label(window_s),
                 "bypasses": len([e for e in recent if e["ev"] == "bypass"]),
                 "reclaims": len([e for e in recent if e["ev"] == "reclaim"])},
         "tiers": cfg()["tiers"], "slots": cfg()["slots"],
     }
+
+
+def _window_label(window_s):
+    return "24h" if window_s >= 86400 - 60 else f"{window_s / 3600:.1f}h"
 
 
 def _cli(argv):
@@ -534,7 +697,7 @@ def _cli(argv):
         for w in s["queue"]:
             print(f"   {w['score']:>3}  {w['project']:<14} {w['job']:<28} {w['waiting_s']:>6.1f}s")
         print(f"resident: {', '.join(s['resident']) or 'none'}")
-        print("last 24h:")
+        print(f"last {s['day']['window']}:")
         for p, b in sorted(s["day"]["by_project"].items(), key=lambda x: -x[1]["calls"]):
             avg = b["wait_s"] / b["contended"] if b["contended"] else 0
             print(f"   {p:<14} {b['calls']:>4} calls · gpu {b['held_s'] / 60:>6.1f} min · "
@@ -567,9 +730,11 @@ def _selftest():
     the winner is the one the doctrine says it should be."""
     c = cfg()
     now = time.time()
-    def w(proj, age=0, model=None, t=None):
+    def w(proj, age=0, model=None, t=None, bf=False):
         return {"id": proj + str(age), "project": proj, "job": "t", "since": now - age,
-                "model": model, "tier": t if t is not None else c["tiers"].get(proj, c["default_tier"])}
+                "model": model, "tier": t if t is not None else c["tiers"].get(proj, c["default_tier"]),
+                **({"backfill": True} if bf else {})}
+    BF = backfill_tier()
     def winner(field, resident=()):
         return min(field, key=lambda x: (score(x, now, resident), x["since"]))["project"]
     cases = [
@@ -596,6 +761,17 @@ def _selftest():
         ("desk:search outranks the Bench",
          [w("bench", t=c["tiers"].get("Stocks/the Bench", 15)),
           w("search", t=c["tiers"].get("data-desk/desk:search", 20))], (), "search"),
+        # backfill (2026-10-04): below everything, and it never ages
+        ("a waiting tier-10 beats an aged backfill",
+         [w("Stocks"), w("bf", age=10 * 3600, t=BF, bf=True)], (), "Stocks"),
+        ("an aged backfill never ties maintenance",
+         [w("bf", age=10 * 3600, t=BF, bf=True), w("maintenance")], (), "maintenance"),
+        ("nor with affinity on its side",
+         [w("bf", age=10 * 3600, model="a", t=BF, bf=True), w("maintenance", model="b")], ("a",),
+         "maintenance"),
+        ("an unflagged tier-40 waiter does not age either",
+         [w("bf", age=10 * 3600, t=BF), w("maintenance")], (), "maintenance"),
+        ("backfill takes an empty field", [w("bf", t=BF, bf=True)], (), "bf"),
     ]
     bad = 0
     for name, field, resident, want in cases:
@@ -663,9 +839,161 @@ def _selftest():
         ok = got == want
         bad += not ok
         print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
-    total = len(cases) + len(announce_cases) + len(zombie_cases) + len(meter_cases)
+    backfill_cases = _selftest_backfill(c, now, cpid)
+    for name, got, want in backfill_cases:
+        ok = got == want
+        bad += not ok
+        print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
+    class_cases = _selftest_classes(c, now)
+    for name, got, want in class_cases:
+        ok = got == want
+        bad += not ok
+        print(f"  {'ok ' if ok else 'FAIL'} {name:<42} -> {got}")
+    total = (len(cases) + len(announce_cases) + len(zombie_cases) + len(meter_cases) + len(backfill_cases)
+             + len(class_cases))
     print(f"{total - bad}/{total} passed")
     return bad
+
+
+def _selftest_backfill(c, now, dead_pid):
+    """The 2026-10-04 additions: the backfill tier, no ageing for it, the grant's
+    others_min_tier, release tier, the read-only waiter scan, the trim and the status window.
+    One real slot is taken against a scratch state dir (never state/gpu), with the announce
+    push and the ollama /api/ps lookup stubbed, so nothing leaves the process."""
+    import shutil
+    import tempfile
+    global DIR, WAITERS, HOLDER, LOCK, EVENTS, ANNOUNCE, _announce
+    BF = backfill_tier()
+    out = [
+        ("SPARK_GPU_BACKFILL -> the backfill tier",
+         tier("data-desk", "desk:shift", interactive=False, backfill=True), BF),
+        ("backfill tier is below maintenance", BF > c["tiers"].get("maintenance", 30), True),
+        ("a human at the terminal still outranks it",
+         tier("data-desk", "desk:shift", interactive=True, backfill=True), c["tiers"].get("interactive", 0)),
+        ("no env, no change for any caller",
+         tier("Stocks", "x", interactive=False, backfill=False), c["tiers"].get("Stocks", 10)),
+        ("a backfill waiter earns no ageing",
+         aged({"tier": BF, "backfill": True, "since": now - 36000}, now), 0),
+        ("a tier-30 waiter still ages",
+         aged({"tier": 30, "since": now - 36000}, now), c["max_age_bonus"]),
+        ("the status label says the window it read", (_window_label(86400), _window_label(23040)),
+         ("24h", "6.4h")),
+    ]
+    saved = (DIR, WAITERS, HOLDER, LOCK, EVENTS, ANNOUNCE, _announce, dict(_ps))
+    d = tempfile.mkdtemp(prefix="gpu-selftest-")
+    try:
+        DIR, WAITERS = d, os.path.join(d, "waiters")
+        HOLDER, LOCK = os.path.join(d, "holder.json"), os.path.join(d, "lock")
+        EVENTS, ANNOUNCE = os.path.join(d, "events.jsonl"), os.path.join(d, "announce")
+        _announce = lambda me: None
+        _ps.update(at=time.time() + 3600, models=[])
+        _ensure()
+        _write_atomic(_waiter_path("other30"), {"id": "other30", "pid": os.getpid(), "since": now,
+                                                "project": "maintenance", "job": "o", "tier": 30})
+        with slot(job="selftest", proj="Stocks", timeout=5) as g1:
+            pass
+        os.unlink(_waiter_path("other30"))
+        with slot(job="selftest-alone", proj="Stocks", timeout=5):
+            pass
+        ev = [json.loads(l) for l in open(EVENTS) if l.strip()]
+        grants = [e for e in ev if e["ev"] == "grant"]
+        rels = [e for e in ev if e["ev"] == "release"]
+        out += [
+            ("a grant with others waiting is logged", (g1.held, len(grants), grants[0].get("job") if grants else None),
+             (True, 1, "selftest")),
+            ("and carries others_min_tier",
+             (grants[0].get("others"), grants[0].get("others_min_tier")) if grants else None, (1, 30)),
+            ("an uncontended fast grant stays unlogged", any(e.get("job") == "selftest-alone" for e in grants), False),
+            ("release carries the tier", [("tier" in e) for e in rels], [True, True]),
+        ]
+        _write_atomic(_waiter_path("dead"), {"id": "dead", "pid": dead_pid, "since": now, "tier": 20})
+        kept = os.path.exists(_waiter_path("dead")) and not _waiters(clean=False) \
+            and os.path.exists(_waiter_path("dead"))
+        _waiters()
+        out += [("read-only scan skips a dead waiter, keeps its file", kept, True),
+                ("the admitting scan still clears it", os.path.exists(_waiter_path("dead")), False)]
+        with open(EVENTS, "w") as f:
+            f.writelines(json.dumps({"at": i, "ev": "release"}) + "\n" for i in range(50))
+        small = _trim_events(EVENTS, cap=10, trigger_bytes=10 ** 6)
+        big = _trim_events(EVENTS, cap=10, trigger_bytes=100)
+        rows = [json.loads(l)["at"] for l in open(EVENTS)]
+        tail = [e["at"] for e in tail_events(64, EVENTS)]
+        out += [("trim waits for the byte trigger", small, False),
+                ("then keeps the newest cap lines", (big, rows[0], rows[-1], len(rows)), (True, 40, 49, 10)),
+                ("tail read drops its partial first line", bool(tail) and tail[-1] == 49 and tail[0] > 40, True)]
+    finally:
+        DIR, WAITERS, HOLDER, LOCK, EVENTS, ANNOUNCE, _announce = saved[:7]
+        _ps.clear()
+        _ps.update(saved[7])
+        shutil.rmtree(d, ignore_errors=True)
+    return out
+
+
+def _selftest_classes(c, now):
+    """The declared classes (2026-10-05) against a temp gpu_classes.json, never the live one: a declared
+    backfill job takes the backfill tier and earns no ageing, a prefix matches, time-sensitive and
+    unclassified keep their tier, a Stocks entry is ignored, and a missing or corrupt file changes nothing."""
+    import shutil
+    import tempfile
+    global CLASSES
+    BF = backfill_tier()
+    m30 = c["tiers"].get("maintenance", 30)
+    bench = c["tiers"].get("Stocks/the Bench", c["tiers"].get("Stocks", 10))
+    saved, cache = CLASSES, dict(_cls_cache)
+    d = tempfile.mkdtemp(prefix="gpu-classes-selftest-")
+    T = lambda p, j: tier(p, j, interactive=False, backfill=False)  # noqa: E731
+    try:
+        CLASSES = os.path.join(d, "gpu_classes.json")
+        out = [("no classes file -> tiers unchanged", (T("maintenance", "model watch"), T("Stocks", "the Bench")),
+                (m30, bench))]
+        doc = {"jobs": {
+            "maintenance/model watch": {"project": "maintenance", "gpu_project": "maintenance",
+                                        "label": "model watch", "class": "backfill", "applied": True},
+            "maintenance/sentinel.py": {"project": "maintenance", "gpu_project": "maintenance",
+                                        "label": "sentinel.py", "class": "time-sensitive", "applied": True},
+            "hbs/hbs-extract-*": {"project": "hbs", "gpu_project": "hbs", "label": "hbs-extract-*",
+                                  "class": "backfill", "applied": True},
+            "hbs/x*": {"project": "hbs", "gpu_project": "hbs", "label": "x*", "class": "backfill"},
+            "Stocks/the Bench": {"project": "stocks", "gpu_project": "Stocks", "label": "the Bench",
+                                 "class": "backfill", "applied": True},
+            "Stocks/grunt:qoq": {"project": "stocks", "gpu_project": "Stocks", "label": "grunt:qoq",
+                                 "class": "backfill"}}}
+        with open(CLASSES, "w") as f:
+            json.dump(doc, f)
+        t_bf = T("maintenance", "model watch")
+        out += [
+            ("declared backfill -> the backfill tier", t_bf, BF),
+            ("and earns no ageing however long it waits", aged({"tier": t_bf, "since": now - 36000}, now), 0),
+            ("so maintenance work still beats it",
+             min([{"id": "a", "project": "bf", "tier": t_bf, "since": now - 36000},
+                  {"id": "b", "project": "maintenance", "tier": m30, "since": now}],
+                 key=lambda x: (score(x, now, ()), x["since"]))["project"], "maintenance"),
+            ("a prefix* entry matches a per-run label", T("hbs", "hbs-extract-netflix"), BF),
+            ("a too-short prefix is ignored", T("hbs", "xyz"), c["tiers"].get("hbs", c["default_tier"])),
+            ("time-sensitive keeps its tier", T("maintenance", "sentinel.py"), m30),
+            ("unclassified keeps its tier", T("maintenance", "daily log"), m30),
+            ("a Stocks backfill entry is ignored", (T("Stocks", "the Bench"), T("Stocks", "grunt:qoq")),
+             (bench, c["tiers"].get("Stocks", 10))),
+            ("a human at the terminal still outranks it",
+             tier("maintenance", "model watch", interactive=True, backfill=False), c["tiers"].get("interactive", 0)),
+            ("same label, another project: no match", T("poker", "model watch"), c["tiers"].get("poker", c["default_tier"])),
+        ]
+        with open(CLASSES, "w") as f:
+            f.write('{"jobs": {"maintenance/model watch": ')      # half-written / corrupt
+        os.utime(CLASSES, ns=(time.time_ns(), time.time_ns() + 10 ** 9))
+        out.append(("corrupt file -> tiers unchanged (fail-open)", T("maintenance", "model watch"), m30))
+        with open(CLASSES, "w") as f:
+            json.dump({"jobs": ["not", "a", "dict"]}, f)
+        out.append(("wrong shape -> tiers unchanged", T("maintenance", "model watch"), m30))
+        os.unlink(CLASSES)
+        out.append(("file removed -> tiers unchanged", T("maintenance", "model watch"), m30))
+    finally:
+        CLASSES = saved
+        _cls_cache.clear()
+        _cls_cache.update(cache)
+        _cls_cache["key"] = None                 # re-read the live file on the next call
+        shutil.rmtree(d, ignore_errors=True)
+    return out
 
 
 if __name__ == "__main__":

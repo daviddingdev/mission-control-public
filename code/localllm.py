@@ -54,13 +54,15 @@ def _meter(g, t0, t_body, t_end):
 
 
 def ask(prompt, model=None, num_predict=400, temperature=None, timeout=900,
-        force_json=False, job=None, think=None, num_ctx=None, system=None):
+        force_json=False, job=None, think=None, num_ctx=None, system=None, images=None):
     """One local-model call. Sampling defaults come from the registry's per-role `options`
     (models.json: temperature, think, num_ctx) so the box can change them in one place;
     an explicit argument wins. `think` on a reasoning model (qwen3.*) is a real quality
     lever for adjudication/extraction and a real cost (seconds) for bulk reads — callers
     choose per prompt. `num_ctx` is sent EXPLICITLY: the server happens to be sized at
-    256K today, but an unrequested window is a default that can change under us."""
+    256K today, but an unrequested window is a default that can change under us.
+    `images` (2026-10-04): paths of PNG/JPEG files sent with the prompt, for the dense role's vision
+    (qwen3.8 read a printed article page in ~17 s; text stays the cheaper read when there is text)."""
     model = model or _model()
     opts = models.options(ROLE)
     if think is None:
@@ -71,8 +73,11 @@ def ask(prompt, model=None, num_predict=400, temperature=None, timeout=900,
         num_ctx = opts.get("num_ctx")
     if think:
         num_predict = num_predict + THINK_HEADROOM
-    messages = ([{"role": "system", "content": system}] if system else []) + \
-               [{"role": "user", "content": prompt}]
+    user = {"role": "user", "content": prompt}
+    if images:
+        import base64
+        user["images"] = [base64.b64encode(open(p, "rb").read()).decode() for p in images]
+    messages = ([{"role": "system", "content": system}] if system else []) + [user]
     body = {"model": model, "messages": messages,
             "think": bool(think), "stream": False, "keep_alive": gpu.cfg()["keep_alive"],
             "options": {"num_predict": num_predict, "temperature": temperature}}

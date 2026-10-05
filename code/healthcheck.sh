@@ -321,6 +321,11 @@ chk 8900 MissionControl
 chk 8910 HBSCasework
 # :8911 is the tailscale serve HTTPS front for :8910 — David's Home Screen icon (memo from hbs, 2026-09-29)
 chkts 8911 HBSCaseworkHTTPS
+# The Spark browser (2026-10-04, bin/browser.py): Chrome's DevTools and the web viewer, both loopback;
+# :8912 is the viewer's tailnet HTTPS front. :5999 (VNC) is not HTTP; the viewer answering covers it.
+chk 9222 SparkBrowser
+chk 6080 SparkBrowserView
+chkts 8912 SparkBrowserHTTPS
 chk 8790 JustinDesk localhost 403
 chk 19999 Netdata
 curl -sf -m 5 -o /dev/null "http://127.0.0.1:11434/api/tags" || FAIL+=("ollama(:11434)")   # local AI is production now (sentinel/digest/scoring depend on it)

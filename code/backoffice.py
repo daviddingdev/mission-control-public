@@ -141,8 +141,13 @@ def save(path, obj, indent=1):
 
 def _cron_lines():
     """Parsed crontab. Keeps the preceding comment — it's the job's name in the registry."""
+    return _parse_cron(sh(["crontab", "-l"]))
+
+
+def _parse_cron(text):
+    """_cron_lines()'s parser over any crontab text (rule 44 parses fleet-stop's saved lines with it)."""
     out, comment = [], ""
-    for raw in sh(["crontab", "-l"]).splitlines():
+    for raw in (text or "").splitlines():
         line = raw.strip()
         if not line:
             continue
@@ -1010,13 +1015,25 @@ ARMED_CHECKS = (
      "titles": ("the data catalog did not compile — every catalog rule is off",
                 "catalog selftest fails — a data-catalog rule no longer fires")},
     {"id": "dashboard", "control": "dashboard tab tests + check.py", "layer": "detective",
-     "standard": "—", "check": "`node test_*_tab.js` · `dashboard/check.py`",
+     "standard": "—", "check": "`node test_*_tab.js` (every one on disk, as check.py finds them) · "
+                               "`dashboard/check.py`",
      "requires": ("dashboard/test_overview_tab.js", "dashboard/test_claude_tab.js",
                   "dashboard/test_catalog_tab.js", "dashboard/check.py"),
-     "titles": ("dashboard {} tab test fails", "a dashboard check is failing")},
+     "titles": ("dashboard {} tab test fails", "a dashboard check is failing",
+                "some dashboard tab tests did not run (time budget)")},
     {"id": "deadunits", "control": "dead-unit rule", "layer": "detective",
      "standard": "—", "check": "`deadunits.py selftest`", "requires": ("bin/deadunits.py",),
      "titles": ("deadunits selftest fails — the dead-unit rule no longer fires",)},
+    {"id": "lead-identity", "control": "lead identity (every lead its own name, role, hue and emblem; a new project "
+                                       "is assigned one)", "layer": "detective", "standard": "§5 Day-1",
+     "check": "`identity.py selftest` (the assignment fixtures, and the live config/projects.json: no shared hue or "
+              "emblem, no project without one) · `tt_team.py selftest` pins the same against the page",
+     "requires": ("bin/identity.py", "config/projects.json"),
+     "titles": ("identity selftest fails — two leads could share a hue or an emblem, or a project has none",)},
+    {"id": "browser-selftest", "control": "the Spark browser's pacing, caps and sign-in reads", "layer": "preventive",
+     "standard": "—", "check": "`browser.py selftest --pure` (fixtures only: no Chrome, no site visited)",
+     "requires": ("bin/browser.py",),
+     "titles": ("browser.py selftest fails — the Spark browser's pacing, caps or sign-in reads may not hold",)},
     {"id": "crew-namer", "control": "the crew namer (one name per agent everywhere)", "layer": "detective",
      "standard": "—", "check": "`tt_crew.py selftest` (resolver, tools-rule and badge fixtures) · every live job, scripts too, claimed once",
      "requires": ("dashboard/tt_crew.py", "config/crew.json"),
@@ -1313,6 +1330,96 @@ def _owner_findings(f, things, status_rows, agents):
     return miss
 
 
+# THE LEAD-PROJECT LAYOUT (2026-10-04, David: "we need a separate folder for data desk and its own
+# claude md etc. any project with a lead should follow this structure"; PROJECT_STANDARDS §5). Rule
+# lead-structure walks every project whose lead runs under lead.py (rule 25's `lead.py status` rows,
+# state ok or invalid; a lead in its own harness, kind external — Stocks' PM — is lead.py's EXTERNAL
+# declaration and is not walked) and files ONE low finding per project listing what its folder lacks.
+# fix="human": file_memos() files high findings only, so a memo fix here would send nothing; the
+# project's lead sees the finding in its weekly packet (lead.py findings_section).
+_PLACEHOLDER_DESC = re.compile(r"^\s*\(auto-added", re.I)
+
+
+def _worktrees_ignored(root):
+    """True when `.claude/worktrees/` is git-ignored in `root` (git's own answer, so a whitelist
+    .gitignore counts); no git or git unsure -> a plain read of .gitignore."""
+    if os.path.isdir(os.path.join(root, ".git")):
+        try:
+            r = subprocess.run(["git", "-C", root, "check-ignore", "-q", "--no-index", ".claude/worktrees/probe"],
+                               capture_output=True, timeout=10)
+            if r.returncode in (0, 1):
+                return r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        with open(os.path.join(root, ".gitignore")) as fh:
+            lines = {ln.strip().lstrip("/").rstrip("/") for ln in fh}
+    except OSError:
+        return False
+    return bool(lines & {".claude/worktrees", ".claude", ".claude/*", ".claude/worktrees/*"})
+
+
+def _lead_layout_gaps(root, dirname, lead, projects_cfg):
+    """What one lead project's folder lacks, [] when the layout is whole."""
+    slug, gaps = dirname.lower(), []
+    if not os.path.isdir(os.path.join(root, ".git")):
+        gaps.append("not a git repo")
+    try:
+        with open(os.path.join(root, "CLAUDE.md"), errors="replace") as fh:
+            cm = fh.read()
+    except OSError:
+        cm = None
+    if cm is None:
+        gaps.append("no CLAUDE.md")
+    elif not re.search(r"^##\s+Project lead\b", cm, re.M | re.I):
+        gaps.append("CLAUDE.md has no '## Project lead' section")
+    cat = "config/catalog.json" if slug == "maintenance" else "catalog.json"
+    for rel, what in (("README.md", "no README.md"), ("ARCHITECTURE.md", "no ARCHITECTURE.md at the root"),
+                      (f".claude/agents/{lead}.md", f"no .claude/agents/{lead}.md (the charter)"),
+                      (".claude/lead.json", "no .claude/lead.json"), (".claude/lead-memory.md", "no .claude/lead-memory.md"),
+                      (cat, f"no {cat} (box rule 8)")):
+        if not os.path.exists(os.path.join(root, *rel.split("/"))):
+            gaps.append(what)
+    if not _worktrees_ignored(root):
+        gaps.append(".gitignore does not cover .claude/worktrees/")
+    row = None
+    for k, v in ((projects_cfg or {}).get("projects") or {}).items():
+        if isinstance(v, dict) and (k.lower() == slug or slug in [str(m).lower() for m in v.get("match") or []]):
+            row = v
+            break
+    desc = str((row or {}).get("desc") or "").strip()
+    if row is None:
+        gaps.append("no row in config/projects.json")
+    elif not desc or desc.lower() in (slug, dirname.lower()) or _PLACEHOLDER_DESC.match(desc):
+        gaps.append(f"config/projects.json desc is a placeholder ({desc or 'empty'!s})")
+    return gaps
+
+
+def _lead_structure_findings(f, status_rows, projects_cfg, home=None):
+    """lead-structure over `lead.py status --json` rows. -> {slug: gaps} for the projects with any."""
+    home = home or HOME
+    out = {}
+    for r in status_rows or []:
+        if r.get("kind") == "external" or r.get("state") not in ("ok", "invalid"):
+            continue
+        name = r.get("dir") or r.get("slug") or ""
+        slug = (r.get("slug") or name).lower()
+        root = os.path.join(home, name)
+        if not name or not os.path.isdir(root):
+            continue
+        gaps = _lead_layout_gaps(root, name, r.get("lead") or slug.replace("-", "_") + "_lead", projects_cfg)
+        if not gaps:
+            continue
+        out[slug] = gaps
+        _finding(f, "lead-structure", "low", f"{name} does not follow the lead-project layout",
+                 "PROJECT_STANDARDS §5, the lead-project layout (David 2026-10-04: \"any project with a lead "
+                 "should follow this structure\"). Missing: " + "; ".join(gaps) + ". The project's lead owns "
+                 "the fix (it sees this in its weekly packet); Mission Control's own config/projects.json row "
+                 "is MC's to set. An accepted deviation is muted in config/backoffice_mute.json with its reason.",
+                 name, fix="human", key=slug)
+    return out
+
+
 def _sto_queue_jobs(path=None, days=30):
     """[(job name, kind)] that started in the box Claude queue in the last `days` days."""
     cut, seen = time.time() - days * 86400, {}
@@ -1542,6 +1649,385 @@ def _backup_tamper_finding(f, problems):
                  project="maintenance", key=rel)
 
 
+# ---------------------------------------------------------------- rules 37-41 (2026-10-05)
+# Pure helpers: each takes what it reads as data (or a path), so the selftest drives them on fixtures.
+
+def _iso_ts(s):
+    """An ISO-8601 UTC stamp ('...Z' or '+00:00') or epoch number -> epoch seconds, else None."""
+    if isinstance(s, (int, float)) and not isinstance(s, bool):
+        return float(s)
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _browser_signin_findings(f, state, sites_cfg):
+    """Rule browser-signin (memo browser-signin-needs-attention ask 1): a site the Spark browser was
+    signed in to once (`signed_in_once`) that `browser.py daily` now reads as logged_out or
+    challenge. A registered site David never signed in to stays silent."""
+    sites = (state or {}).get("sites") or {}
+    cfg = (sites_cfg or {}).get("sites") or {}
+    for site, s in sorted(sites.items()):
+        if not isinstance(s, dict) or s.get("signed_in_once") is not True:
+            continue
+        st = s.get("state")
+        if st not in ("logged_out", "challenge"):
+            continue
+        label = (cfg.get(site) or {}).get("label") or site
+        what = "a bot check (challenge)" if st == "challenge" else "signed out"
+        _finding(f, "browser-signin", "med", f"the Spark browser is signed out of {label}",
+                 f"{label} ({site}) reads {what} since {s.get('since') or '?'} (probe: {s.get('detail') or '?'}, "
+                 f"checked {s.get('checked_at') or '?'}). Every read of it fails until David signs in again at "
+                 "https://<host>.<tailnet>.ts.net:8912 (the browser's desktop). If the site is no longer "
+                 "wanted, drop it from config/browser_sites.json and the check stops.",
+                 project="maintenance", key=site)
+
+
+def _dash_check_finding(f, d, now_ts=None, days=7):
+    """Rule dashboard-check-red (memo wa-attention-kpi-leftovers): serve.sh's post-restart
+    check.py run (state/dash_check.json) came back red within `days`. Missing file -> quiet."""
+    if not isinstance(d, dict) or d.get("ok") is not False:
+        return
+    at = _iso_ts(d.get("at")) or _iso_ts(d.get("ts"))
+    now_ts = now_ts or time.time()
+    if not at or now_ts - at > days * 86400:
+        return
+    summ = d.get("summary") or [f"FAIL {x}" for x in d.get("items") or []]
+    heads = [str(x) for x in summ if not str(x).startswith("FAIL - ")] or [str(x) for x in summ]
+    _finding(f, "dashboard-check-red", "med",
+             "the dashboard check after the last restart is red",
+             f"serve.sh ran dashboard/check.py at {d.get('at') or '?'} ({d.get('trigger') or 'restart'}, rc "
+             f"{d.get('rc')}, {d.get('duration_s', '?')} s) and it failed: " + "; ".join(heads)[:300]
+             + ". Details: " + " | ".join(str(x) for x in summ)[:600]
+             + ". Re-run `python3 ~/maintenance/dashboard/check.py`; logs/dash_check.log has the full run.",
+             project="maintenance", key="dash-check")
+
+
+def _push_undelivered_finding(f, path, now_ts=None, mins=30):
+    """Rule push-undelivered (memo wa-alerts-and-boot slice 3): healthcheck.sh's delivery spool
+    (state/alerts_pending, one JSON line {ts, title, ...} per undelivered push) holds a push older
+    than `mins`. The watchdog retries it every 15 min and drops it after 24 h."""
+    now_ts = now_ts or time.time()
+    old = [r for r in _jsonl_rows(path)
+           if isinstance(r.get("ts"), (int, float)) and now_ts - r["ts"] > mins * 60]
+    if not old:
+        return
+    first = min(old, key=lambda r: r["ts"])
+    age = int((now_ts - first["ts"]) // 60)
+    _finding(f, "push-undelivered", "high", "a critical push has not reached David's phone",
+             f"{len(old)} push(es) in state/alerts_pending have waited over {mins} min; the oldest, "
+             f"\"{str(first.get('title') or '?')[:80]}\", for {age} min (first tried {dt_from(first['ts'])}Z). "
+             "healthcheck.sh retries the spool every 15 min and drops a line after 24 h, so ntfy.sh has been "
+             "unreachable or refusing since. Check the uplink and `tail ~/maintenance/logs/healthcheck.log`.",
+             project="maintenance", key="spool")
+
+
+GUARD_LEDGERS = (("broker", "guard_broker.jsonl", "high"), ("lead", "guard_lead.jsonl", "low"),
+                 ("claude", "guard_claude.jsonl", "high"))
+
+
+def _guard_denials(rows, now_ts=None, hours=24):
+    """The DENY rows of one guard ledger in the last `hours` (broker/lead: verdict, ts; the claude
+    spawn guard: mode, time — every row there is a firing, `mode` deny is a refusal)."""
+    now_ts = now_ts or time.time()
+    out = []
+    for r in rows or ():
+        ts = r.get("ts", r.get("time"))
+        if not isinstance(ts, (int, float)) or now_ts - ts > hours * 3600:
+            continue
+        if (r.get("verdict") or r.get("mode")) == "deny":
+            out.append(r)
+    return sorted(out, key=lambda r: r.get("ts", r.get("time")))
+
+
+def _guard_deny_findings(f, by_ledger, now_ts=None):
+    """Rule guard-deny (memo wa-security-detection slice 3): any refusal in the last 24 h, one
+    finding per ledger. A lead denied by hook-guard-lead is the guard working as designed (med);
+    a broker or bare-claude refusal is an unattended session reaching for something it must not
+    (high). No command or excerpt is carried: who, which tool, the guard's first reason."""
+    for name, fname, sev in GUARD_LEDGERS:
+        den = _guard_denials(by_ledger.get(name), now_ts)
+        if not den:
+            continue
+        last = den[-1]
+        who = last.get("lead") or last.get("who") or last.get("class") or "a session"
+        tool = last.get("tool") or ("Bash" if name == "claude" else "?")
+        why = last.get("reason")
+        why = (why[0] if isinstance(why, list) and why else why) or (
+            "a bare `claude -p` spawn" if name == "claude" else "")
+        why = _scrub_secrets(str(why)[:160])
+        _finding(f, "guard-deny", sev, f"the {name} guard refused {len(den)} action(s) in 24 h",
+                 f"state/{fname}: {len(den)} denial(s) since {dt_from(den[0].get('ts', den[0].get('time')))}Z. "
+                 f"Latest {dt_from(last.get('ts', last.get('time')))}Z: session "
+                 f"{str(last.get('session') or '?')[:8]}, {who}, tool {tool}"
+                 + (f", because {why}" if why else "") + ". "
+                 + ("A lead stopped at its fence is the guard working; read the ledger for a lead that keeps "
+                    "trying the same thing (it should file a proposal patch or a memo instead)."
+                    if name == "lead" else
+                    "An unattended session tried something only David (or the Stocks PM) may do: read the "
+                    "session's transcript and docs/INCIDENTS.md before anything else."),
+                 project="maintenance", key=name)
+
+
+def _restore_unproven_finding(f, rows, now_ts=None, days=30, sources=None):
+    """Rule restore-unproven (memo wa-restore-and-rebuild): the newest green `backup.py drill` row
+    (state/restore_drills.jsonl) is older than `days`, or there is none. The pass does NOT run the drill
+    itself (slice 4/4, 2026-10-05: a drill writes the ledger and reports/restore-drill-<month>.md outside
+    its temp dir, and an hbs archive is ~700 MB to extract and sample, past a 5-minute bound); the detail
+    names the exact command for the source drilled least recently (`sources`: config/backups.json's)."""
+    now_ts = now_ts or time.time()
+    green = [t for t in (_iso_ts(r.get("ts")) for r in rows or () if r.get("ok") is True) if t]
+    if green and now_ts - max(green) <= days * 86400:
+        return
+    when = f"the newest is from {dt_from(max(green))}Z" if green else "none is recorded"
+    nxt = _drill_next(rows, sources) if sources else None
+    cmd = (f"`python3 ~/maintenance/bin/backup.py drill {nxt}` (the source drilled least recently; "
+           "`backup.py drill` with no source does them all)") if nxt else "`python3 ~/maintenance/bin/backup.py drill`"
+    _finding(f, "restore-unproven", "med", f"no green restore drill in {days} days",
+             f"A backup is proven only by a restore. state/restore_drills.jsonl: {when}. Run "
+             f"{cmd}: it extracts into a 0700 temp dir under /tmp, checksums against live, and removes it; nothing "
+             "is restored over anything. `--dry` first shows the size. Then read reports/restore-drill-<month>.md.",
+             project="maintenance", key="drill")
+
+
+def _manifest_stale_finding(f, root, now_ts=None, days=2):
+    """Rule manifest-stale (memo wa-restore-and-rebuild): the newest ~/backups/manifest/<YYYY-MM-DD>/
+    (real directories only, as manifest.py writes them) is older than `days`, or there is none."""
+    now_ts = now_ts or time.time()
+    try:
+        names = [n for n in os.listdir(root) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", n)
+                 and os.path.isdir(os.path.join(root, n)) and not os.path.islink(os.path.join(root, n))]
+    except OSError:
+        names = []
+    newest = max(names) if names else None
+    t = _iso_ts(newest + "T00:00:00+00:00") if newest else None
+    if t and now_ts - t <= (days + 1) * 86400:       # a day folder covers that whole UTC day
+        return
+    _finding(f, "manifest-stale", "med", "the nightly rebuild manifest is stale",
+             f"{root}: " + (f"the newest day folder is {newest}" if newest else "no day folder")
+             + f" (want one within {days} days). bin/manifest.py runs from `backup.py run` each night and "
+               "never pages on its own; `python3 ~/maintenance/bin/manifest.py write --dry` shows what it would "
+               "write, and logs/backup.log has its last `manifest:` line.",
+             project="maintenance", key="manifest")
+
+
+def _ledger_order_finding(f, path):
+    """Rule ledger-order (memo review-ledger-hygiene slice 2): ~/memos/LEDGER.md is newest-first, and
+    every writer goes through bin/ledger_rows.py prepend. A row dated newer than the row above it is a
+    writer that appended (or a hand edit): ONE low finding with the count and the first offender.
+    A missing or unreadable ledger is quiet (other rules own the bus)."""
+    import ledger_rows
+    try:
+        with open(path, errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    bad = ledger_rows.out_of_order(lines)
+    if not bad:
+        return
+    i, d, prev, memo = bad[0]
+    _finding(f, "ledger-order", "low", "the memo ledger has rows out of date order",
+             f"{path}: {len(bad)} row(s) dated newer than the row above them; the first is line {i} "
+             f"({d} {memo}, under a {prev} row). The ledger is newest-first and every writer prepends through "
+             "bin/ledger_rows.py; a row like this came from a writer that appends or a hand edit. "
+             "`python3 ~/maintenance/bin/ledger_rows.py check` lists them; move each up to its date.",
+             project="maintenance", key="ledger")
+
+
+# ---------------------------------------------------------------- rules 44-45 (2026-10-05)
+# 44 fleet-stop-engaged (memo wa-security-detection slice 4/4): while `paused.py fleet-stop` is engaged the
+# Claude cron lines it commented out are paused on purpose, not broken. The job-shaped findings about those
+# jobs are held, and ONE finding says since when and why. 45 backup-stray (memo wa-backups-integrity slice
+# 4/4): a file or folder in the top two levels of ~/backups that no writer declares. Both pure on fixtures.
+FLEET_SUPPRESS_KINDS = {"job-silent", "log-missing", "registry-orphan", "registry-missing", "registry-false-claim",
+                        "weight-missing", "name-missing", "owner-missing", "crew-unclaimed", "queue-starved",
+                        "lead-overdue", "schedule-blocker", "claude-protected-window"}
+FLEET_GENERIC = {"claudeq.py", "claude-headless", "stream_filter.py", "notify.sh"}
+
+
+def _fleet_state():
+    """paused.fleet_state() (PAUSED_FLEET_STATE moves the file): the engaged state dict, or None."""
+    import paused
+    return paused.fleet_state()
+
+
+def _fleet_stop_tokens(st, live_scripts=()):
+    """What names a paused job in a finding: each `--job "<name>"` of the saved lines, and each script
+    they run that no live cron line still runs (a script shared with a live line names that line too)."""
+    toks = set()
+    for j in _parse_cron("\n".join(st.get("lines") or [])):
+        toks |= {x for x in j["scripts"] if x not in FLEET_GENERIC and x not in set(live_scripts)}
+        toks |= set(re.findall(r"""--job\s+["']([^"']+)["']""", j["cmd"]))
+    return {t for t in toks if len(t) >= 4}
+
+
+def _fleet_stop_apply(f, st, live_scripts=()):
+    """-> the findings to keep. Not engaged: `f` unchanged. Engaged: drop the FLEET_SUPPRESS_KINDS
+    findings that name a paused job, and add one high fleet-stop-engaged (quiet: David engaged it)."""
+    if not st or not st.get("engaged_at"):
+        return f
+    toks = _fleet_stop_tokens(st, live_scripts)
+    keep, held = [], []
+    for x in f:
+        blob = " ".join(str(x.get(k, "")) for k in ("title", "detail", "key"))
+        (held if x.get("kind") in FLEET_SUPPRESS_KINDS and any(t in blob for t in toks) else keep).append(x)
+    n = len(st.get("lines") or [])
+    _finding(keep, "fleet-stop-engaged", "high", "fleet-stop is engaged: the scheduled Claude jobs are paused",
+             f"Since {st['engaged_at']}: {st.get('reason') or 'no reason given'}. {n} Claude cron line(s) carry "
+             f"`# PAUSED fleet-stop` ({', '.join(sorted(toks))[:300] or 'no named jobs'}); "
+             f"{len(held)} finding(s) about those jobs are held while it is engaged "
+             f"({', '.join(sorted({x['kind'] for x in held})) or 'none today'}). Lines that start Claude inside "
+             "their own code (lead.py, memo-process, Stocks' loop.py/ops.py, `claudeq.py tick`) still run: "
+             "`python3 ~/maintenance/bin/paused.py fleet-stop --dry` lists them. Release is David's incident action: "
+             "`python3 ~/maintenance/bin/paused.py fleet-stop release --yes`.",
+             project="maintenance", key="fleet-stop")
+    return keep
+
+
+BACKUP_STRAY_SINCE = "2026-10-05T00:00:00Z"   # the baseline: anything older predates the rule
+BACKUP_FIXED = ("manifest", "incident", "crontab", "stocks-worktrees", "family-vault")   # contents not judged
+BACKUP_FILES = ("README.md",)
+
+
+def _backup_written(src, name):
+    """A name backup.py writes in a source folder: `<src>_<date>.tar.gz`, its two sidecars, or a
+    dot-prefixed atomic temp (`_write_atomic`)."""
+    base = re.escape(src) + r"_\d{4}-\d{2}-\d{2}\.tar\.gz(?:\.sha256|\.manifest\.json)?"
+    return bool(re.fullmatch(base, name) or re.fullmatch(r"\." + base + r"\.tmp", name))
+
+
+def _backup_stray(broot, sources, since_ts=None):
+    """Rule backup-stray's core: the relative paths at the top two levels of `broot` that no writer
+    declares and that are newer than the baseline. Declared: each source folder in config/backups.json
+    (lowercased, as backup.py's dest_dir does; a delegated source's folder is opaque, its writer is
+    someone else), BACKUP_FIXED folders (opaque: manifest.py, paused.py's incident/, hand copies) and
+    BACKUP_FILES. Inside a backup.py source folder only _backup_written names. Stat only, no hashing."""
+    since_ts = _iso_ts(BACKUP_STRAY_SINCE) if since_ts is None else since_ts
+    srcs = {str(n).lower(): (s or {}) for n, s in (sources or {}).items()}
+
+    def new(p):
+        try:
+            return os.lstat(p).st_mtime >= since_ts
+        except OSError:
+            return False
+    out = []
+    try:
+        top = sorted(os.listdir(broot))
+    except OSError:
+        return out
+    for e in top:
+        p = os.path.join(broot, e)
+        real_dir = os.path.isdir(p) and not os.path.islink(p)
+        if e in BACKUP_FILES and os.path.isfile(p):
+            continue
+        if real_dir and (e in BACKUP_FIXED or (e in srcs and srcs[e].get("delegated_to"))):
+            continue
+        if real_dir and e in srcs:
+            for g in sorted(os.listdir(p)):
+                q = os.path.join(p, g)
+                if os.path.isfile(q) and not os.path.islink(q) and _backup_written(e, g):
+                    continue
+                if new(q):
+                    out.append(f"{e}/{g}")
+            continue
+        if new(p):
+            out.append(e)
+    return out
+
+
+def _backup_stray_finding(f, stray, limit=10):
+    if not stray:
+        return
+    _finding(f, "backup-stray", "med", f"{len(stray)} undeclared item(s) in ~/backups",
+             "Nothing in config/backups.json, the fixed folders (" + ", ".join(BACKUP_FIXED) + ") or "
+             "README.md accounts for: " + ", ".join(stray[:limit])
+             + (f" and {len(stray) - limit} more" if len(stray) > limit else "")
+             + f". Older entries (before {BACKUP_STRAY_SINCE[:10]}) are the baseline. ~/backups is written only "
+             "by bin/backup.py, Stocks' backup.sh, manifest.py and paused.py; a file outside them is a hand copy, a "
+             "new writer that skipped config/backups.json, or tampering. Declare it, move it out, or mute with the reason.",
+             project="maintenance", key="backup-stray")
+
+
+def _drill_next(rows, sources):
+    """Round-robin: the non-delegated source drilled least recently (never drilled first, config order)."""
+    last = {}
+    for r in rows or ():
+        t = _iso_ts(r.get("ts")) if isinstance(r, dict) else None
+        if t and r.get("source") and r.get("ok") is not None:
+            last[r["source"]] = max(t, last.get(r["source"], 0))
+    cands = [n for n, s in (sources or {}).items() if not (s or {}).get("delegated_to")]
+    return min(cands, key=lambda n: (last.get(n, 0), cands.index(n))) if cands else None
+
+
+# ---------------------------------------------------------------- weight-drift (rule 43)
+# Memo wa-cost-attribution slice 3/4 (2026-10-05): the daily pass trues config/job_weights.json up from
+# measured runs (bin/weight_drift.py, imported: measure + apply_rows + _write), ONCE a UTC day
+# (state/weight_drift_applied.json), and commits the file by path. Rows with 1-2 measured runs are not
+# rewritten (n < MIN_N); when one is more than half off its declared figure it is a low, quiet finding.
+WEIGHT_DRIFT_STAMP = os.path.join(STATE, "weight_drift_applied.json")
+WEIGHT_DRIFT_OFF = 0.5
+
+
+def _weight_drift_findings(f, rows, min_n=3):
+    """rows: weight_drift.measure() rows. One low finding listing the n < min_n rows > 50% off."""
+    off = []
+    for r in rows:
+        dec, med, n = r.get("declared"), r.get("median"), r.get("n") or 0
+        if not (0 < n < min_n) or not dec or not med:
+            continue
+        if abs(med - dec) > WEIGHT_DRIFT_OFF * dec:
+            off.append(f"{r['match']}: declared {dec // 1000:,}k, measured {med // 1000:,}k (n={n})")
+    if not off:
+        return
+    _finding(f, "weight-drift", "low",
+             f"{len(off)} job weight(s) more than half off their measured runs, too few runs to rewrite",
+             "bin/weight_drift.py rewrites a weight only at n >= 3 measured runs in 30 days; these have 1-2 and "
+             "differ from config/job_weights.json by more than 50%: " + "; ".join(off)
+             + ". Nothing to do unless the figure is plainly wrong: the daily pass rewrites each row on its "
+               "third run. `python3 ~/maintenance/bin/weight_drift.py show` has the table.",
+             project="maintenance", key="weights")
+
+
+def weight_drift_pass(dry=False, live=None, weights=None, stamp=None, today=None, commit=None):
+    """-> (line, findings). `live` (tests) returns (doc, rows) like weight_drift._live without unattr.
+    Applies at most once per UTC day, never on --dry; a failure is a line, never an exception."""
+    import weight_drift as wd
+    weights = weights or wd.WEIGHTS
+    stamp = stamp or WEIGHT_DRIFT_STAMP
+    today = today or f"{datetime.now(timezone.utc):%Y-%m-%d}"
+    f = []
+    try:
+        if live:
+            doc, rows = live()
+        else:
+            doc, rows, _u, _n = wd._live(time.time())
+    except Exception as e:
+        return f"weight drift could not measure: {type(e).__name__}: {str(e)[:160]}", f
+    _weight_drift_findings(f, rows, wd.MIN_N)
+    if dry:
+        n = sum(1 for r in rows if r.get("action") in ("rewrite", "add"))
+        return f"weight drift: {n} row(s) measurable (dry: nothing written)", f
+    if (load(stamp, {}) or {}).get("day") == today:
+        return "", f
+    try:
+        ch = wd.apply_rows(doc, rows, today)
+        ch = [c for c in ch if c[1] != c[2]]          # a row already at its median is not a change
+        if ch:
+            wd._write(doc, weights)
+        save(stamp, {"day": today, "changes": [list(c) for c in ch]})
+    except Exception as e:
+        return f"weight drift apply failed: {type(e).__name__}: {str(e)[:160]}", f
+    if not ch:
+        return "weight drift: no weight moved", f
+    rel = os.path.relpath(weights, MC)
+    sha = (commit or _commit)([rel], f"weights: {len(ch)} row(s) trued up from measured runs (backoffice daily "
+                                     "pass, bin/weight_drift.py; memo wa-cost-attribution slice 3/4)\n\n"
+                              + "\n".join(f"{m}: {old} -> {new} (n={k})" for m, old, new, k in ch))
+    return (f"weight drift: {len(ch)} row(s) rewritten in {rel}"
+            + (f", {sha}" if sha else ", not committed")), f
+
+
 # Finding kinds that are filed (Needs attention, findings.json) but never by themselves make the
 # pass push: a slow signal David reads on the page, not on his phone.
 # ---------------------------------------------------------------- argv-unsafe (rule 34)
@@ -1549,11 +2035,21 @@ def _backup_tamper_finding(f, problems):
 # is exit 2, never the live job") carried to every project. STATIC ONLY: each script is parsed with ast
 # and never imported or run. Heuristics lean to missing some rather than flagging a fixed script: a
 # dispatch with an exit-2 branch, argparse parse_args, or an argv-checking helper counts as guarded.
-ARGV_DIRS = ("bin", "scripts")
+# Scope (2026-10-05, memo review-argv-scan-scope): every *.py under the project with a `__main__` block,
+# not only bin/ and scripts/ (Stocks keeps runnable scripts in _engine/, hbs in pipeline folders). Pruned:
+# hidden dirs, vendored/generated trees by name (_ARGV_SKIP), and whatever the project's own .gitignore
+# ignores (one `git check-ignore --stdin` per project, over the candidates only). Declared data_roots are
+# NOT pruned: Stocks declares a code folder (_engine/sources) as one, and a data file is not a .py, so
+# walking them costs a directory listing. Bounded: ARGV_MAX_ENTRIES walked, ARGV_MAX_PY read, ARGV_MAX_BYTES each.
 ARGV_OPT_OUT = "# argv: data"
 ARGV_CAP = 15
 ARGV_ASKED = os.path.join(STATE, "argv_asked.json")   # project -> the argv-unsafe memo filed and the list it named
-_ARGV_SKIP = {"__pycache__", "node_modules", ".venv", "venv", "site-packages", ".git"}
+_ARGV_SKIP = {"__pycache__", "node_modules", ".venv", "venv", "env", "site-packages", "dist-packages", ".git",
+              "dist", "build", "worktrees", "backups", "vendor", "third_party", "data", "logs", "cache",
+              "tmp", "out", "output", "htmlcov", "egg-info"}
+ARGV_MAX_ENTRIES = 200_000     # directory entries walked per project
+ARGV_MAX_PY = 4000             # .py files read per project
+ARGV_MAX_BYTES = 512 * 1024    # a bigger .py is generated, not a script someone runs by hand
 _ARGV_HELPER = re.compile(r"(parse|check|valid|error|guard).*argv|argv.*(error|check|valid|guard)", re.I)
 _ARGV_HARMLESS = {"print", "exit", "quit", "_exit", "SystemExit", "usage", "_usage", "print_usage", "print_help",
                   "write", "strip", "splitlines", "split", "join", "format", "lower", "upper", "dumps", "get"}
@@ -1702,26 +2198,73 @@ def _argv_scan_source(src):
     return sorted(set(hits))
 
 
-def argv_scan(home=None, projects=None):
-    """-> {project: [(relpath, line, why)]} over bin/ and scripts/ of every project in the roster."""
+def _argv_gitignored(root, rels):
+    """-> the subset of `rels` (paths relative to `root`) the project's git ignores. Empty when root is
+    not a work tree or git fails: a missing check never hides a script."""
+    if not rels or not os.path.exists(os.path.join(root, ".git")):
+        return set()
+    try:
+        r = subprocess.run(["git", "-C", root, "check-ignore", "--stdin"], input="\n".join(rels) + "\n",
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return set()
+    return set(r.stdout.splitlines()) if r.returncode in (0, 1) else set()
+
+
+def _argv_candidates(root, stats=None):
+    """-> sorted relpaths of the project's runnable scripts: *.py with a `__main__` and an `argv` in the
+    source, under `root`, pruned and bounded as above. `stats` (a dict) gets walked/read/capped counts."""
+    walked = read = 0
+    capped = ""
+    cands = []
+    for dp, dns, fns in os.walk(root):
+        dns[:] = sorted(x for x in dns if x not in _ARGV_SKIP and not x.startswith(".")
+                        and not x.endswith(".egg-info"))
+        walked += len(dns) + len(fns)
+        if walked > ARGV_MAX_ENTRIES:
+            capped = f"walked {ARGV_MAX_ENTRIES} entries"
+            break
+        for fn in sorted(fns):
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dp, fn)
+            try:
+                if os.path.islink(p) or os.path.getsize(p) > ARGV_MAX_BYTES:
+                    continue
+                if read >= ARGV_MAX_PY:
+                    capped = f"read {ARGV_MAX_PY} .py files"
+                    break
+                read += 1
+                src = open(p, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            if "__main__" in src and "argv" in src:
+                cands.append(os.path.relpath(p, root))
+        if capped:
+            break
+    ign = _argv_gitignored(root, cands)
+    if stats is not None:
+        stats.update(walked=walked, read=read, candidates=len(cands), ignored=len(ign), capped=capped)
+    return sorted(c for c in cands if c not in ign)
+
+
+def argv_scan(home=None, projects=None, stats=None):
+    """-> {project: [(relpath, line, why)]} over every runnable script of every project in the roster
+    (see the scope note above). `stats` (a dict) gets {project: _argv_candidates stats}."""
     home = home or HOME
     out = {}
     for proj in (projects if projects is not None else _project_dirs(home)):
+        root = os.path.join(home, proj)
+        st = {}
         rows = []
-        for d in ARGV_DIRS:
-            root = os.path.join(home, proj, d)
-            for dp, dns, fns in os.walk(root):
-                dns[:] = sorted(x for x in dns if x not in _ARGV_SKIP and not x.startswith("."))
-                for fn in sorted(fns):
-                    if not fn.endswith(".py"):
-                        continue
-                    p = os.path.join(dp, fn)
-                    try:
-                        src = open(p, encoding="utf-8", errors="replace").read()
-                    except OSError:
-                        continue
-                    rows += [(os.path.relpath(p, os.path.join(home, proj)), ln, why)
-                             for ln, why in _argv_scan_source(src)]
+        for rel in _argv_candidates(root, st):
+            try:
+                src = open(os.path.join(root, rel), encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            rows += [(rel, ln, why) for ln, why in _argv_scan_source(src)]
+        if stats is not None:
+            stats[proj] = st
         if rows:
             out[proj] = rows
     return out
@@ -1818,7 +2361,18 @@ def _rule5_reports(port, d):
             and port not in d.get("infra_ports", []))
 
 
+def _gh_bin():
+    """gh by absolute path: cron's PATH has no ~/.local/bin, so a bare "gh" never ran under cron
+    and the posture rule's GitHub half was inert (2026-10-04 handoff check)."""
+    import shutil
+    return shutil.which("gh") or next((p for p in (os.path.expanduser("~/.local/bin/gh"),
+                                                   "/usr/bin/gh", "/usr/local/bin/gh")
+                                       if os.path.exists(p)), "gh")
+
+
 def _gh_run(cmd):
+    if cmd and cmd[0] == "gh":
+        cmd = [_gh_bin()] + list(cmd[1:])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         return r.returncode, r.stdout, (r.stderr or "").strip()[-200:]
@@ -1912,7 +2466,12 @@ def _posture_findings(f, probs):
         _finding(f, "posture", sev, title, detail, project="maintenance", key=key)
 
 
-QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe"}
+QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe",
+               # rules 37-41 (2026-10-05): findings only, never a push of their own (the brief: no pushes)
+               "browser-signin", "dashboard-check-red", "push-undelivered", "guard-deny",
+               "restore-unproven", "manifest-stale",
+               "ledger-order", "weight-drift",  # rules 42-43 (2026-10-05): low, filed, never a push
+               "fleet-stop-engaged", "backup-stray"}  # rules 44-45: David engaged it / filed, never a push
 
 
 def _push_worthy(new):
@@ -2447,6 +3006,16 @@ def audit(c=None):
                  "gpu.py selftest fails — the GPU queue's ordering rules no longer hold",
                  "Stocks-first ordering on the one GPU keeps local jobs out of the trading path. "
                  "Its output: " + _out)
+    # every lead its own name, role, hue and emblem, and a new project assigned one (2026-10-04, David: "there should be a
+    # cleaner distinction between each of the project lead UI's. this should be applied for every new project when they
+    # come as well"): identity.py's selftest runs the assignment fixtures and the live config/projects.json
+    _ok, _out = _selfcheck(["identity.py", "selftest"], "ALL PASS")
+    if not _ok:
+        _finding(f, "guardrail-inert", "med",
+                 "identity selftest fails — two leads could share a hue or an emblem, or a project has none",
+                 "run `python3 ~/maintenance/bin/identity.py selftest`; a FAIL on the live registry names the project "
+                 "in config/projects.json whose identity is missing or shared (fix it there: identity_palette lists "
+                 "the free hues and emblems). Its output: " + _out)
     _ok, _out = _selfcheck(["publish.py", "selftest"], "passed")
     if not _ok:
         _finding(f, "guardrail-inert", "high",
@@ -2805,14 +3374,21 @@ def audit(c=None):
                  f"and dashboard/check.py were skipped this pass: against a half-updated server they "
                  f"report only this mismatch, under the wrong names.", project="maintenance")
     if shutil.which("node") and not _snewer:
-        for _t, _lbl in (("test_overview_tab.js", "Overview"), ("test_claude_tab.js", "Claude"),
-                         ("test_catalog_tab.js", "Catalog")):
+        # every dashboard/test_*_tab.js, found on disk the way check.py finds them (2026-10-05,
+        # memo review-backoffice-runs-team-tests: a hard-coded three let test_team_tab.js go red
+        # with no finding). Per test 90 s, the whole set DASH_TESTS_BUDGET_S; a test the budget
+        # leaves unrun is named in one finding rather than silently dropped.
+        _t0 = time.time()
+        _unrun = []
+        for _t, _lbl in dashboard_tab_tests(_dash):
             _tp = os.path.join(_dash, _t)
-            if not os.path.exists(_tp):
+            _left = DASH_TESTS_BUDGET_S - (time.time() - _t0)
+            if _left < 15:
+                _unrun.append(_t)
                 continue
             try:
                 _r = subprocess.run(["node", _tp], cwd=_dash, capture_output=True,
-                                    text=True, timeout=90)
+                                    text=True, timeout=min(DASH_TEST_TIMEOUT_S, _left))
                 _ok, _out = _r.returncode == 0, (_r.stdout + _r.stderr)
             except Exception as _e:
                 _ok, _out = False, f"{type(_e).__name__}: {_e}"
@@ -2825,6 +3401,13 @@ def audit(c=None):
                          + " | ".join(l for l in _out.splitlines()
                                       if "FAIL" in l or "THREW" in l or "Error" in l)[-300:],
                          project="maintenance")
+        if _unrun:
+            _finding(f, "guardrail-inert", "med",
+                     "some dashboard tab tests did not run (time budget)",
+                     f"{len(_unrun)} of the dashboard's test_*_tab.js were left unrun after "
+                     f"{DASH_TESTS_BUDGET_S} s: {', '.join(_unrun)}. A slow test is hiding the ones "
+                     f"after it; time them with `node dashboard/<test>` and fix the slow one.",
+                     project="maintenance", key="dashboard-tests-unrun")
 
     # 21. the dashboard itself. "If it isn't on the dashboard, it isn't real" cuts both ways:
     #     a panel that silently renders nothing is worse than a missing one, because the page
@@ -3142,14 +3725,23 @@ def audit(c=None):
                  "through bin/backup.py; `python3 ~/maintenance/bin/backup.py verify` checks the same by hand.",
                  project="maintenance", key="backup-tamper-unread")
 
-    # 34. argv-unsafe (2026-10-04, memo wa-lessons-propagation ask 1): a script in any project's bin/ or
-    #     scripts/ that runs a live path on an unknown argument. Static (ast), low and quiet; the memos
+    # 34. argv-unsafe (2026-10-04, memo wa-lessons-propagation ask 1): a script in any project
+    #     that runs a live path on an unknown argument. Static (ast), low and quiet; the memos
     #     (one per non-Stocks project, ask-once) are argv_memos(), called from run() only when not dry.
+    #     Since 2026-10-05 every runnable *.py in the project, not only bin/ and scripts/.
     try:
-        _argv_findings(f, argv_scan())
+        _argv_st = {}
+        _argv_findings(f, argv_scan(stats=_argv_st))
+        _argv_capped = {p: st["capped"] for p, st in _argv_st.items() if st.get("capped")}
+        if _argv_capped:
+            _finding(f, "argv-unsafe", "low", "the argv-unsafe scan stopped at its cap",
+                     "Scripts past the cap were not read: " + "; ".join(f"{p}: {c}" for p, c in
+                     sorted(_argv_capped.items())) + ". A vendored or generated tree the prune list "
+                     "misses (_ARGV_SKIP in bin/backoffice.py) is the usual cause.",
+                     project="maintenance", key="argv-unsafe-capped")
     except Exception as e:
         _finding(f, "argv-unsafe", "low", "the argv-unsafe rule could not run",
-                 f"{type(e).__name__}: {str(e)[:160]}. It parses bin/ and scripts/ of every project with ast.",
+                 f"{type(e).__name__}: {str(e)[:160]}. It parses every project's runnable *.py with ast.",
                  project="maintenance", key="argv-unsafe-unread")
 
     # 35. posture (2026-10-04, memo wa-security-detection ask 2): a repo turned public, a new GitHub key,
@@ -3164,6 +3756,80 @@ def audit(c=None):
         _finding(f, "posture", "med", "the posture rule could not run",
                  f"{type(e).__name__}: {str(e)[:160]}. It reads gh (repo list, user/keys), `ss -ltnp` and "
                  "config/expected_github.json.", project="maintenance", key="posture-unread")
+
+    # 36. lead-structure (2026-10-04, David: "any project with a lead should follow this structure";
+    #     helpers above audit()): every lead.py lead's project has the lead-project layout of
+    #     PROJECT_STANDARDS §5. Reads rule 25's rows; the selftest fixture is its armed-check.
+    try:
+        if not isinstance(_st_rows, list) or not _st_rows:
+            raise RuntimeError("no lead.py status rows (rule 25 failed)")
+        _lead_structure_findings(f, _st_rows, load(os.path.join(CONFIG, "projects.json"), {}))
+    except Exception as e:
+        _finding(f, "lead-structure", "low", "the lead-structure rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It walks each lead.py lead's project folder against "
+                 "PROJECT_STANDARDS §5's lead-project layout, from `lead.py status --json` and config/projects.json.",
+                 project="maintenance", key="lead-structure-unread")
+
+    # 37. browser-signin (2026-10-05, memo browser-signin-needs-attention ask 1): a site the Spark browser was
+    #     signed in to once that `browser.py daily` now reads logged_out or challenge. Options come from the
+    #     kind template in dashboard/tt_decide.py. 37b: its pure selftest beside the other morning ones.
+    try:
+        _browser_signin_findings(f, load(os.path.join(STATE, "browser.json"), {}),
+                                 load(os.path.join(CONFIG, "browser_sites.json"), {}))
+    except Exception as e:
+        _finding(f, "browser-signin", "low", "the browser-signin rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It reads state/browser.json and config/browser_sites.json.",
+                 project="maintenance", key="browser-signin-unread")
+    _ok, _out = _selfcheck(["browser.py", "selftest", "--pure"], "PASS")
+    if not _ok:
+        _finding(f, "guardrail-inert", "med",
+                 "browser.py selftest fails — the Spark browser's pacing, caps or sign-in reads may not hold",
+                 "run `python3 ~/maintenance/bin/browser.py selftest --pure` (fixtures only: no Chrome, no site "
+                 "visited); each FAIL line names the case. Its output: " + _out)
+
+    # 38. dashboard-check-red (2026-10-05, memo wa-attention-kpi-leftovers): serve.sh's post-restart check.py run
+    #     came back red in the last 7 days.
+    _dash_check_finding(f, load(os.path.join(STATE, "dash_check.json"), None))
+
+    # 39. push-undelivered (2026-10-05, memo wa-alerts-and-boot slice 3): a critical push in healthcheck.sh's
+    #     delivery spool for over 30 min.
+    _push_undelivered_finding(f, os.path.join(STATE, "alerts_pending"))
+
+    # 40. guard-deny (2026-10-05, memo wa-security-detection slice 3): any refusal in a guard ledger in 24 h.
+    _guard_deny_findings(f, {n: _jsonl_rows(os.path.join(STATE, fn)) for n, fn, _ in GUARD_LEDGERS})
+
+    # 41. restore-unproven + manifest-stale (2026-10-05, memo wa-restore-and-rebuild): the last green restore
+    #     drill > 30 days old (the pass does not run the drill), and the nightly rebuild manifest > 2 days old.
+    try:
+        import backup as _bk2
+        _drill_srcs = _bk2.cfg().get("sources") or {}
+    except Exception:
+        _drill_srcs = None
+    _restore_unproven_finding(f, _jsonl_rows(os.path.join(STATE, "restore_drills.jsonl")), sources=_drill_srcs)
+    _manifest_stale_finding(f, os.path.join(HOME, "backups", "manifest"))
+
+    # 42. ledger-order (2026-10-05, memo review-ledger-hygiene slice 2): a LEDGER.md row dated newer than
+    #     the row above it (the ledger is newest-first; every writer prepends through bin/ledger_rows.py).
+    _ledger_order_finding(f, os.path.join(MEMOS, "LEDGER.md"))
+
+    # 45. backup-stray (2026-10-05, memo wa-backups-integrity slice 4/4): an undeclared file or folder at the
+    #     top two levels of ~/backups, newer than the baseline. Stat only.
+    try:
+        import backup as _bk3
+        _backup_stray_finding(f, _backup_stray(_bk3.root(), _bk3.cfg().get("sources") or {}))
+    except Exception as e:
+        _finding(f, "backup-stray", "low", "the backup-stray rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It lists ~/backups against config/backups.json.",
+                 project="maintenance", key="backup-stray-unread")
+
+    # 44. fleet-stop-engaged (2026-10-05, memo wa-security-detection slice 4/4): LAST, over every finding
+    #     above: while fleet-stop is engaged, the job-shaped findings about the lines it paused are held.
+    try:
+        f = _fleet_stop_apply(f, _fleet_state(), {x for j in c["crons"] for x in j["scripts"]})
+    except Exception as e:
+        _finding(f, "fleet-stop-engaged", "med", "the fleet-stop rule could not read its state",
+                 f"{type(e).__name__}: {str(e)[:160]}. It reads state/fleet_stop.json through bin/paused.py.",
+                 project="maintenance", key="fleet-stop-unread")
 
     uniq = {}
     for x in f:
@@ -3433,6 +4099,25 @@ def _desc_of(project):
     return project
 
 
+def _new_card(pcfg, name):
+    """The config/projects.json card the auto-add writes for a project on disk with none (`roster-missing`). Since
+    2026-10-04 it carries the project's identity (David: "there should be a cleaner distinction between each of the
+    project lead UI's. this should be applied for every new project when they come as well"): bin/identity.py assign —
+    a name from the folder, role "Project lead", the next palette hue and fallback emblem no project holds, no vitals
+    yet (its lead's home shows Mission Control's own record of it), `for` its desc. The project's lead then names its
+    role and vitals by memo to maintenance (PROJECT_STANDARDS.md Day-1). An identity that cannot be assigned leaves the
+    card without one: the dashboard then assigns it at read time, never a blank."""
+    desc = _desc_of(name)
+    card = {"desc": desc, "match": [name], "activity_file": None,
+            "next": "(auto-added by the back-office pass — set the next step)"}
+    try:
+        import identity
+        card["identity"] = identity.assign(pcfg, name, desc)
+    except Exception as e:
+        print(f"  identity for {name}: {type(e).__name__}: {e}", file=sys.stderr)
+    return card
+
+
 def fix(open_findings, dry=False):
     """Repair the drift Mission Control owns. Everything here edits this project's own
     files — never another project's (see the reach rule in CLAUDE.md)."""
@@ -3452,14 +4137,11 @@ def fix(open_findings, dry=False):
 
         if f["kind"] == "roster-missing" and f["project"]:
             name = f["project"]
-            act = None
-            for cand in (f"~/{name}/logs", f"~/{name}/_engine/logs"):
-                if os.path.isdir(cand.replace("~", HOME)):
-                    act = None       # a directory isn't an activity file; leave it for a human
-            pcfg.setdefault("projects", {})[name] = {
-                "desc": _desc_of(name), "match": [name], "activity_file": act,
-                "next": "(auto-added by the back-office pass — set the next step)"}
-            done.append((f, f"added {name} to the dashboard roster"))
+            # (a logs/ directory is not an activity file: activity_file stays None for a human to set)
+            card = pcfg.setdefault("projects", {})[name] = _new_card(pcfg, name)
+            idn = card.get("identity") or {}
+            done.append((f, f"added {name} to the dashboard roster"
+                         + (f" ({idn.get('name')}: {idn.get('emblem')} on {idn.get('hue')})" if idn else "")))
 
         elif f["kind"] == "registry-missing":
             script = f["title"].split()[0]
@@ -3787,6 +4469,25 @@ def _proc_start(pid):
         return None
 
 
+DASH_TEST_TIMEOUT_S = 90       # one tab test
+DASH_TESTS_BUDGET_S = 600      # every tab test together, so a hung server cannot stall the pass
+
+
+def dashboard_tab_tests(dash=None):
+    """-> [(file, label)] for every dashboard/test_*_tab.js, sorted: the same discovery as
+    dashboard/check.py (its browser tests, test_*_browser.js, and the boot/click/routing helpers
+    are not *_tab.js, so neither runs them). check.py skips test_catalog_tab.js only because it
+    runs that test's two catalog checks itself; the janitor runs the tab test directly."""
+    dash = dash or os.path.join(MC, "dashboard")
+    try:
+        names = sorted(fn for fn in os.listdir(dash)
+                       if fn.startswith("test_") and fn.endswith("_tab.js")
+                       and os.path.isfile(os.path.join(dash, fn)))
+    except OSError:
+        return []
+    return [(fn, fn[5:-7].replace("_", " ").title()) for fn in names]
+
+
 def _dashboard_stale(dash=None):
     """(pid, [files changed since that process started]) for the running dashboard — found the
     way dashboard/serve.sh finds it — or (None, []) when it is not running or cannot be read."""
@@ -3896,8 +4597,11 @@ def _write_memo(target, name, body, note):
     os.makedirs(inbox, exist_ok=True)
     with open(path, "w") as fh:
         fh.write(body)
-    with open(os.path.join(MEMOS, "LEDGER.md"), "a") as fh:
-        fh.write(f"| {day} | {name} | mission-control | {target} | proposed | {note} |\n")
+    # newest-first, first under the table header (bin/ledger_rows.py, memo review-ledger-hygiene);
+    # Source is the bus slug "maintenance", never "mission-control"
+    import ledger_rows
+    ledger_rows.prepend(f"| {day} | {name} | maintenance | {target} | proposed | {note} |",
+                        os.path.join(MEMOS, "LEDGER.md"))
     return path
 
 
@@ -4088,9 +4792,64 @@ def _ledger_verify_apply(run=None):
     return f"ledger verify: {out[-1] if out else 'no output'}"
 
 
+ATTENTION_WEEKS = os.path.join(STATE, "attention_weeks.jsonl")
+ATTENTION_LIMIT = 25        # model calls per week, largest sessions first (~2 s each); the rest heuristic
+
+
+def _attention_due(today, rows):
+    """-> the Monday of the ISO week this pass should measure, or None (memo wa-attention-kpi ask 2:
+    weekly, ridden by this daily pass, no crontab line). Only on a Sunday (UTC); the week is the last
+    FULL one (Mon..Sun ending a week before today: the current week still runs at 11:35); and once
+    that day: a history row for that week generated today means this Sunday's run already happened.
+    A backfilled row from an earlier day does not count, so the Sunday run re-measures it in place."""
+    from datetime import timedelta
+    if today.weekday() != 6:
+        return None
+    mon = today - timedelta(days=13)
+    y, w, _ = mon.isocalendar()
+    label = f"{y}-W{w:02d}"
+    if any(r.get("week") == label and str(r.get("generated") or "")[:10] == today.isoformat()
+           for r in rows):
+        return None
+    return mon
+
+
+def _attention_weekly(today=None, rows=None, run=None, dry=False):
+    """On a Sunday, `attention.py week` for the last full week: state/attention.json + one row in
+    state/attention_weeks.jsonl (local model, zero Claude tokens, HBS text stays on the box).
+    -> a line for the pass, or "" on any other day. Never raises; a failure is a line, and a missed
+    week surfaces as catalog-stale on maintenance/attention_weeks."""
+    try:
+        today = today or datetime.now(timezone.utc).date()
+        if rows is None:
+            from attention import read_weeks
+            rows = read_weeks(ATTENTION_WEEKS)
+        mon = _attention_due(today, rows)
+        if mon is None:
+            return ""
+        argv = [sys.executable, os.path.join(MC, "bin", "attention.py"), "week",
+                "--week", mon.isoformat(), "--limit", str(ATTENTION_LIMIT)]
+        if dry:
+            return f"attention: would measure the week of {mon} (dry: {' '.join(argv[2:])})"
+        r = (run or subprocess.run)(argv, capture_output=True, text=True, timeout=1800)
+        out = (r.stdout or "").strip().splitlines()
+        if r.returncode != 0:
+            return (f"attention week failed (rc {r.returncode}): "
+                    f"{((r.stderr or '').strip() + ' ' + (out[-1] if out else '')).strip()[-160:]}")
+        return "attention: " + (out[0] if out else "no output")
+    except Exception as e:
+        return f"attention week failed: {type(e).__name__}: {str(e)[:160]}"
+
+
 def run(dry=False):
     c = census()
     fresh = audit(c)
+    # rule 43 (memo wa-cost-attribution slice 3/4): true the weights up once a day, file weight-drift
+    try:
+        _wd_line, _wd_f = weight_drift_pass(dry=dry)
+    except Exception as e:                       # the weight pass must never break the pass
+        _wd_line, _wd_f = f"weight drift failed: {type(e).__name__}: {e}", []
+    fresh += _wd_f
     # David's dashboard answers first, so a mute he chose skips this very pass's merge
     decided = apply_decisions(fresh, dry=dry)
     new, resolved, open_f = merge_findings(fresh)
@@ -4113,6 +4872,8 @@ def run(dry=False):
         print(f"  decided: {what or 'could not apply'} (decision:{e['id']})")
     for k, outcome in repeats:
         print(f"  repeat: {k} -> {outcome}")
+    if _wd_line:
+        print(f"  {_wd_line}")
     if not dry:
         for p in _clean_stale_pyc():
             print(f"  removed a stale byte-code cache: {os.path.relpath(p, MC)}")
@@ -4132,6 +4893,12 @@ def run(dry=False):
                     print(f"  argv-unsafe: memo to {proj.lower()} -> {outcome[6:]}")
         except Exception as e:                   # the memo filing must never break the pass
             print(f"  argv-unsafe memos failed: {type(e).__name__}: {e}")
+    try:                                         # Sundays only: David's decide+learn KPI for the last week
+        _at = _attention_weekly(dry=dry)
+    except Exception as e:                       # the KPI must never break the pass
+        _at = f"attention week failed: {type(e).__name__}: {e}"
+    if _at:
+        print(f"  {_at}")
     for f in new:
         print(f"  new [{f['sev']}] {f['title']}")
     with open(HISTORY, "a") as fh:
@@ -4170,7 +4937,7 @@ def selftest():
     stored-copy scrub, the diagram rules and the render that must not claim a false repair.
     Nothing here touches the live state, config or git."""
     import tempfile
-    global FINDINGS, MUTE, CONFIG, MC, _commit, MEMOS, BLOCKERS, REPEAT_ASKED, ARGV_ASKED
+    global FINDINGS, MUTE, CONFIG, MC, _commit, MEMOS, BLOCKERS, REPEAT_ASKED, ARGV_ASKED, ARGV_MAX_PY
     ok = True
 
     def check(name, cond, info=""):
@@ -4304,6 +5071,59 @@ def selftest():
                      + json.dumps({"at": int(time.time()) - 60, "ev": "release", "job": "rel", "kind": "x"}) + "\n")
         check("owner-missing: queue jobs are the starts of the last 30 days",
               _sto_queue_jobs(qp) == [("pe firms", "pe")], _sto_queue_jobs(qp))
+
+        # lead-structure (2026-10-04, David: "any project with a lead should follow this structure"):
+        # the armed-check is this fixture — a complete lead project passes, one missing README trips,
+        # a placeholder projects.json desc trips, an external lead (Stocks) is never walked
+        lh = f"{t}/leadhome"
+
+        def lead_proj(name, skip=()):
+            r = f"{lh}/{name}"
+            os.makedirs(f"{r}/.claude/agents", exist_ok=True)
+            subprocess.run(["git", "init", "-q", r], check=False, capture_output=True)
+            files = {"CLAUDE.md": f"# {name}\n\n## Project lead\n\n{name}_lead owns it.\n", "README.md": "x\n",
+                     "ARCHITECTURE.md": "x\n", f".claude/agents/{name}_lead.md": "---\nname: x\n---\n",
+                     ".claude/lead.json": "{}\n", ".claude/lead-memory.md": "x\n", "catalog.json": "{}\n",
+                     ".gitignore": ".claude/worktrees/\n"}
+            for rel, body in files.items():
+                if rel not in skip:
+                    with open(f"{r}/{rel}", "w") as fh:
+                        fh.write(body)
+        lead_proj("fullp")
+        lead_proj("nordme", skip=("README.md",))
+        lead_proj("bare", skip=("CLAUDE.md", "ARCHITECTURE.md", ".gitignore"))
+        with open(f"{lh}/bare/CLAUDE.md", "w") as fh:
+            fh.write("# bare\n\nno lead section here\n")
+        lrows = [{"slug": "fullp", "dir": "fullp", "lead": "fullp_lead", "state": "ok"},
+                 {"slug": "nordme", "dir": "nordme", "lead": "nordme_lead", "state": "ok"},
+                 {"slug": "bare", "dir": "bare", "lead": "bare_lead", "state": "invalid"},
+                 {"slug": "stocks", "dir": "Stocks", "lead": "pm", "state": "excluded", "kind": "external"},
+                 {"slug": "nolead", "dir": "nolead", "lead": "nolead_lead", "state": "missing"}]
+        lcfg = {"projects": {"Full P": {"desc": "A real one-liner", "match": ["fullp"]},
+                             "nordme": {"desc": "Another real one", "match": ["nordme"]},
+                             "bare": {"desc": "bare", "match": ["bare"]}}}
+        lf = []
+        lgaps = _lead_structure_findings(lf, lrows, lcfg, home=lh)
+        check("lead-structure: a complete lead project passes; an external lead (Stocks) and a project "
+              "with no lead are not walked", "fullp" not in lgaps and "stocks" not in lgaps
+              and "nolead" not in lgaps, lgaps)
+        check("lead-structure: a lead project missing its README trips, one low finding naming only that",
+              lgaps.get("nordme") == ["no README.md"]
+              and [(x["kind"], x["sev"], x["project"]) for x in lf if x["project"] == "nordme"]
+              == [("lead-structure", "low", "nordme")], (lgaps.get("nordme"), lf))
+        check("lead-structure: no lead section, no ARCHITECTURE.md, worktrees not ignored and a placeholder "
+              "desc are each a gap, still one finding for the project",
+              len([x for x in lf if x["project"] == "bare"]) == 1
+              and any("Project lead" in g for g in lgaps.get("bare", []))
+              and any("ARCHITECTURE" in g for g in lgaps.get("bare", []))
+              and any("worktrees" in g for g in lgaps.get("bare", []))
+              and any("projects.json" in g for g in lgaps.get("bare", [])), lgaps.get("bare"))
+        lcfg2 = {"projects": {"fullp": {"desc": "(auto-added by the back-office pass)", "match": ["fullp"]},
+                              "nordme": {"desc": "x", "match": ["nordme"]}}}
+        lg2 = _lead_structure_findings([], lrows[:1], lcfg2, home=lh)
+        lg3 = _lead_structure_findings([], lrows[:1], {"projects": {}}, home=lh)
+        check("lead-structure: an '(auto-added ...)' desc and a missing projects.json row are gaps",
+              len(lg2.get("fullp", [])) == 1 and len(lg3.get("fullp", [])) == 1, (lg2, lg3))
 
         # armed: the auto-fix policy's three selftests and the dead-box alarm (2026-10-03)
         outs = {"bin/decisions.py": (0, "PASS a\nALL PASS\n"), "dashboard/tt_decide.py": (0, "PASS b\nALL PASS"),
@@ -4613,6 +5433,21 @@ def selftest():
             decoy.wait()
         check("stale server: no process, no claim", _dashboard_stale(sd) == (None, []))
 
+        # the tab tests come from the folder, the way check.py finds them (2026-10-05, memo
+        # review-backoffice-runs-team-tests): a new test_<view>_tab.js is run with no edit here;
+        # browser tests and the boot/click helpers are not
+        for n in ("test_team_tab.js", "test_overview_tab.js", "test_world_browser.js",
+                  "test_catalog_boot.js", "test_x_tab.js.bak", "team_tab.js"):
+            open(f"{sd}/{n}", "w").write("")
+        os.makedirs(f"{sd}/test_dir_tab.js")
+        check("dashboard tab tests: every test_*_tab.js on disk, labelled, browser and helper tests left out",
+              dashboard_tab_tests(sd) == [("test_overview_tab.js", "Overview"), ("test_team_tab.js", "Team")],
+              dashboard_tab_tests(sd))
+        _live = [x for x, _ in dashboard_tab_tests(os.path.join(HOME, "maintenance", "dashboard"))]
+        check("dashboard tab tests: the live folder's set includes the three once hard-coded and test_team_tab.js",
+              {"test_overview_tab.js", "test_claude_tab.js", "test_catalog_tab.js", "test_team_tab.js"} <= set(_live),
+              _live)
+
         # leak lines and the stored-copy scrub
         out = _leak_lines("mc-public/code/p.py:91  [credential from ~/.secrets/sudo] s3cretVALUE\n"
                           "   x = 's3cretVALUE'\nmc-public/README.md:3  [absolute home path] /home/q\n1 leak(s)\n")
@@ -4648,6 +5483,24 @@ def selftest():
               ds["unrendered"] == ["a.d2"] and ds["diagrams"] == 2, ds)
         open(f"{t}/bin/render-diagrams.sh", "w").write("#!/bin/sh\necho refused >&2\nexit 1\n")
         os.chmod(f"{t}/bin/render-diagrams.sh", 0o755)
+        # the auto-add (roster-missing) writes the new project's identity with no edit (2026-10-04): a free hue and a
+        # free fallback emblem, a name from its folder, no vitals; the existing cards keep theirs
+        save(f"{CONFIG}/projects.json", {"identity_palette": {
+            "hues": [["project-a", "#111111"], ["project-b", "#222222"], ["project-c", "#333333"]],
+            "emblems": ["alpha"], "fallback_emblems": ["flag", "compass"]},
+            "projects": {"alpha": {"desc": "x", "match": ["alpha"], "identity": {
+                "name": "Alpha", "role": "Chief", "emblem": "alpha", "hue": "project-a", "for": "", "vitals": []}}}})
+        rfx = []
+        _finding(rfx, "roster-missing", "high", "brand-new-proj is not on the dashboard", "3 commits", "brand-new-proj", fix="auto")
+        _finding(rfx, "roster-missing", "high", "second-one is not on the dashboard", "1 commit", "second-one", fix="auto")
+        rdone = fix([dict(x, state="open") for x in rfx])
+        rc = load(f"{CONFIG}/projects.json", {}).get("projects") or {}
+        i1, i2 = (rc.get("brand-new-proj") or {}).get("identity") or {}, (rc.get("second-one") or {}).get("identity") or {}
+        check("roster-missing: the auto-add writes each new project's identity, a hue and an emblem of its own, with no edit",
+              len(rdone) == 2 and i1.get("name") == "Brand New Proj" and i1.get("role") == "Project lead"
+              and (i1.get("hue"), i1.get("emblem")) == ("project-b", "flag") and (i2.get("hue"), i2.get("emblem")) == ("project-c", "compass")
+              and i1.get("vitals") == [] and rc["alpha"]["identity"]["hue"] == "project-a"
+              and "flag on project-b" in rdone[0][1], (rdone, rc))
         dfix = []
         _finding(dfix, "diagram-unrendered", "low", "1 diagram source(s) edited but not re-rendered", "a.d2",
                  "maintenance", fix="auto", key="")
@@ -5089,6 +5942,34 @@ def selftest():
         sc = argv_scan(home=f"{ta}/home")
         check("argv-unsafe: the scan walks every project's bin/ (skips caches) and names file:line",
               sorted(sc) == ["Stocks", "hbs"] and sc["hbs"] == [("bin/job.py", 4, sc["hbs"][0][2])], sc)
+        # 2026-10-05 (memo review-argv-scan-scope): the whole project, not only bin/ and scripts/ — a
+        # script deep in a pipeline folder is found; vendored, generated, hidden, gitignored and oversize
+        # files are not, and a declared data root that holds code (Stocks' _engine/sources) is still read
+        _deep = {"pipeline/stage/run.py": _hbs, "_engine/sources/fetch.py": _hbs,
+                 "node_modules/pkg/cli.py": _hbs, ".venv/lib/x.py": _hbs, "build/lib/x.py": _hbs,
+                 "gen/made.py": _hbs, "huge.py": _hbs + "#" * (ARGV_MAX_BYTES + 1)}
+        _gp = f"{ta}/gitproj"
+        os.makedirs(_gp)
+        subprocess.run(["git", "init", "-q", _gp], capture_output=True)
+        open(f"{_gp}/.gitignore", "w").write("gen/\n")
+        for rel, src in _deep.items():
+            os.makedirs(os.path.dirname(f"{_gp}/{rel}"), exist_ok=True)
+            open(f"{_gp}/{rel}", "w").write(src)
+        _dst = {}
+        _dsc = argv_scan(home=ta, projects=["gitproj"], stats=_dst)
+        check("argv-unsafe: a script outside bin/ is found (and one in a declared data root); node_modules, "
+              ".venv, build/, a gitignored folder and an oversize file are not",
+              sorted({r[0] for r in _dsc.get("gitproj", [])}) == ["_engine/sources/fetch.py", "pipeline/stage/run.py"]
+              and _dst["gitproj"]["ignored"] == 1 and not _dst["gitproj"]["capped"], (_dsc, _dst))
+        _cap = ARGV_MAX_PY
+        try:
+            ARGV_MAX_PY = 1
+            _cst = {}
+            argv_scan(home=ta, projects=["gitproj"], stats=_cst)
+        finally:
+            ARGV_MAX_PY = _cap
+        check("argv-unsafe: the per-project read cap holds and says so", _cst["gitproj"]["read"] == 1
+              and _cst["gitproj"]["capped"].startswith("read 1"), _cst)
         fa = []
         _argv_findings(fa, sc)
         check("argv-unsafe: one low, quiet finding per project (Stocks included), stable key",
@@ -5178,6 +6059,293 @@ def selftest():
               and not _rule5_reports(8088, {"known_ports": [8088], "infra_ports": []}))
     finally:
         shutil.rmtree(tp, ignore_errors=True)
+
+    # rules 37-41 (2026-10-05): browser-signin, dashboard-check-red, push-undelivered, guard-deny,
+    # restore-unproven, manifest-stale — pure helpers on fixtures, findings only, none of them pushes
+    N = 1791200000.0                                                     # 2026-10-05 11:33Z
+    t7 = tempfile.mkdtemp(prefix="backoffice-r37.")
+    try:
+        check("rules 37-41: every new kind is filed but never pushes on its own (QUIET_KINDS)",
+              {"browser-signin", "dashboard-check-red", "push-undelivered", "guard-deny", "restore-unproven",
+               "manifest-stale"} <= QUIET_KINDS)
+        fbr = []
+        _browser_signin_findings(fbr, {"sites": {
+            "canvas": {"state": "logged_out", "signed_in_once": True, "since": "x"},
+            "wsj": {"state": "challenge", "signed_in_once": True},
+            "ft": {"state": "logged_in", "signed_in_once": True},
+            "onefinnet": {"state": "logged_out", "signed_in_once": False},
+            "vii": {"state": "unknown"}}}, {"sites": {"canvas": {"label": "Canvas (HBS)"}}})
+        check("browser-signin: a site signed in once and now logged_out or challenge -> one med finding each, keyed by site",
+              sorted((x["key"], x["sev"]) for x in fbr) == [("browser-signin:maintenance:canvas", "med"),
+                                                           ("browser-signin:maintenance:wsj", "med")]
+              and any(x["title"] == "the Spark browser is signed out of Canvas (HBS)" for x in fbr)
+              and any(x["title"].endswith("signed out of wsj") for x in fbr), [(x["key"], x["title"]) for x in fbr])
+        fbr = []
+        _browser_signin_findings(fbr, {"sites": {"onefinnet": {"state": "logged_out", "signed_in_once": False}}}, {})
+        _browser_signin_findings(fbr, {}, {})
+        check("browser-signin: a registered site never signed in, and no state file, stay quiet", fbr == [], fbr)
+        fdc = []
+        _dash_check_finding(fdc, {"ok": False, "at": "2026-10-05T08:29:47Z", "rc": 1,
+                                  "summary": ["FAIL overview tab", "FAIL - a check :: detail"]}, N)
+        check("dashboard-check-red: a red check within 7 days -> one med finding naming the failing tab",
+              len(fdc) == 1 and fdc[0]["sev"] == "med" and fdc[0]["key"] == "dashboard-check-red:maintenance:dash-check"
+              and "FAIL overview tab" in fdc[0]["detail"], fdc)
+        fdc = []
+        _dash_check_finding(fdc, None, N)
+        _dash_check_finding(fdc, {"ok": True, "at": "2026-10-05T08:29:47Z"}, N)
+        _dash_check_finding(fdc, {"ok": False, "at": "2026-09-20T08:00:00Z"}, N)
+        check("dashboard-check-red: missing file, a green check, or a red one older than 7 days -> quiet", fdc == [], fdc)
+        sp = f"{t7}/alerts_pending"
+        with open(sp, "w") as fh:
+            fh.write(json.dumps({"ts": int(N) - 600, "title": "fresh", "body": "b", "state": "s"}) + "\n")
+        fpu = []
+        _push_undelivered_finding(fpu, sp, N)
+        _push_undelivered_finding(fpu, f"{t7}/no_spool", N)
+        check("push-undelivered: a missing spool or a push spooled 10 min ago -> quiet", fpu == [], fpu)
+        with open(sp, "a") as fh:
+            fh.write("not json\n" + json.dumps({"ts": int(N) - 3600, "title": "Spark: ollama DOWN"}) + "\n")
+        _push_undelivered_finding(fpu, sp, N)
+        check("push-undelivered: a push spooled over 30 min -> one high finding naming the oldest",
+              len(fpu) == 1 and fpu[0]["sev"] == "high" and "ollama DOWN" in fpu[0]["detail"]
+              and "60 min" in fpu[0]["detail"], fpu)
+        gl = {"broker": [{"ts": N - 100, "verdict": "allow", "session": "s1"},
+                         {"ts": N - 200, "verdict": "deny", "session": "abcdef123456", "who": "headless cron session",
+                          "tool": "mcp__fixture_broker__order", "reason": ["an order tool"],
+                          "excerpt": "SECRET-EXCERPT"}],
+              "lead": [{"ts": N - 50, "verdict": "deny", "session": "l1", "lead": "poker_lead", "tool": "Edit",
+                        "reason": ["outside its project"]},
+                       {"ts": N - 90000, "verdict": "deny", "session": "old", "lead": "x_lead"}],
+              "claude": [{"time": N - 30, "mode": "warn", "command": "claude -p hi"},
+                         {"time": N - 99999, "mode": "deny", "command": "claude -p old"}]}
+        fgd = []
+        _guard_deny_findings(fgd, gl, N)
+        by = {x["key"]: x for x in fgd}
+        check("guard-deny: a broker deny in 24 h -> high; a lead deny -> low (the guard working as designed); a warn or a deny older than 24 h -> nothing",
+              sorted((k, v["sev"]) for k, v in by.items()) == [("guard-deny:maintenance:broker", "high"),
+                                                                ("guard-deny:maintenance:lead", "low")], by)
+        check("guard-deny: names the count, session, agent and tool, never the excerpt or command",
+              "1 denial" in by["guard-deny:maintenance:broker"]["detail"]
+              and "abcdef12" in by["guard-deny:maintenance:broker"]["detail"]
+              and "mcp__fixture_broker__order" in by["guard-deny:maintenance:broker"]["detail"]
+              and "poker_lead" in by["guard-deny:maintenance:lead"]["detail"]
+              and not any("SECRET-EXCERPT" in x["detail"] or "claude -p" in x["detail"] for x in fgd), fgd)
+        fgd = []
+        _guard_deny_findings(fgd, {"claude": [{"time": N - 30, "mode": "deny", "session": "c1",
+                                               "command": "claude -p x"}]}, N)
+        check("guard-deny: a bare-claude deny -> high, keyed claude", [(x["key"], x["sev"]) for x in fgd]
+              == [("guard-deny:maintenance:claude", "high")], fgd)
+        fru = []
+        _restore_unproven_finding(fru, [{"ts": "2026-10-04T08:51:49Z", "ok": True}], N)
+        check("restore-unproven: a green drill yesterday -> quiet", fru == [], fru)
+        _restore_unproven_finding(fru, [{"ts": "2026-08-01T00:00:00Z", "ok": True},
+                                        {"ts": "2026-10-04T00:00:00Z", "ok": False}], N)
+        _restore_unproven_finding(fru, [], N)
+        check("restore-unproven: newest GREEN drill 65 days old (a red one since does not count), or none -> med",
+              len(fru) == 2 and all(x["sev"] == "med" for x in fru) and "2026-08-01" in fru[0]["detail"]
+              and "none is recorded" in fru[1]["detail"], fru)
+        mr = f"{t7}/manifest"
+        os.makedirs(f"{mr}/2026-10-01")
+        os.makedirs(f"{mr}/notadate")
+        fms = []
+        _manifest_stale_finding(fms, mr, N)
+        _manifest_stale_finding(fms, f"{t7}/no_manifest", N)
+        check("manifest-stale: newest day folder 4 days old, or no folder at all -> med each",
+              len(fms) == 2 and all(x["sev"] == "med" for x in fms) and "2026-10-01" in fms[0]["detail"], fms)
+        os.makedirs(f"{mr}/2026-10-03")
+        os.symlink(f"{mr}/2026-10-03", f"{mr}/2026-10-09")
+        fms = []
+        _manifest_stale_finding(fms, mr, N)
+        check("manifest-stale: a folder from 2 days ago is fresh (a symlinked future 'day' is ignored)", fms == [], fms)
+        # restore-unproven slice 4/4: the detail names the exact command for the least-recently drilled source
+        _srcs = {"poker": {}, "Stocks": {"delegated_to": "x"}, "hbs": {}, "memos": {}}
+        _dr = [{"ts": "2026-08-01T00:00:00Z", "source": "poker", "ok": True},
+               {"ts": "2026-08-02T00:00:00Z", "source": "memos", "ok": False},
+               {"ts": "2026-08-03T00:00:00Z", "source": "Stocks", "ok": None}]
+        check("restore-unproven: round-robin picks a never-drilled source first, then the oldest; a delegated one never",
+              _drill_next(_dr, _srcs) == "hbs" and _drill_next(_dr + [{"ts": "2026-08-04T00:00:00Z", "source": "hbs",
+                                                                        "ok": True}], _srcs) == "poker"
+              and _drill_next([], {"Stocks": {"delegated_to": "x"}}) is None, _drill_next(_dr, _srcs))
+        fru = []
+        _restore_unproven_finding(fru, _dr, N, sources=_srcs)
+        check("restore-unproven: the pass does not drill; the finding names `backup.py drill hbs` as the exact command",
+              len(fru) == 1 and "`python3 ~/maintenance/bin/backup.py drill hbs`" in fru[0]["detail"], fru)
+        # rule 45: backup-stray — the top two levels against the declared writers; older than the baseline is allowed
+        br = f"{t7}/backups"
+        for d_ in ("poker", "stocks", "manifest/2026-10-05", "incident/2026-10-05T01", "crontab", "family-vault/x"):
+            os.makedirs(f"{br}/{d_}")
+        for fn in ("README.md", "poker/poker_2026-10-05.tar.gz", "poker/poker_2026-10-05.tar.gz.sha256",
+                   "poker/poker_2026-10-05.tar.gz.manifest.json", "poker/.poker_2026-10-05.tar.gz.sha256.tmp",
+                   "stocks/anything.db", "crontab/x.txt", "incident/2026-10-05T01/ss.txt", "poker/old-handcopy.conf"):
+            open(f"{br}/{fn}", "w").close()
+        os.utime(f"{br}/poker/old-handcopy.conf", (N - 86400 * 10, N - 86400 * 10))
+        _bs = {"poker": {"keep_days": 21}, "Stocks": {"delegated_to": "~/Stocks/_engine/backup.sh"}}
+        check("backup-stray: declared sources, sidecars, temps, fixed folders, README and a pre-baseline file -> nothing",
+              _backup_stray(br, _bs, N - 86400) == [], _backup_stray(br, _bs, N - 86400))
+        os.makedirs(f"{br}/newdump")
+        for fn in ("loose.tar.gz", "poker/evil.sh", "poker/hbs_2026-10-05.tar.gz"):
+            open(f"{br}/{fn}", "w").close()
+        os.symlink("/etc", f"{br}/crontab2")
+        _st = _backup_stray(br, _bs, N - 86400)
+        fbs = []
+        _backup_stray_finding(fbs, _st)
+        check("backup-stray: a new top-level folder, file and symlink, and a foreign name in a source folder -> one med",
+              _st == ["crontab2", "loose.tar.gz", "newdump", "poker/evil.sh", "poker/hbs_2026-10-05.tar.gz"]
+              and len(fbs) == 1 and fbs[0]["sev"] == "med" and fbs[0]["key"] == "backup-stray:maintenance:backup-stray"
+              and "poker/evil.sh" in fbs[0]["detail"], (_st, fbs))
+        fbs = []
+        _backup_stray_finding(fbs, [f"s{i}" for i in range(14)])
+        check("backup-stray: lists at most 10, then the count; a missing root is quiet",
+              "s9" in fbs[0]["detail"] and "s10" not in fbs[0]["detail"] and "and 4 more" in fbs[0]["detail"]
+              and _backup_stray(f"{t7}/no_backups", _bs) == [], fbs)
+        # rule 44: fleet-stop-engaged — PAUSED_FLEET_STATE points paused.py at a temp file
+        _fs = f"{t7}/fleet_stop.json"
+        _pf = os.environ.get("PAUSED_FLEET_STATE")
+        os.environ["PAUSED_FLEET_STATE"] = _fs
+        try:
+            check("fleet-stop: no state file -> not engaged, findings untouched",
+                  _fleet_state() is None and _fleet_stop_apply([{"kind": "job-silent"}], _fleet_state()) == [{"kind": "job-silent"}])
+            with open(_fs, "w") as fh:
+                json.dump({"engaged_at": "2026-10-05T12:00:00Z", "reason": "suspected token leak", "lines": [
+                    '50 7 * * * cd ~/maintenance && python3 bin/decisions.py pending >> logs/decisions.log 2>&1 && '
+                    'python3 /h/maintenance/bin/claudeq.py run --kind decisions --est 20 --job "daily check" -- x',
+                    '15 15 5 * * cd ~/clientco-db && ./.venv/bin/python scripts/ingest_gate.py >> logs/ingest.log 2>&1 '
+                    '&& python3 /h/maintenance/bin/claudeq.py run --kind clientco --job "clientco ingest" -- y']}, fh)
+            _fl = []
+            _finding(_fl, "registry-orphan", "low", "ingest_gate.py is documented but no longer scheduled", "d")
+            _finding(_fl, "registry-orphan", "low", "decisions.py is documented but no longer scheduled", "d")
+            _finding(_fl, "queue-starved", "low", "queue job 'daily check' startable 60h", "d")
+            _finding(_fl, "job-silent", "high", "memo-process.py has not run in 90h", "d")
+            _finding(_fl, "guardrail-inert", "med", "gpu.py selftest fails — the GPU queue's ordering rules no longer hold", "d")  # a REGISTERED title: tt_system reads every guardrail-inert title in this file
+            _finding(_fl, "posture", "high", "a repo turned public", "d")
+            _kept = _fleet_stop_apply(_fl, _fleet_state(), {"decisions.py", "memo-process.py", "claudeq.py"})
+            _ks = sorted((x["kind"], x["title"][:22]) for x in _kept)
+            _fe = [x for x in _kept if x["kind"] == "fleet-stop-engaged"]
+            check("fleet-stop: engaged -> the paused jobs' registry/queue findings held; a live job, a guardrail and posture kept",
+                  _ks == sorted([("registry-orphan", "decisions.py is docume"), ("job-silent", "memo-process.py has no"),
+                                 ("guardrail-inert", "gpu.py selftest fails "), ("posture", "a repo turned public"),
+                                 ("fleet-stop-engaged", "fleet-stop is engaged:")]), _ks)
+            check("fleet-stop: ONE high quiet finding, owner maintenance, with since when, why and the held count",
+                  len(_fe) == 1 and _fe[0]["sev"] == "high" and _fe[0]["project"] == "maintenance"
+                  and "fleet-stop-engaged" in QUIET_KINDS and "2026-10-05T12:00:00Z" in _fe[0]["detail"]
+                  and "suspected token leak" in _fe[0]["detail"] and "2 finding(s)" in _fe[0]["detail"]
+                  and _fe[0]["key"] == "fleet-stop-engaged:maintenance:fleet-stop", _fe)
+        finally:
+            if _pf is None:
+                os.environ.pop("PAUSED_FLEET_STATE", None)
+            else:
+                os.environ["PAUSED_FLEET_STATE"] = _pf
+        # rule 42: ledger-order, and _write_memo's row lands first under the header with Source maintenance
+        lg = f"{t7}/LEDGER.md"
+        hdr = "# l\n\n| Date | Memo | Source | Target | Status | Evidence |\n|---|---|---|---|---|---|\n"
+        with open(lg, "w") as fh:
+            fh.write(hdr + "| 2026-10-04 | b | x | y | p | e |\n| 2026-10-01 | a | x | y | p | e |\n")
+        flo = []
+        _ledger_order_finding(flo, lg)
+        _ledger_order_finding(flo, f"{t7}/no_ledger.md")
+        check("ledger-order: a newest-first ledger, or none, is quiet", flo == [], flo)
+        with open(lg, "a") as fh:
+            fh.write("| 2026-10-05 | c | x | y | p | e |\n| 2026-10-03 | d | x | y | p | e |\n"
+                     "| 2026-10-04 | e | x | y | p | e |\n")
+        _ledger_order_finding(flo, lg)
+        check("ledger-order: two appended rows -> ONE low quiet finding with the count and the first offender",
+              len(flo) == 1 and flo[0]["sev"] == "low" and flo[0]["kind"] in QUIET_KINDS
+              and flo[0]["key"] == "ledger-order:maintenance:ledger" and "2 row(s)" in flo[0]["detail"]
+              and "line 7 (2026-10-05 c, under a 2026-10-01 row)" in flo[0]["detail"], flo)
+        _mm = MEMOS
+        try:
+            MEMOS = f"{t7}/memos"
+            os.makedirs(MEMOS)
+            with open(f"{MEMOS}/LEDGER.md", "w") as fh:
+                fh.write(hdr + "| 2026-10-01 | a | x | y | p | e |\n")
+            _wp = _write_memo("poker", "backoffice-x", "body", "note")
+            _ll = open(f"{MEMOS}/LEDGER.md").read().splitlines()
+            check("_write_memo: its row is first under the header (newest-first), Source maintenance",
+                  _wp and _ll[4].endswith(f"| backoffice-x | maintenance | poker | proposed | note |")
+                  and _ll[5] == "| 2026-10-01 | a | x | y | p | e |" and _ll[:4] == hdr.splitlines(), _ll)
+        finally:
+            MEMOS = _mm
+        # rule 43: weight-drift on fixtures (a temp weights file and stamp; job_weights.json never touched)
+        _wf = f"{t7}/job_weights.json"
+        _doc = {"weights": [{"match": "a", "tokens_per_run": 2_000_000}, {"match": "b", "tokens_per_run": 100_000},
+                            {"match": "c", "tokens_per_run": 100_000}, {"match": "d", "tokens_per_run": 0}]}
+        with open(_wf, "w") as fh:
+            json.dump(_doc, fh)
+        _rows = [{"match": "a", "declared": 2_000_000, "n": 4, "median": 330_400, "usd_run": 1.5, "action": "rewrite"},
+                 {"match": "b", "declared": 100_000, "n": 2, "median": 260_000, "usd_run": 0.5,
+                  "action": "report only (n=2 < 3)"},
+                 {"match": "c", "declared": 100_000, "n": 1, "median": 130_000, "usd_run": 0.3,
+                  "action": "report only (n=1 < 3)"},
+                 {"match": "d", "declared": 0, "n": 0, "median": None, "usd_run": None, "action": "skip: declared 0"}]
+        _live = lambda: (json.load(open(_wf)), [dict(r) for r in _rows])
+        _cm = []
+        _st = f"{t7}/wd_stamp.json"
+        _ln, _wff = weight_drift_pass(dry=True, live=_live, weights=_wf, stamp=_st, today="2026-10-05",
+                                      commit=lambda p, m: _cm.append(p) or "x")
+        check("weight-drift: --dry writes nothing (no file change, no stamp, no commit) and still files",
+              json.load(open(_wf)) == _doc and not os.path.exists(_st) and not _cm and len(_wff) == 1
+              and "dry" in _ln, (_ln, _cm))
+        check("weight-drift: ONE low quiet finding naming only the n<3 row more than 50% off",
+              len(_wff) == 1 and _wff[0]["sev"] == "low" and _wff[0]["kind"] in QUIET_KINDS
+              and _wff[0]["key"] == "weight-drift:maintenance:weights" and "b: declared 100k, measured 260k (n=2)"
+              in _wff[0]["detail"] and "c:" not in _wff[0]["detail"] and "a:" not in _wff[0]["detail"], _wff)
+        _ln, _ = weight_drift_pass(live=_live, weights=_wf, stamp=_st, today="2026-10-05",
+                                   commit=lambda p, m: _cm.append(p) or "x")
+        _w = {w["match"]: w for w in json.load(open(_wf))["weights"]}
+        check("weight-drift: the live pass rewrites n>=3 only (330k), leaves n<3 and a declared 0, commits by path",
+              _w["a"]["tokens_per_run"] == 330_000 and _w["b"]["tokens_per_run"] == 100_000
+              and _w["d"]["tokens_per_run"] == 0 and _cm == [[os.path.relpath(_wf, MC)]]
+              and "1 row(s) rewritten" in _ln, (_ln, _cm, _w))
+        _ln, _ = weight_drift_pass(live=_live, weights=_wf, stamp=_st, today="2026-10-05",
+                                   commit=lambda p, m: _cm.append(p) or "x")
+        check("weight-drift: once a day (a second pass the same day applies nothing)", _ln == "" and len(_cm) == 1, _ln)
+        _ln, _ = weight_drift_pass(live=lambda: (_ for _ in ()).throw(OSError("no ledger")), weights=_wf, stamp=_st)
+        check("weight-drift: a measuring failure is a line, never an exception", "could not measure" in _ln, _ln)
+    finally:
+        shutil.rmtree(t7, ignore_errors=True)
+
+    # the attention KPI rides this pass on Sundays (memo wa-attention-kpi ask 2): fires only on a
+    # Sunday, for the last full ISO week, once that day; a failure is a line, never an exception
+    from datetime import date as _date
+    _week = [_date(2026, 10, d) for d in range(5, 12)]                  # Mon 10-05 .. Sun 10-11
+    check("attention: not due Monday..Saturday",
+          [_attention_due(d, []) for d in _week[:6]] == [None] * 6)
+    check("attention: due on Sunday, for the last FULL week (Mon 09-28 .. Sun 10-04)",
+          _attention_due(_week[6], []) == _date(2026, 9, 28))
+    check("attention: a row for that week generated earlier (the backfill) does not stop it",
+          _attention_due(_week[6], [{"week": "2026-W40", "generated": "2026-10-05T02:00:00Z"}])
+          == _date(2026, 9, 28))
+    check("attention: once that Sunday (a row generated today -> not due again)",
+          _attention_due(_week[6], [{"week": "2026-W40", "generated": "2026-10-11T11:40:00Z"}]) is None)
+    check("attention: a year-end Sunday names the right ISO week (Sun 2027-01-10 -> W53 of 2026)",
+          _attention_due(_date(2027, 1, 10), []) == _date(2026, 12, 28)
+          and _attention_due(_date(2027, 1, 10), [{"week": "2026-W53", "generated": "2027-01-10T11:40Z"}])
+          is None)
+    _calls = []
+
+    class _R:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def _fake(rc=0, exc=None):
+        def go(argv, **kw):
+            _calls.append(argv)
+            if exc:
+                raise exc
+            return _R(rc, "attention week 2026-09-28..2026-10-04: KPI (DECIDE+LEARN) = 41.0%\nwrote x", "boom")
+        return go
+    check("attention: a weekday pass runs nothing and says nothing",
+          _attention_weekly(today=_week[0], rows=[], run=_fake()) == "" and not _calls)
+    _line = _attention_weekly(today=_week[6], rows=[], run=_fake())
+    check("attention: the Sunday pass runs `attention.py week --week <Mon> --limit N` once, reports its KPI line",
+          len(_calls) == 1 and _calls[0][2:] == ["week", "--week", "2026-09-28", "--limit", str(ATTENTION_LIMIT)]
+          and _line.startswith("attention: attention week 2026-09-28") and "41.0%" in _line, (_calls, _line))
+    check("attention: dry names the run and runs nothing",
+          "would measure the week of 2026-09-28" in _attention_weekly(today=_week[6], rows=[], run=_fake(), dry=True)
+          and len(_calls) == 1)
+    check("attention: a failing run (rc 1) or a raising one is a line, never an exception",
+          _attention_weekly(today=_week[6], rows=[], run=_fake(rc=1)).startswith("attention week failed (rc 1)")
+          and _attention_weekly(today=_week[6], rows=[], run=_fake(exc=TimeoutError("t")))
+          .startswith("attention week failed: TimeoutError"))
 
     # the argv contract (2026-10-03): an argument this does not know is exit 2, never the live pass
     P = parse_argv

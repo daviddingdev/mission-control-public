@@ -1082,6 +1082,10 @@ KNOWN_PORTS = {
     8090: ("Poker App Store build (pokerapp.service)", "poker-appstore"),
     8443: ("tailscale serve HTTPS → poker App Store build", "poker-appstore"),
     8911: ("tailscale serve HTTPS → HBS dashboard (:8910)", "hbs"),
+    9222: ("Spark browser: Chrome DevTools (loopback; read through bin/browser.py)", "Mission Control"),
+    6080: ("Spark browser: web viewer (noVNC, loopback)", "Mission Control"),
+    5999: ("Spark browser: VNC screen (loopback; the viewer's backend)", "Mission Control"),
+    8912: ("tailscale serve HTTPS → Spark browser viewer (:6080)", "Mission Control"),
 }
 # Ports that listen only while someone works on them (v2.5, polish #15): declared, so a listening one is
 # never "undeclared", and listed as a service only while it listens — off is their normal state, not down.
@@ -1369,6 +1373,14 @@ def _build_id():
         return "0"
 
 
+def _catalog_names(slugs):
+    """{slug: display name} for the catalog views, through the ONE helper (dashboard/projname.py: the identity
+    registry, as the lead seats read it; memo maintenance_lead-work-one-project-name). Slugs stay the ids and keys;
+    a project with no card (`box`, an unknown reader) keeps its slug."""
+    import projname
+    return projname.names(slugs)
+
+
 def catalog_sources():
     """Every outside system, grouped by category, with what it is and what it feeds.
     Metadata only, and small — the whole thing is a few kB."""
@@ -1400,7 +1412,8 @@ def catalog_sources():
     order = sorted(cats, key=lambda c: (c == "uncategorised", -cats[c]["bytes"], c))
     return {"categories": [cats[c] for c in order],
             "systems": sum(len(c["systems"]) for c in cats.values()),
-            "bytes": sum(c["bytes"] for c in cats.values())}
+            "bytes": sum(c["bytes"] for c in cats.values()),
+            "names": _catalog_names([p for c in cats.values() for x in c["systems"] for p in x["projects"]])}
 
 
 def catalog_origin(origin):
@@ -1428,18 +1441,21 @@ def catalog_origin(origin):
             of.setdefault(cid, set()).add(sys_cat.get(name, "uncategorised"))
 
     groups = {}
+    nm = _catalog_names([r.get("project") for r in ent.values()])
     for cid, r in sorted(ent.items()):
         if r.get("origin") != origin:
             continue
         keys = ([r["project"]] if origin == "internal"
                 else sorted(of.get(cid) or []) or ["derived on the box"])
-        item = {"id": cid, "project": r["project"], "schema": r.get("schema"),
+        item = {"id": cid, "project": r["project"], "project_name": nm.get(r["project"], r["project"]),
+                "schema": r.get("schema"),
                 "layer": r.get("layer"), "bytes": r.get("bytes"), "age_h": r.get("age_h"),
                 "fresh": r.get("fresh"), "exists": r.get("exists"),
                 "private": bool(r.get("private")), "backup": r.get("backup"),
                 "disposable": r.get("disposable"), "reads_30d": r.get("reads_30d")}
         for k in keys:
-            g = groups.setdefault(k, {"key": k, "items": [], "bytes": 0, "unprotected": 0})
+            g = groups.setdefault(k, {"key": k, "items": [], "bytes": 0, "unprotected": 0,
+                                      **({"name": nm.get(k, k)} if origin == "internal" else {})})
             g["items"].append(item)
             g["bytes"] += r.get("bytes") or 0
             if origin == "internal" and r.get("backup") == "none" and not r.get("disposable"):
@@ -1530,8 +1546,11 @@ def catalog_project(slug):
             b["held"] = held[b["id"]]
     if held:
         p["stale"], p["held"] = max(0, (p.get("stale") or 0) - len(held)), len(held)
-    return {"project": slug, "meta": p, "owns": owns, "ins": ins, "outs": outs,
-            "bytes": sum(x["bytes"] or 0 for x in owns), "boards": catalog_boards(slug)}
+    nm = _catalog_names([slug] + [x["owner"] for x in ins] + [y for x in outs for y in x["readers"]])
+    for x in ins:
+        x["owner_name"] = nm.get(x["owner"], x["owner"])
+    return {"project": slug, "project_name": nm.get(slug, slug), "names": nm, "meta": p, "owns": owns, "ins": ins,
+            "outs": outs, "bytes": sum(x["bytes"] or 0 for x in owns), "boards": catalog_boards(slug)}
 
 
 def catalog_boards(slug):
@@ -1593,7 +1612,7 @@ def catalog_view():
     the 30-day read window also move with the clock."""
     paths = [f"{HOME}/maintenance/state/{x}" for x in
              ("catalog.json", "catalog_reads.jsonl", "findings.json")]
-    paths += [os.path.join(BASE, "index.html"), MUTE_FILE]
+    paths += [os.path.join(BASE, "index.html"), MUTE_FILE, f"{HOME}/maintenance/config/projects.json"]
     return _by_sig("catalog_view", paths, _catalog_view_build, max_age=300,
                    extra=_SWEEP["t"])
 
@@ -1692,11 +1711,25 @@ def _catalog_view_build():
             if q is not None:
                 q = projs[ent[cid]["project"]] = dict(q)
                 q["stale"], q["held"] = max(0, (q.get("stale") or 0) - 1), (q.get("held") or 0) + 1
+    # one display name per project (memo maintenance_lead-work-one-project-name): `name` on each project, a
+    # `*_name` beside each slug, and `names` for the slug lists; every slug stays the key the page matches on
+    lk = sorted(links.values(), key=lambda x: -x["n"])
+    nm = _catalog_names(list(projs) + [x[k] for x in lk for k in ("reader", "owner")]
+                        + [f.get("project") for f in open_f + held]
+                        + [p for v in (st.get("sources") or {}).values() for p in v.get("projects") or []])
+    for sl in projs:
+        projs[sl] = {**projs[sl], "name": nm.get(sl, sl)}
+    for x in lk:
+        x["reader_name"], x["owner_name"] = nm.get(x["reader"], x["reader"]), nm.get(x["owner"], x["owner"])
+    open_f = [{**f, "project_name": nm.get(f.get("project"), f.get("project"))} if f.get("project") else f
+              for f in open_f]
+    held = [{**f, "project_name": nm.get(f.get("project"), f.get("project"))} if f.get("project") else f
+            for f in held]
     out = {"at": st.get("at"), "build": _build_id(),
-           "counts": counts, "projects": projs,
+           "counts": counts, "projects": projs, "names": nm,
            "sources": st.get("sources", {}), "order": order,
            "errors": st.get("errors", []),
-           "links": sorted(links.values(), key=lambda x: -x["n"]),
+           "links": lk,
            "findings": open_f, "held": held}
     return out
 
@@ -1895,7 +1928,20 @@ def reports():
         if f.endswith(".md"):
             out.append({"file": f, "mtime": int(os.stat(os.path.join(d, f)).st_mtime),
                         "content": open(os.path.join(d, f), errors="replace").read()[-40000:]})
-    return out
+    # The Sunday catalog review moved to the Data Desk on 2026-10-04 (its CDO review). Its weekly page
+    # lives in the desk's store, read by catalog id (box rule 8; maintenance is a declared reader), and
+    # is listed here as cdo_review_<week>.md so it keeps the place catalog_review_<week>.md had.
+    try:
+        sys.path.insert(0, f"{HOME}/maintenance/bin")
+        import catalog as cat
+        for p in cat.read("data-desk/cdo_review", proj="maintenance"):
+            if p.endswith(".md"):
+                out.append({"file": "cdo_review_" + os.path.basename(p),
+                            "mtime": int(os.stat(p).st_mtime),
+                            "content": open(p, errors="replace").read()[-40000:]})
+    except Exception:
+        pass                                   # no page yet, or the desk is down: the MC reports still list
+    return sorted(out, key=lambda r: -r["mtime"])
 
 
 def attention():
@@ -2254,12 +2300,10 @@ def bus_send(target, title, body, launch):
         f"# {title.strip()}\n\n_From: David via Mission Control dashboard · {today} · target: {target}_\n\n"
         f"{body.strip()}\n")
     # ledger row at proposed — the receiving session owns every later transition
-    row = f"| {today} | {slug} | dashboard (David) | {target} | proposed | inbox/{target}/{fname} |\n"
-    try:
-        cur = open(LEDGER, errors="replace").read().rstrip() + "\n"
-    except Exception:
-        cur = ""
-    open(LEDGER, "w").write(cur + row)
+    # (newest-first, first under the table header: bin/ledger_rows.py, memo review-ledger-hygiene)
+    row = f"| {today} | {slug} | dashboard (David) | {target} | proposed | inbox/{target}/{fname} |"
+    import ledger_rows                                     # bin/ is on sys.path (top of file)
+    ledger_rows.prepend(row, LEDGER)
     msg = f"Memo dropped in inbox/{target}/."
     if launch:
         r = bus_process(target)
@@ -2394,11 +2438,8 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     row = f"| {today} | {slug} | dashboard (David) | {target} | proposed | inbox/{target}/{fname} · dispatched: {mode} |\n"
     if not _ledger_set_status(slug, "proposed", f"inbox/{target}/{fname} · re-dispatched: {mode}",
                               target=target):
-        try:
-            cur = open(LEDGER, errors="replace").read().rstrip() + "\n"
-        except Exception:
-            cur = ""
-        open(LEDGER, "w").write(cur + row)
+        import ledger_rows                                 # newest-first, under the header
+        ledger_rows.prepend(row, LEDGER)
     e = _lead_entry(target)
     if e:
         # a project lead: the same memo, through the lead (Stocks and lead-less projects: below, unchanged)
@@ -2482,13 +2523,9 @@ def bus_ignore(slug):
     else:
         new = [] if _ledger_set_status(slug, status) else ["—"]
     if new:
-        try:
-            cur = open(LEDGER, errors="replace").read().rstrip() + "\n"
-        except Exception:
-            cur = ""
-        open(LEDGER, "w").write(cur + "".join(
-            f"| {today} | {slug} | dashboard (David) | {t} | {status} | dashboard ignore |\n"
-            for t in new))
+        import ledger_rows                                 # newest-first, under the header
+        ledger_rows.prepend([f"| {today} | {slug} | dashboard (David) | {t} | {status} | dashboard ignore |"
+                             for t in new], LEDGER)
     return {"ok": True, "msg": f"Ignored — ledger updated" + (f", {len(moved)} inbox file(s) archived" if moved else "")}
 
 
@@ -3049,6 +3086,8 @@ HOT_ROUTES = {
     "/api/usage":           (120, 1800, 12),
     "/api/crew":            (60, 600, 13),
     "/api/team":            (30, 600, 14),
+    "/api/work":            (30, 600, 15),
+    "/api/report":          (60, 900, 16),
 }
 
 
@@ -3284,6 +3323,8 @@ TT_ROUTES = {
     "/api/live":      ("tt_live", "live"),          # what runs now, and what it touches (v2.2)
     "/api/crew":      ("tt_crew", "crew"),          # the named agents, their state and runs (v2.5)
     "/api/team":      ("tt_team", "team"),          # one seat per project lead, ?id= its sheet (2026-10-03)
+    "/api/work":      ("tt_work", "work"),          # the team's work: planned → in progress → done (2026-10-04)
+    "/api/report":    ("tt_report", "report"),      # the one-page report: moving? your time? talking? (2026-10-05)
 }
 # v2.5: tt_crew.stamp() puts `agent` + `agent_name` on every run these feeds carry — one namer for
 # the desk, the crew, Recent runs and "Last used by"
@@ -3852,7 +3893,7 @@ class H(BaseHTTPRequestHandler):
             if r.get("ok"):
                 # an answered item must never be served as still open: the next status read
                 # waits for the rebuild (tt_decide has already dropped tt_now's own cache)
-                _hot_invalidate("/api/status", "/api/decisions", "/api/timeline", "/api/team")
+                _hot_invalidate("/api/status", "/api/decisions", "/api/timeline", "/api/team", "/api/work", "/api/report")
             self._json(r)
             return
         if m:
@@ -3898,7 +3939,7 @@ class H(BaseHTTPRequestHandler):
             return
         # what a click changes shows on the next read: memos waiting on David, an update
         # running, an experiment's status
-        _hot_invalidate("/api/status", "/api/overview", "/api/timeline", "/api/team")
+        _hot_invalidate("/api/status", "/api/overview", "/api/timeline", "/api/team", "/api/work", "/api/report")
         self._json(r)
 
 
@@ -4160,6 +4201,23 @@ def selftest():
        and _hot_spec("/api/live") is None and _hot_spec("/api/live?since=1790000000") is None
        and not any(k.startswith("/api/live") for k in _HOT),
        "/api/live is a tt route that bypasses the hot cache")
+    # 2026-10-04: /api/work (the team's work, tt_work) rides the hot cache like /api/team, at its own priority, and
+    # every POST that invalidates /api/team invalidates it too (an answered question must leave both at once)
+    import inspect
+    prios = [v[2] for v in HOT_ROUTES.values()]
+    post_src = inspect.getsource(H._post)
+    ok(TT_ROUTES.get("/api/work") == ("tt_work", "work") and HOT_ROUTES.get("/api/work", (0, 0, 0))[:2] == HOT_ROUTES["/api/team"][:2]
+       and len(prios) == len(set(prios)) and (_hot_spec("/api/work?lite=1") or ("",))[0] == "/api/work?lite=1"
+       and (_hot_spec("/api/work?lead=pm") or ("",))[0] == "/api/work?lead=pm"
+       and post_src.count('"/api/team"') == post_src.count('"/api/work"') >= 2,
+       "/api/work: a hot tt route beside /api/team (same fresh/stale, unique priority), invalidated wherever it is")
+    # 2026-10-05: /api/report (the one-page report, tt_report) rides the hot cache after /api/work, rebuilt at most once a
+    # minute while watched (its sources change daily or per answer), and an answer invalidates it with /api/team (the
+    # verdict counts the questions)
+    ok(TT_ROUTES.get("/api/report") == ("tt_report", "report") and HOT_ROUTES.get("/api/report", (0, 0, 0))[:2] == (60, 900)
+       and HOT_ROUTES["/api/report"][2] > HOT_ROUTES["/api/work"][2] and (_hot_spec("/api/report") or ("",))[0] == "/api/report"
+       and post_src.count('"/api/report"') == post_src.count('"/api/team"'),
+       "/api/report: a hot tt route after /api/work, invalidated wherever /api/team is")
 
     # the last text-fit round (2026-10-03): /api/team?id=<no such lead> is a 404 with the module's own body
     ok(_not_found("/api/team?id=bogus", {"error": "no seat 'bogus'", "ids": ["pm"]})

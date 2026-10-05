@@ -27,10 +27,21 @@ if __name__ == "__main__" and sys.argv[1:] and not any(a in ("-h", "--help") for
 
 BUS = f"{HOME}/memos"
 # memo-process.py runs daily at 08:20Z: one session per inbox (a project lead takes its whole
-# inbox, Stocks one memo), up to 4 inboxes a run. A memo that has survived seven of those passes is
-# not waiting its turn — it is stuck. One parked on purpose with `waiting-until <date>` (a lead's
-# gate, at most 30 days, lead.memo_state) is not, until that day: it is left out (2026-10-02).
+# inbox, Stocks one memo), up to 6 inboxes a run (MAX_SESSIONS, ef51486). A memo that has survived
+# seven of those passes is not waiting its turn — it is stuck. One parked on purpose with
+# `waiting-until <date>` (a lead's gate, at most 30 days, lead.memo_state) is not, until that day:
+# it is left out (2026-10-02). Nor is one parked `needs-david` (2026-10-04): it already stands on
+# Needs attention, where David answers it, and a push about it restates an ask ("ask once, never
+# restate"); stocks/learn-valuation-test-and-global-tnum would have paged at 10-05 10:35Z for it.
+# Since 2026-10-04 the COO's daily ops build (bin/coo.py, 11:57Z) is the working signal: it hands a
+# memo eligible for 48 h or an ask owed for 14 days to its OWNING lead as a judgment trigger. This
+# script stays the phone backstop for what even that leaves behind.
 STUCK_H = 24 * 7
+SKIP_STATES = ("waiting", "needs-david")
+# Rows whose target is paused for every lead are not stuck, they are held: Stocks runs only through
+# its PM's own harness while David keeps it closed (David 2026-10-02: "don't touch stock for now";
+# lead_base.md class `stocks`). The COO's ops map still counts them.
+PAUSED_TARGETS = {"stocks"}
 try:
     import lead as _lead
     _rows = _lead.ledger_rows()
@@ -46,7 +57,7 @@ for proj in sorted(os.listdir(f"{BUS}/inbox")) if os.path.isdir(f"{BUS}/inbox") 
         age_h = (now - os.path.getmtime(p)) / 3600
         if age_h > STUCK_H:
             try:
-                if _lead and _lead.memo_state(proj, f, _rows, None, os.path.getmtime(p))[0] == "waiting":
+                if _lead and _lead.memo_state(proj, f, _rows, None, os.path.getmtime(p))[0] in SKIP_STATES:
                     continue
             except Exception:
                 pass
@@ -60,9 +71,14 @@ for proj in sorted(os.listdir(f"{BUS}/inbox")) if os.path.isdir(f"{BUS}/inbox") 
 
 try:
     for line in open(f"{BUS}/LEDGER.md", errors="replace"):
-        m = re.match(r"\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*([^|]+)\|[^|]*\|[^|]*\|\s*([^|]+)\|", line)
+        m = re.match(r"\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*([^|]+)\|[^|]*\|\s*([^|]*)\|\s*([^|]+)\|", line)
         if m:
-            date, memo, status = m.group(1), m.group(2).strip(), m.group(3).strip().lower()
+            # markdown marks stripped first: "**accepted**" read as not-accepted, so a row accepted
+            # 27 days (research-session-wall-clock-cap) was invisible here (2026-10-04)
+            date, memo = m.group(1), m.group(2).strip()
+            target, status = m.group(3).strip().lower(), re.sub(r"[*_`]", "", m.group(4)).strip().lower()
+            if target in PAUSED_TARGETS:
+                continue
             if ("proposed" in status or status.startswith("accepted")) and "implemented" not in status:
                 age_d = (now - time.mktime(time.strptime(date, "%Y-%m-%d"))) / 86400
                 if age_d > LEDGER_STUCK_D:
