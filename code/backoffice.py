@@ -1665,7 +1665,8 @@ def _iso_ts(s):
 def _browser_signin_findings(f, state, sites_cfg):
     """Rule browser-signin (memo browser-signin-needs-attention ask 1): a site the Spark browser was
     signed in to once (`signed_in_once`) that `browser.py daily` now reads as logged_out or
-    challenge. A registered site David never signed in to stays silent."""
+    challenge. A registered site David never signed in to stays silent, and so does a signed-out site
+    marked `ask: when_needed` (its job asks him with `browser.py ask-signin` when it needs the site)."""
     sites = (state or {}).get("sites") or {}
     cfg = (sites_cfg or {}).get("sites") or {}
     for site, s in sorted(sites.items()):
@@ -1674,6 +1675,8 @@ def _browser_signin_findings(f, state, sites_cfg):
         st = s.get("state")
         if st not in ("logged_out", "challenge"):
             continue
+        if st == "logged_out" and (cfg.get(site) or {}).get("ask") == "when_needed":
+            continue        # 12twenty (2026-10-05): its job asks with `browser.py ask-signin` when it needs him
         label = (cfg.get(site) or {}).get("label") or site
         what = "a bot check (challenge)" if st == "challenge" else "signed out"
         _finding(f, "browser-signin", "med", f"the Spark browser is signed out of {label}",
