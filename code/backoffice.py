@@ -33,14 +33,18 @@ Design rules, in case a later session wants to extend it:
              into config/dev.json, and a "I'll do it myself" answer is checked and closed
     history-backfill  one-time seed of each finding's first_ever_seen / reopen_count / history
              from state/decisions.jsonl and findings.json (--dry prints, writes nothing)
+    experiments  rule 46 (experiment-no-driver) alone: the oldest Queue item older than 7 days with
+             no design memo gets one design-only session (prompts/experiment_design.md) through
+             `claudeq.py run --kind frontier`, at most 3 a week; --dry says what it would launch
 
-CLI: backoffice.py [census|audit|fix|brief|run|show|decide|selftest|history-backfill] [--dry|--dry-run]
+CLI: backoffice.py [census|audit|fix|brief|run|show|decide|selftest|history-backfill|experiments] [--dry|--dry-run]
      (no command = run; --dry and --dry-run are the same; any other argument exits 2 and runs
      nothing — 2026-10-03: until then `--dry-run`, or any typo, ran the live pass)
 """
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2474,7 +2478,8 @@ QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe",
                "browser-signin", "dashboard-check-red", "push-undelivered", "guard-deny",
                "restore-unproven", "manifest-stale",
                "ledger-order", "weight-drift",  # rules 42-43 (2026-10-05): low, filed, never a push
-               "fleet-stop-engaged", "backup-stray"}  # rules 44-45: David engaged it / filed, never a push
+               "fleet-stop-engaged", "backup-stray",  # rules 44-45: David engaged it / filed, never a push
+               "experiment-no-driver"}  # rule 46: the design memo reaches David as memos do today, no new push
 
 
 def _push_worthy(new):
@@ -4258,6 +4263,174 @@ def _adopt_experiment(finding_title):
     return True
 
 
+# ---------------------------------------------------------------- experiment-no-driver (rule 46)
+# Memo wa-handoffs-and-frontier, slice 2/2 (2026-10-07). The Queue had no driver: every graveyard
+# reason read "3 weeks without a design memo", and no memo in proposals/ was newer than 08-10. Once
+# a pass, the oldest Queue item older than EXP_DRIVE_AGE_D days with no design memo gets a
+# design-only session (prompts/experiment_design.md, kind `frontier`) through `claudeq.py run`,
+# at most EXP_DRIVE_WEEK_MAX launches in any 7 days, never twice for one item. A typed queue
+# filing (claudeq's enqueue) is NOT used: its tick dispatches only Stocks' kinds and would drop a
+# frontier job as "unknown job kind"; `claudeq.py run` is the client every non-Stocks job uses.
+# A run the queue refused (SKIPPED in its log) never started, so the item is tried again next pass.
+# Stocks targets are held (David's while Stocks is paused): no job, no memo, a line saying so.
+EXP_DRIVER = "experiment_driver.json"          # under STATE: slug -> {title, attempts: [...]}
+EXP_DRIVE_AGE_D = 7
+EXP_DRIVE_WEEK_MAX = 3
+EXP_DRIVE_PER_PASS = 1                          # one a day keeps three 30-min sessions from stacking
+EXP_DRIVE_SKIPS_MAX = 5                         # refused this many times running -> a finding
+EXP_DRIVE_EST = 30
+# OFF (maintenance_lead 2026-10-07): bin/ is a zero-Claude-token zone, and the janitor must not start a Claude
+# session itself. Until the design run has its own cron line (prompts/experiment_design.md through claudeq, after
+# the pilot ends 10-16: memo wa-handoffs-and-frontier slice 3/3), the rule only reports what it would launch.
+EXP_DRIVE_LAUNCH = False
+
+
+def _exp_memo_slug(title):
+    """The memo's file slug: the dashboard's _slug (server.py) on the title without its date, so a
+    memo this writes is the one the dashboard's run_experiment would have written."""
+    s = re.sub(r"[^a-z0-9]+", "-", _short_full(title).lower()).strip("-")
+    if len(s) > 40:
+        s = s[:40].rsplit("-", 1)[0]
+    return s
+
+
+def _short_full(title):
+    return re.sub(r"^[\d-]+\s*·\s*", "", title).strip()
+
+
+def _exp_queue_items(text):
+    """The Queue section of experiments.md -> [{title, queued, slug, target, memo, stocks}]."""
+    out = []
+    queue = text.split("## Queue", 1)[-1].split("## Adopted", 1)[0]
+    for block in re.split(r"\n(?=### )", queue):
+        m = re.match(r"### ([^\n]+)", block.strip())
+        if not m:
+            continue
+        title = m.group(1).strip()
+        d = re.match(r"(\d{4}-\d{2}-\d{2})", title)
+        tgt = re.search(r"\*\*Target:\*\*\s*([^\n]+)", block)
+        tgt = tgt.group(1) if tgt else ""
+        memo = re.search(r"\*\*Memo:\*\*\s*(\S+)", block)
+        out.append({"title": title, "queued": d.group(1) if d else "", "slug": _exp_memo_slug(title),
+                    "target": tgt, "memo": memo.group(1) if memo else None,
+                    "stocks": bool(re.search(r"~/Stocks\b|\bStocks/", tgt))})
+    return out
+
+
+def _exp_attempt_state(a, alive=None, read=None):
+    """One launch record -> running | skipped | ran. `alive(pid)` / `read(path)` are the selftest's."""
+    alive = alive or _pid_alive
+    if a.get("dry"):
+        return "dry"
+    if a.get("pid") and alive(a["pid"]):
+        return "running"
+    try:
+        txt = (read or (lambda p: open(p, errors="replace").read()))(a.get("log") or "")
+    except OSError:
+        txt = ""
+    tail = txt.split(a.get("marker") or "\x00", 1)[-1] if a.get("marker") and a["marker"] in txt else ""
+    return "skipped" if "claudeq run: SKIPPED" in tail else "ran"
+
+
+def experiment_driver(dry=False, now_ts=None, mc=None, state_dir=None, spawn=None, alive=None, read=None):
+    """Rule 46, `experiment-no-driver`. -> (lines, findings). Dry reports what it WOULD launch and
+    launches nothing, writes nothing. `spawn(argv, log) -> pid` and the paths are the selftest's."""
+    now_ts = int(time.time() if now_ts is None else now_ts)
+    mc, state_dir = mc or MC, state_dir or STATE
+    today = datetime.fromtimestamp(now_ts, timezone.utc).strftime("%Y-%m-%d")
+    lines, f = [], []
+    try:
+        text = open(os.path.join(mc, "experiments.md"), errors="replace").read()
+    except OSError as e:
+        return [f"experiment driver: experiments.md unreadable ({e})"], f
+    sp = os.path.join(state_dir, EXP_DRIVER)
+    st = load(sp, {})
+    try:
+        props = os.listdir(os.path.join(mc, "proposals"))
+    except OSError:
+        props = []
+    week = [a for v in st.values() for a in v.get("attempts", [])
+            if now_ts - a.get("at", 0) < 7 * 86400 and _exp_attempt_state(a, alive, read) != "skipped"]
+    budget = max(0, min(EXP_DRIVE_PER_PASS, EXP_DRIVE_WEEK_MAX - len(week)))
+    items = sorted(_exp_queue_items(text), key=lambda x: x["queued"] or "9999")
+    for it in items:
+        slug = it["slug"]
+        has_memo = it["memo"] or any(p.endswith(f"_{slug}.md") for p in props)
+        if has_memo or not it["queued"]:
+            continue
+        age = (now_ts - datetime.strptime(it["queued"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) / 86400
+        if age < EXP_DRIVE_AGE_D:
+            continue
+        name = _short(it["title"])
+        if it["stocks"]:
+            lines.append(f"experiment driver: held '{name}' (target is Stocks; David's while Stocks is paused)")
+            continue
+        rec = st.get(slug, {})
+        att = rec.get("attempts", [])
+        states = [_exp_attempt_state(a, alive, read) for a in att]
+        if "running" in states:
+            lines.append(f"experiment driver: '{name}' design session is running")
+            continue
+        if "ran" in states:                      # never twice for one item: the run happened, no memo came
+            _finding(f, "experiment-no-driver", "med", f"'{name}' design session ran but wrote no memo",
+                     f"launched {datetime.fromtimestamp(att[states.index('ran')]['at'], timezone.utc):%Y-%m-%d} "
+                     f"(log {att[states.index('ran')].get('log')}); the driver does not launch it twice. Read the "
+                     "log, then re-run by hand or move the item to the Graveyard", "maintenance", key=f"exp-ran:{slug}")
+            continue
+        skips = states.count("skipped")
+        if skips >= EXP_DRIVE_SKIPS_MAX:
+            _finding(f, "experiment-no-driver", "low", f"'{name}' design job refused by the Claude queue {skips} times",
+                     "claudeq.py run SKIPPED it every pass (5h budget or the clock); the driver keeps trying daily",
+                     "maintenance", key=f"exp-skips:{slug}")
+        if budget <= 0:
+            lines.append(f"experiment driver: '{name}' waits ({age:.0f}d old; "
+                         f"{len(week)} of {EXP_DRIVE_WEEK_MAX} this week, {EXP_DRIVE_PER_PASS} per pass)")
+            continue
+        budget -= 1
+        log = os.path.join(mc, "logs", f"experiment_design_{slug}.log")
+        rendered = os.path.join(state_dir, "experiment_design", f"{slug}.md")
+        job = f"frontier design: {slug}"
+        cmd = (f"python3 {mc}/bin/claudeq.py run --kind frontier --est {EXP_DRIVE_EST} --job {shlex.quote(job)} "
+               f"--wait 20 --quiet -- timeout 1800 {mc}/bin/claude-headless -p \"$(cat {shlex.quote(rendered)})\" "
+               "--dangerously-skip-permissions")
+        if dry:
+            lines.append(f"experiment driver: would launch '{name}' ({age:.0f}d old, no memo) as claudeq "
+                         f"frontier job {job!r} -> proposals/{today}_{slug}.md")
+            continue
+        try:
+            tpl = open(os.path.join(mc, "prompts", "experiment_design.md")).read()
+            for k, v in (("{title}", _short_full(it["title"])), ("{queued}", it["queued"]),
+                         ("{date}", today), ("{slug}", slug)):
+                tpl = tpl.replace(k, v)
+            os.makedirs(os.path.dirname(rendered), exist_ok=True)
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(rendered, "w") as fh:
+                fh.write(tpl)
+            marker = f"=== experiment-no-driver {now_ts} ==="
+            with open(log, "a") as fh:
+                fh.write(f"\n{marker}\n")
+            pid = (spawn or _exp_spawn)(["bash", "-c", cmd], log)
+        except Exception as e:                   # a launch failure is a line and a finding, never a crash
+            lines.append(f"experiment driver: launch of '{name}' failed: {type(e).__name__}: {e}")
+            _finding(f, "experiment-no-driver", "med", f"'{name}' design job could not be launched",
+                     f"{type(e).__name__}: {e}"[:200], "maintenance", key=f"exp-launch:{slug}")
+            continue
+        att.append({"at": now_ts, "pid": pid, "log": log, "marker": marker, "job": job})
+        st[slug] = {"title": it["title"], "attempts": att}
+        save(sp, st)
+        lines.append(f"experiment driver: launched '{name}' as claudeq frontier job {job!r} (pid {pid}, log "
+                     f"{os.path.relpath(log, mc)})")
+    return lines, f
+
+
+def _exp_spawn(argv, log):
+    """Detached: the session outlives the daily pass; claudeq.py run holds the box slot for it."""
+    with open(log, "ab") as fh:
+        p = subprocess.Popen(argv, stdout=fh, stderr=fh, cwd=MC, start_new_session=True,
+                             stdin=subprocess.DEVNULL)
+    return p.pid
+
+
 def _append_registry_row(reg_path, job, script):
     """Insert a row in the section for the job's project, creating the section if new."""
     text = open(reg_path).read()
@@ -4853,6 +5026,12 @@ def run(dry=False):
     except Exception as e:                       # the weight pass must never break the pass
         _wd_line, _wd_f = f"weight drift failed: {type(e).__name__}: {e}", []
     fresh += _wd_f
+    # rule 46 (memo wa-handoffs-and-frontier slice 2/2): a stale Queue item gets its design session
+    try:
+        _ed_lines, _ed_f = experiment_driver(dry=dry or not EXP_DRIVE_LAUNCH)
+    except Exception as e:                       # the driver must never break the pass
+        _ed_lines, _ed_f = [f"experiment driver failed: {type(e).__name__}: {e}"], []
+    fresh += _ed_f
     # David's dashboard answers first, so a mute he chose skips this very pass's merge
     decided = apply_decisions(fresh, dry=dry)
     new, resolved, open_f = merge_findings(fresh)
@@ -4877,6 +5056,8 @@ def run(dry=False):
         print(f"  repeat: {k} -> {outcome}")
     if _wd_line:
         print(f"  {_wd_line}")
+    for _ln in _ed_lines:
+        print(f"  {_ln}")
     if not dry:
         for p in _clean_stale_pyc():
             print(f"  removed a stale byte-code cache: {os.path.relpath(p, MC)}")
@@ -6350,8 +6531,72 @@ def selftest():
           and _attention_weekly(today=_week[6], rows=[], run=_fake(exc=TimeoutError("t")))
           .startswith("attention week failed: TimeoutError"))
 
+    # rule 46 experiment-no-driver (memo wa-handoffs-and-frontier slice 2/2), on a scratch tree
+    _ex = tempfile.mkdtemp(prefix="backoffice-expdrv.")
+    try:
+        os.makedirs(f"{_ex}/prompts"); os.makedirs(f"{_ex}/proposals"); os.makedirs(f"{_ex}/state")
+        open(f"{_ex}/prompts/experiment_design.md", "w").write("design {title} queued {queued} -> {date}_{slug}.md")
+        open(f"{_ex}/experiments.md", "w").write(
+            "# q\n\n## Queue\n\n### 2026-09-18 · Stale poker corpus\n- **Target:** `~/poker/tools/`\n\n"
+            "### 2026-09-18 · Stale Stocks trim\n- **Target:** `~/Stocks/_engine/agent/loop.py`\n\n"
+            "### 2026-09-20 · Has memo already\n- **Target:** `~/hbs/x`\n- **Memo:** proposals/x.md — SKIP\n\n"
+            "### 2026-09-21 · Second stale item\n- **Target:** `~/maintenance/bin/x.py`\n\n"
+            "### 2026-09-22 · Third stale item\n- **Target:** `~/hbs/bin/ingest.py`\n\n"
+            "### 2026-09-23 · Fourth stale item\n- **Target:** `~/poker/x`\n\n"
+            "### 2026-10-05 · Fresh item\n- **Target:** `~/poker/x`\n\n## Adopted\n\n## Graveyard\n")
+        T = int(datetime(2026, 10, 7, 11, 36, tzinfo=timezone.utc).timestamp())
+        spawned, live, logs = [], set(), {}
+        def _spawn(argv, log):
+            spawned.append((argv, log)); return 1000 + len(spawned)
+        _alive = lambda pid: pid in live
+        _read = lambda p: open(p, errors="replace").read() + logs.get(p, "")
+        ED = lambda dry=False, ts=T: experiment_driver(dry=dry, now_ts=ts, mc=_ex, state_dir=f"{_ex}/state",
+                                                      spawn=_spawn, alive=_alive, read=_read)
+        _l, _f = ED(dry=True)
+        check("experiment-no-driver: dry names the oldest stale item, launches nothing, writes no state",
+              not spawned and not os.path.exists(f"{_ex}/state/{EXP_DRIVER}")
+              and any("would launch 'Stale poker corpus'" in x for x in _l), _l)
+        check("experiment-no-driver: a Stocks-target item is held with a line, never launched",
+              any("held 'Stale Stocks trim'" in x for x in _l) and not any("would launch 'Stale Stocks" in x for x in _l))
+        _l, _f = ED()
+        _st = load(f"{_ex}/state/{EXP_DRIVER}", {})
+        check("experiment-no-driver: a stale item enqueues exactly ONE claudeq run --kind frontier job",
+              len(spawned) == 1 and "claudeq.py run --kind frontier" in spawned[0][0][2]
+              and "claude-headless" in spawned[0][0][2] and list(_st) == ["stale-poker-corpus"], (spawned, _st))
+        check("experiment-no-driver: the rendered prompt carries the item, the date and the memo slug",
+              open(f"{_ex}/state/experiment_design/stale-poker-corpus.md").read()
+              == "design Stale poker corpus queued 2026-09-18 -> 2026-10-07_stale-poker-corpus.md")
+        live.add(1001)
+        ED(ts=T + 86400)
+        check("experiment-no-driver: next pass, the running item is not relaunched; the next stale one goes",
+              [os.path.basename(s[1]) for s in spawned] == ["experiment_design_stale-poker-corpus.log",
+                                                             "experiment_design_second-stale-item.log"],
+              [s[1] for s in spawned])
+        live.discard(1001)
+        _l, _f = ED(ts=T + 2 * 86400)
+        check("experiment-no-driver: an item whose session ran and wrote no memo is never launched twice "
+              "(a finding instead)", "stale-poker-corpus" not in spawned[-1][1]
+              and any(x["kind"] == "experiment-no-driver" and "Stale poker corpus" in x["title"] for x in _f), _f)
+        with open(spawned[1][1], "a") as _fh:
+            _fh.write("claudeq run: SKIPPED frontier design: second-stale-item — 5h budget\n")
+        n = len(spawned)
+        _l, _f = ED(ts=T + 3 * 86400)
+        check("experiment-no-driver: a run the queue SKIPPED never started; it is retried, inside the cap",
+              len(spawned) == n + 1 and "second-stale-item" in spawned[-1][1], [s[1] for s in spawned])
+        _l, _f = ED(ts=T + 4 * 86400)
+        check("experiment-no-driver: at most 3 started launches in 7 days (the skipped one not counted)",
+              len(spawned) == 4 and any("Fourth stale item' waits" in x and "3 of 3" in x for x in _l), _l)
+        open(f"{_ex}/proposals/2026-10-01_fourth-stale-item.md", "w").write("# memo")
+        check("experiment-no-driver: a memo file in proposals/ counts as a memo; fresh items wait their week",
+              not any("Fourth stale" in x or "Fresh item" in x for x in ED(dry=True, ts=T)[0]))
+    finally:
+        shutil.rmtree(_ex, ignore_errors=True)
+
     # the argv contract (2026-10-03): an argument this does not know is exit 2, never the live pass
     P = parse_argv
+    check("argv: `experiments` and `experiments --dry` parse; `experiments --now` is exit 2",
+          P(["experiments", "--dry"]) == ("experiments", True, "") and P(["experiments"]) == ("experiments", False, "")
+          and bool(P(["experiments", "--now"])[2]))
     check("argv: history-backfill takes --dry / --dry-run, and an unknown flag after it is exit 2",
           P(["history-backfill", "--dry"]) == ("history-backfill", True, "")
           and P(["history-backfill"]) == ("history-backfill", False, "")
@@ -6367,8 +6612,9 @@ def selftest():
     return 0 if ok else 1
 
 
-COMMANDS = ("census", "audit", "fix", "brief", "run", "show", "decide", "selftest", "history-backfill")
-USAGE = ("usage: backoffice.py [census|audit|fix|brief|run|show|decide|selftest|history-backfill] "
+COMMANDS = ("census", "audit", "fix", "brief", "run", "show", "decide", "selftest", "history-backfill",
+            "experiments")
+USAGE = ("usage: backoffice.py [census|audit|fix|brief|run|show|decide|selftest|history-backfill|experiments] "
          "[--dry|--dry-run] | --help")
 
 
@@ -6420,5 +6666,11 @@ if __name__ == "__main__":
         sys.exit(selftest())
     elif cmd == "history-backfill":
         sys.exit(history_backfill(dry=dry))
+    elif cmd == "experiments":                   # rule 46 alone; --dry launches nothing, writes nothing
+        _ls, _fs = experiment_driver(dry=dry or not EXP_DRIVE_LAUNCH)
+        for _ln in _ls or ["experiment driver: nothing to drive"]:
+            print(_ln)
+        for _f in _fs:
+            print(f"[{_f['sev']:>4}] {_f['kind']:<18} {_f['title']}")
     elif cmd == "run":
         sys.exit(run(dry=dry))

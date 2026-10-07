@@ -2965,6 +2965,55 @@ def _overview_build():
     return data
 
 
+WINDOW_FILE = f"{HOME}/maintenance/state/window.jsonl"
+WINDOW_STALE_S = 2 * 3600
+
+
+def window_state(path=None, now=None):
+    """The real Claude usage window for the Overview's box line (memo wa-usage-window slice 3/3):
+    the latest level sample bin/window_sample.py wrote to state/window.jsonl (rows with a `kind`
+    are window_limits.py's limit hits, skipped). None when there is no sample. A window whose
+    resets_at has passed reads null (that window has reset; the sample no longer says its level).
+    `stale` past 2 h. Reads only the file's last 64 KB."""
+    path = path or WINDOW_FILE
+    now = time.time() if now is None else now
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 65536))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    row = None
+    for ln in reversed(lines):
+        try:
+            r = json.loads(ln)
+        except Exception:
+            continue
+        if isinstance(r, dict) and not r.get("kind") and r.get("ts"):
+            row = r
+            break
+    if row is None:
+        return None
+    try:
+        import calendar
+        at = calendar.timegm(time.strptime(row["ts"], "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return None
+    out = {"sampled_at": int(at), "age_s": max(0, int(now - at)),
+           "stale": now - at > WINDOW_STALE_S}
+    for k in ("five_hour", "seven_day"):
+        pct, reset = row.get(k + "_pct"), row.get(k + "_resets_at")
+        live = isinstance(pct, (int, float)) and not isinstance(pct, bool) and (
+            not isinstance(reset, (int, float)) or reset > now)
+        out[k + "_pct"] = round(float(pct), 1) if live else None
+        out[k + "_resets_at"] = int(reset) if live and isinstance(reset, (int, float)) else None
+    if out["five_hour_pct"] is None and out["seven_day_pct"] is None:
+        return None
+    return out
+
+
 def _overview_lite_build():
     """/api/overview?lite=1: only what the Overview and Box pages read — system, the Claude
     queue, the catalog tiles and three job counts — 2 KB instead of 18 KB gzipped on every
@@ -2972,7 +3021,7 @@ def _overview_lite_build():
     work. The full payload stays at /api/overview for Agents › Usage."""
     return {"generated_at": int(time.time()), "lite": True, "system": system_stats(),
             "sessions": {"queue": _stocks_queue()}, "catalog": catalog_summary(),
-            "crons_summary": crons_summary()}
+            "crons_summary": crons_summary(), "window": window_state()}
 
 
 def _fleet_roster(refresh_after=600):
@@ -3578,6 +3627,51 @@ def _host_ok(host):
     return h in _HOSTS
 
 
+
+# Who sent each answer, by tailnet node (memo wa-injection-boundary slice 4/4, 2026-10-07). OBSERVE ONLY: a row in
+# state/decision_peers.jsonl per /api/decisions POST, with `tailscale whois` of the peer (cached 10 min per peer).
+# Nothing is refused on it yet; once the log shows David's nodes, a by=david rule can be proposed for tt_decide
+# (fence). Never raises: an answer must never fail because whois did.
+_WHOIS = {}
+
+
+def _whois(peer):
+    now = time.time()
+    hit = _WHOIS.get(peer)
+    if hit and now - hit[0] < 600:
+        return hit[1]
+    out = {}
+    try:
+        ip = ipaddress.ip_address(peer)
+        if ip.is_loopback:
+            out = {"loopback": True}
+        else:
+            r = subprocess.run(["tailscale", "whois", "--json", peer], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                j = json.loads(r.stdout or "{}")
+                out = {"node": ((j.get("Node") or {}).get("ComputedName") or (j.get("Node") or {}).get("Name") or "")[:64],
+                       "user": ((j.get("UserProfile") or {}).get("LoginName") or "")[:64]}
+            else:
+                out = {"whois": "no answer"}
+    except Exception as e:
+        out = {"whois": f"error {type(e).__name__}"}
+    _WHOIS[peer] = (now, out)
+    return out
+
+
+def _log_decision_peer(path, body, r):
+    try:
+        via = (body or {}).get("_via") or {}
+        peer = str(via.get("peer") or "")
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "path": path,
+               "key": str((body or {}).get("key") or "")[:120], "ok": bool((r or {}).get("ok")),
+               "peer": peer[:64], "page": bool(via.get("page"))}
+        row.update(_whois(peer) if peer else {})
+        with open(f"{HOME}/maintenance/state/decision_peers.jsonl", "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
 class H(BaseHTTPRequestHandler):
     # HTTP/1.1: the page's six requests share connections instead of opening one each (every
     # response already carries Content-Length). An idle kept-alive socket is closed after
@@ -3890,6 +3984,8 @@ class H(BaseHTTPRequestHandler):
                 # the request's own facts; a `_via` the client sent is dropped, never trusted
                 body = dict(body, _via=self._via())
             r = _tt_post(path, body)
+            if path.startswith("/api/decisions"):
+                _log_decision_peer(path, body, r)
             if r.get("ok"):
                 # an answered item must never be served as still open: the next status read
                 # waits for the rebuild (tt_decide has already dropped tt_now's own cache)
@@ -4427,6 +4523,25 @@ def selftest():
         ok(json.dumps(relogin_status()) == out, "relogin_status() prints what the script prints")
     except Exception as x:
         ok(False, f"relogin script ran: {x}")
+
+    # 6b. the real usage window (wa-usage-window 3/3): the last level sample, limit rows skipped
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        wp = os.path.join(td, "window.jsonl")
+        t0 = 1_800_000_000
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        ok(window_state(wp, t0) is None, "window: no file, no window")
+        with open(wp, "w") as fh:
+            fh.write(json.dumps({"ts": iso(t0 - 600), "five_hour_pct": 42, "five_hour_resets_at": t0 + 3600,
+                                 "seven_day_pct": 18, "seven_day_resets_at": t0 + 86400}) + "\n")
+            fh.write(json.dumps({"ts": iso(t0 - 60), "kind": "limit", "limit_type": "five_hour"}) + "\n")
+        w = window_state(wp, t0)
+        ok(w and w["five_hour_pct"] == 42 and w["seven_day_pct"] == 18 and w["age_s"] == 600
+           and not w["stale"] and w["five_hour_resets_at"] == t0 + 3600, f"window: the last level row, limit row skipped ({w})")
+        w = window_state(wp, t0 + 3 * 3600)
+        ok(w and w["stale"] and w["five_hour_pct"] is None and w["seven_day_pct"] == 18,
+           f"window: stale past 2 h; a window past its reset reads null ({w})")
+        ok(window_state(wp, t0 + 2 * 86400) is None, "window: both windows reset, no window")
 
     # 7. over the wire: keep-alive, HEAD, ETag/304, the guard, a tt POST that is not there
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)

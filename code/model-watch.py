@@ -126,6 +126,18 @@ def scan(seen, days, fetch=None):
     return fresh, checked, errors
 
 
+def _report_clean():
+    """True when reports/model-watch.md has no uncommitted change, so the lines this run appends are
+    the only change and may be committed by path (the 10-05 run's lines sat uncommitted for 2 days)."""
+    try:
+        r = subprocess.run(["git", "-C", str(REPORT.parent.parent), "status", "--porcelain", "--",
+                            str(REPORT.relative_to(REPORT.parent.parent))],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0 and not r.stdout.strip()
+    except Exception:
+        return False
+
+
 def run(days=8, dry=False):
     prev = json.loads(STATE.read_text()) if STATE.exists() else {}
     seen = set(prev.get("seen", []))
@@ -158,8 +170,13 @@ def run(days=8, dry=False):
         lines.append(f"- **{f['id']}** ({f['created']}, ♥{f['likes']}) — {v.replace(chr(10), ' · ')}")
     _write_state(_state(seen, checked, errors, len(fresh), days, prev))
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    was_clean = _report_clean()
     with open(REPORT, "a") as fh:
         fh.write(f"\n## {stamp} — {len(fresh)} new, {notable} pull-candidate(s)\n" + "\n".join(lines) + "\n")
+    if was_clean:     # commit our own lines by path; never sweep up someone else's edit (2026-10-07)
+        subprocess.run(["git", "-C", str(REPORT.parent.parent), "commit", "-q", "-m",
+                        f"model-watch: {stamp}, {len(fresh)} new, {notable} pull-candidate(s)", "--",
+                        str(REPORT.relative_to(REPORT.parent.parent))], capture_output=True, timeout=30)
     msg = f"{len(fresh)} new open-model release(s), {notable} pull-candidate(s). reports/model-watch.md"
     subprocess.run([str(HOME / "maintenance/bin/notify.sh"), "maintenance", "Open models", msg],
                    capture_output=True, timeout=30)
