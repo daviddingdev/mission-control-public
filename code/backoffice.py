@@ -937,6 +937,13 @@ def _legacy_of(f, fid):
                 and _digitless(fid) == _digitless(f["id"]))
 
 
+def _plural_title(title):
+    """"3 job(s)" -> "3 jobs", "1 job(s)" -> "1 job" in a finding's title (2026-10-08: the dashboard
+    check fails on "(s)" in a work title, and root-cause memos carry the finding's title)."""
+    return re.sub(r"\b(\d+) ((?:[\w'-]+ ){0,3}?[\w'-]+)\(s\)",
+                  lambda m: f"{m.group(1)} {m.group(2)}{'' if m.group(1) == '1' else 's'}", title)
+
+
 def _finding(out, kind, sev, title, detail, project="", fix="human", key=None):
     """`id` is unchanged (mutes by id keep working). `key` (2026-09-24) is what stays the SAME
     when a title carries a count or an age — "has not run in 89h" / "96h" were two findings, a
@@ -944,6 +951,7 @@ def _finding(out, kind, sev, title, detail, project="", fix="human", key=None):
     `key` given: the id is already stable, and the key is the id, normalised."""
     fid = f"{kind}:{project}:{re.sub(r'[^a-z0-9]+', '-', title.lower())[:60]}"
     k = _key(":".join(p for p in (kind, str(project).lower(), str(key)) if p)) if key is not None else _key(fid)
+    title = _plural_title(title)       # after the id: an id (and a mute by id) never changes with it
     out.append({"id": fid, "key": k, "kind": kind, "sev": sev, "title": title, "detail": detail,
                 "project": project, "fix": fix})
 
@@ -1042,6 +1050,12 @@ ARMED_CHECKS = (
      "standard": "—", "check": "`tt_crew.py selftest` (resolver, tools-rule and badge fixtures) · every live job, scripts too, claimed once",
      "requires": ("dashboard/tt_crew.py", "config/crew.json"),
      "titles": ("crew selftest fails — the page can name the wrong agent",)},
+    {"id": "dashboard-selftests", "control": "the dashboard's own builders (Agents, Sessions › Flow, Box)",
+     "layer": "detective", "standard": "—",
+     "check": "`tt_fleet.py`, `tt_flow.py` and `tt_system.py selftest` daily (kinds, the upkeep answer, the memo "
+              "and read lines, payload budgets); they rotted unseen until 10-08",
+     "requires": ("dashboard/tt_fleet.py", "dashboard/tt_flow.py", "dashboard/tt_system.py"),
+     "titles": ("a dashboard selftest fails — a page can show a wrong count, kind or line",)},
     {"id": "always-on-units", "control": "always-on user units (systemd, linked from a project repo, memory-capped)",
      "layer": "preventive", "standard": "§4",
      "check": "every enabled user unit linked from ~/<project>/, and maintenance-dashboard always: enabled · active · "
@@ -1988,7 +2002,8 @@ def _weight_drift_findings(f, rows, min_n=3):
     if not off:
         return
     _finding(f, "weight-drift", "low",
-             f"{len(off)} job weight(s) more than half off their measured runs, too few runs to rewrite",
+             f"{len(off)} job weight{'s' if len(off) != 1 else ''} more than half off {'their' if len(off) != 1 else 'its'} "
+             f"measured runs, too few runs to rewrite",
              "bin/weight_drift.py rewrites a weight only at n >= 3 measured runs in 30 days; these have 1-2 and "
              "differ from config/job_weights.json by more than 50%: " + "; ".join(off)
              + ". Nothing to do unless the figure is plainly wrong: the daily pass rewrites each row on its "
@@ -2717,7 +2732,8 @@ def audit(c=None):
     # date rides on the diagram itself; the monthly session is what acts on it.
     if dia.get("unrendered"):
         _finding(f, "diagram-unrendered", "low",
-                 f"{len(dia['unrendered'])} diagram source(s) edited but not re-rendered",
+                 (f"{len(dia['unrendered'])} diagram sources edited but not re-rendered" if len(dia['unrendered']) != 1
+                  else "1 diagram source edited but not re-rendered"),
                  ", ".join(dia["unrendered"]) + " — the .svg the dashboard serves is older "
                  "than its .d2 source (or than architecture/_style.d2, for a diagram that imports "
                  "it)", "maintenance", fix="auto", key="")
@@ -3524,6 +3540,27 @@ def audit(c=None):
                  "run `python3 ~/maintenance/dashboard/tt_crew.py selftest`; it resolves the real "
                  "queue names (ops:signals, research:COO, the Bench in the VP's window), the tools "
                  "rule and every agent's badge family, and checks every live job is claimed once. Output: " + _cw_st.strip().replace("\n", " | ")[-300:])
+
+    # 23c. the dashboard's own builders (memo maintenance_lead-work-selftests-green-and-daily, 2026-10-08):
+    #      three selftests nothing ran sat red for days (a stale kind, a payload over budget, a row lost
+    #      before noon). One finding names each that fails.
+    _dash_bad = []
+    for _t in ("tt_fleet", "tt_flow", "tt_system"):
+        try:
+            _r = subprocess.run([sys.executable, "-B", os.path.join(MC, "dashboard", f"{_t}.py"), "selftest"],
+                                capture_output=True, text=True, timeout=240, cwd=MC)
+            _o = (_r.stdout or "") + (_r.stderr or "")
+            _fl = [l for l in _o.splitlines() if l.startswith("FAIL")]
+            if _r.returncode != 0 or _fl:
+                _dash_bad.append(f"{_t} (exit {_r.returncode}): " + (" | ".join(_fl)[-200:] or _o.strip()[-200:]))
+        except Exception as e:
+            _dash_bad.append(f"{_t}: {type(e).__name__}: {e}")
+    if _dash_bad:
+        _finding(f, "guardrail-inert", "med",
+                 "a dashboard selftest fails — a page can show a wrong count, kind or line",
+                 "run `python3 -B ~/maintenance/dashboard/<name>.py selftest`; a stale fixture is fixed in the fixture, "
+                 "a regression in the code, a test that reads the live clock gets a pinned input. Failing: "
+                 + " ; ".join(_dash_bad))
 
     # 24. mdreader-drift (2026-09-27): the box's one markdown reader lives in shared/mdreader and every dashboard
     #     serves a COPY of its dist/. A copy left behind by a rebuild reads documents the old way on that
@@ -5129,6 +5166,12 @@ def selftest():
         print(("PASS " if cond else "FAIL ") + name + (f"  — {info}" if info and not cond else ""))
         ok = ok and bool(cond)
 
+    pt = []
+    _finding(pt, "k", "low", "3 queue job(s) reach no lead", "d")
+    _finding(pt, "k", "low", "the x guard refused 1 action(s) in 24 h", "d")
+    check("a finding title says 3 jobs / 1 action, never (s); its id keeps the raw title",
+          [x["title"] for x in pt] == ["3 queue jobs reach no lead", "the x guard refused 1 action in 24 h"]
+          and pt[0]["id"] == "k::3-queue-job-s-reach-no-lead", [(x["id"], x["title"]) for x in pt])
     saved = (FINDINGS, MUTE, CONFIG, MC, _commit, os.environ.get("MC_DECISIONS_FILE"))
     t = tempfile.mkdtemp(prefix="backoffice-selftest.")
     try:
@@ -5686,7 +5729,7 @@ def selftest():
               and i1.get("vitals") == [] and rc["alpha"]["identity"]["hue"] == "project-a"
               and "flag on project-b" in rdone[0][1], (rdone, rc))
         dfix = []
-        _finding(dfix, "diagram-unrendered", "low", "1 diagram source(s) edited but not re-rendered", "a.d2",
+        _finding(dfix, "diagram-unrendered", "low", "1 diagram source edited but not re-rendered", "a.d2",
                  "maintenance", fix="auto", key="")
         done = fix([dict(dfix[0], state="open")])
         check("fix: a render that fails claims no repair", done == [], done)

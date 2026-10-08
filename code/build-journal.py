@@ -31,7 +31,20 @@ for r in REPOS:
         if out:
             logs.append(f"== {r} ({len(out.splitlines())} commits) ==\n{out[:3000]}")
 
+
+
+def mark(outcome):
+    """state/journal/last_run.json: which ISO week ran, quiet included, so the backfill probe
+    (bin/backfill_probe.py journal) does not relaunch a quiet week every 10 minutes."""
+    import json
+    os.makedirs(f"{HOME}/maintenance/state/journal", exist_ok=True)
+    with open(f"{HOME}/maintenance/state/journal/last_run.json", "w") as f:
+        json.dump({"week": time.strftime("%G-W%V"), "at": time.strftime("%FT%TZ", time.gmtime()),
+                   "outcome": outcome}, f)
+
+
 if not logs:
+    mark("quiet")
     print("quiet week, no commits — no journal")
     sys.exit(0)
 
@@ -48,6 +61,7 @@ week = time.strftime("%G-W%V")
 os.makedirs(f"{HOME}/maintenance/state/journal", exist_ok=True)
 open(f"{HOME}/maintenance/state/journal/{week}.md", "w").write(
     f"# Build journal {week}\n\n{journal}\n")
+mark("written")
 subprocess.run([f"{HOME}/maintenance/bin/notify.sh", "maintenance",
                 f"Build journal {week}", journal[:900]], timeout=30)
 print(f"{time.strftime('%F %T')} journal {week} written + pushed")
