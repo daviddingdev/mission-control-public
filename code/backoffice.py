@@ -1217,7 +1217,16 @@ def _catalog_key(r):
     if r["kind"] == "catalog-stale":
         m = re.match(r"^(\S+) is \d+d old", t)
         return m.group(1) if m else None
-    if r["kind"] in ("catalog-source-uncategorised", "catalog-undeclared", "catalog-undeclared-cold",
+    if r["kind"] == "catalog-source-uncategorised":
+        # 2026-10-09 (memo root-cause-catalog-source-uncategorised-maintenance): each new source a project
+        # adds is a NEW item (key = the set of names), so describing one and another arriving later is not
+        # a "recurrence"; the same source left undescribed keeps its key.
+        m = re.search(r"what the system is: (.*)$", r.get("detail") or "")
+        if m:
+            import hashlib
+            return "src-" + hashlib.sha1(m.group(1).encode()).hexdigest()[:8]
+        return ""
+    if r["kind"] in ("catalog-undeclared", "catalog-undeclared-cold",
                      "catalog-orphan-empty", "catalog-conflict"):
         return ""
     return None
@@ -1992,23 +2001,31 @@ WEIGHT_DRIFT_OFF = 0.5
 
 def _weight_drift_findings(f, rows, min_n=3):
     """rows: weight_drift.measure() rows. One low finding listing the n < min_n rows > 50% off."""
-    off = []
+    # 2026-10-09 (memo root-cause-weight-drift-maintenance-weights): only rows with TWO runs that agree
+    # (n = 2) are listed, since one run is noise and n >= 3 is rewritten by the pass itself; and the key
+    # carries the set of rows, so a row reaching n = 3 (closing this) and another reaching n = 2 (a new
+    # set) is a new item, not a "recurrence" after the auto-fix policy acted on the old one.
+    off, names = [], []
     for r in rows:
         dec, med, n = r.get("declared"), r.get("median"), r.get("n") or 0
-        if not (0 < n < min_n) or not dec or not med:
+        if not (2 <= n < min_n) or not dec or not med:
             continue
         if abs(med - dec) > WEIGHT_DRIFT_OFF * dec:
             off.append(f"{r['match']}: declared {dec // 1000:,}k, measured {med // 1000:,}k (n={n})")
+            names.append(r["match"])
     if not off:
         return
+    import hashlib
+    _set = hashlib.sha1("\n".join(sorted(names)).encode()).hexdigest()[:8]
     _finding(f, "weight-drift", "low",
              f"{len(off)} job weight{'s' if len(off) != 1 else ''} more than half off {'their' if len(off) != 1 else 'its'} "
              f"measured runs, too few runs to rewrite",
-             "bin/weight_drift.py rewrites a weight only at n >= 3 measured runs in 30 days; these have 1-2 and "
+             "bin/weight_drift.py rewrites a weight only at n >= 3 measured runs in 30 days; these have 2 and "
              "differ from config/job_weights.json by more than 50%: " + "; ".join(off)
-             + ". Nothing to do unless the figure is plainly wrong: the daily pass rewrites each row on its "
-               "third run. `python3 ~/maintenance/bin/weight_drift.py show` has the table.",
-             project="maintenance", key="weights")
+             + ". Two runs agreeing is the maintenance_lead's rule to correct the row by hand (charter check 5); "
+               "otherwise the daily pass rewrites it on its third run. `python3 ~/maintenance/bin/weight_drift.py "
+               "show` has the table.",
+             project="maintenance", key=f"weights-{_set}")
 
 
 def weight_drift_pass(dry=False, live=None, weights=None, stamp=None, today=None, commit=None):
@@ -5558,6 +5575,11 @@ def selftest():
         _finding(c, "port-undeclared", "med", "port 8797 is listening but undeclared", "d")
         check("key: with no key given it is the id, normalised the way the status layer does it",
               c[0]["key"] == _key(c[0]["id"]) and c[0]["key"] == c[0]["id"].lower())
+        _src = lambda names: {"kind": "catalog-source-uncategorised", "title": "1 data source has no description",
+                              "detail": "add them to `_source_catalog` ... and one line saying what the system is: " + names}
+        check("key: a catalog-source-uncategorised key is the set of names (a new source is a new item)",
+              _catalog_key(_src("DOL EFAST2")) == _catalog_key(_src("DOL EFAST2")) != _catalog_key(_src("Wall Street Prep"))
+              and _catalog_key(_src("DOL EFAST2")).startswith("src-"))
         check("key: a catalog-stale key is the dataset, not its age",
               _catalog_key({"kind": "catalog-stale", "title": "stocks/nav_snapshots is 12d old"})
               == _catalog_key({"kind": "catalog-stale", "title": "stocks/nav_snapshots is 13d old"})
@@ -6513,7 +6535,7 @@ def selftest():
               and "dry" in _ln, (_ln, _cm))
         check("weight-drift: ONE low quiet finding naming only the n<3 row more than 50% off",
               len(_wff) == 1 and _wff[0]["sev"] == "low" and _wff[0]["kind"] in QUIET_KINDS
-              and _wff[0]["key"] == "weight-drift:maintenance:weights" and "b: declared 100k, measured 260k (n=2)"
+              and _wff[0]["key"].startswith("weight-drift:maintenance:weights-") and "b: declared 100k, measured 260k (n=2)"
               in _wff[0]["detail"] and "c:" not in _wff[0]["detail"] and "a:" not in _wff[0]["detail"], _wff)
         _ln, _ = weight_drift_pass(live=_live, weights=_wf, stamp=_st, today="2026-10-05",
                                    commit=lambda p, m: _cm.append(p) or "x")
