@@ -2286,6 +2286,161 @@ def bus_process(target):
     return {"ok": True}
 
 
+# ------------------------------------------------------------------ the composer's routes
+# lead-composer-central slice 2/5 (2026-10-10): David asks a lead from the page. The engine is
+# bin/ask.py (slice 1); these are thin wrappers that validate the request's shape and map
+# ask.AskError to a 4xx. Nothing here starts Claude or pushes: when:"now" is only recorded in the
+# memo (`When: now`), slice 3 starts the live session. ASK_MEMOS_ROOT moves the whole bus (tests).
+ASK_STAGE_RE = re.compile(r"^up-[0-9a-f]{16}$")
+ASK_STAGE_TTL = 24 * 3600          # a staged upload the composer never sent is dropped after a day
+ASK_MAX_REFS = 50
+
+
+def _ask():
+    import ask                      # bin/ is on sys.path (top of file)
+    return ask
+
+
+def _ask_stage(token=None):
+    """~/memos/files/.staging/[<token>/] — uploads waiting for their send. A dot name, so it can never
+    be an ask id (those are ask-<slug>) and ask.memo_taken / thread never see it."""
+    base = os.path.join(_ask().files_dir(), ".staging")
+    return os.path.join(base, token) if token else base
+
+
+def _ask_stage_sweep(now=None):
+    import shutil
+    now = now or time.time()
+    try:
+        names = os.listdir(_ask_stage())
+    except OSError:
+        return
+    for t in names:
+        p = os.path.join(_ask_stage(), t)
+        try:
+            if ASK_STAGE_RE.match(t) and not os.path.islink(p) and now - os.stat(p).st_mtime > ASK_STAGE_TTL:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def ask_upload(rfile, n, filename):
+    """One file, streamed from rfile (n bytes) into a fresh staging folder. -> (code, body).
+    body: {ok, file: "<token>/<name>" (what a send's `files` carries), name, size}."""
+    from urllib.parse import unquote
+    a = _ask()
+    if not filename or not str(filename).strip():
+        return 400, {"ok": False, "msg": "send the file's name, URL-encoded, in X-Filename"}
+    if n <= 0:
+        return 411, {"ok": False, "msg": "send the file as the body, with a Content-Length"}
+    if n > a.MAX_FILES:
+        return 413, {"ok": False, "msg": f"a file over {a.MAX_FILES // 1024 // 1024} MB"}
+    name = a.clean_name(unquote(str(filename)))
+    _ask_stage_sweep()
+    token = "up-" + os.urandom(8).hex()
+    d = _ask_stage(token)
+    os.makedirs(_ask_stage(), exist_ok=True)
+    os.mkdir(d, 0o700)
+    part, dest, left = os.path.join(d, ".part"), os.path.join(d, name), n
+    try:
+        with open(part, "wb") as fh:
+            while left > 0:
+                chunk = rfile.read(min(1 << 20, left))
+                if not chunk:
+                    break
+                fh.write(chunk)
+                left -= len(chunk)
+        if left:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+            return 400, {"ok": False, "msg": f"the upload stopped {left} bytes short"}
+        os.replace(part, dest)
+    except BaseException:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    return 200, {"ok": True, "file": f"{token}/{name}", "name": name, "size": n}
+
+
+def ask_post(d):
+    """POST /api/ask. -> (code, body).
+      {op:"send", to, kind, body, title?, files?:["<token>/<name>" from /api/ask/upload], when?:"next"|"now", ctx?}
+        -> 200 {ok, id, memo, to, lead, when, files[], now?}   (now: a note that slice 3 starts it; nothing ran)
+      {op:"withdraw", id}   (the memo file name or the ask- id)
+        -> 200 {ok, memo, to}; 409 once the lead has picked it up
+    A bad shape, target, kind, when or file ref is 400 {ok:false, msg}."""
+    import shutil
+    a = _ask()
+    if not isinstance(d, dict):
+        return 400, {"ok": False, "msg": "send a JSON object"}
+    op = d.get("op")
+    if op == "withdraw":
+        mid = d.get("id")
+        try:
+            a._norm_memo(mid if isinstance(mid, str) else "")
+        except a.AskError as e:
+            return 400, {"ok": False, "msg": str(e)}
+        try:
+            r = a.withdraw(mid)
+        except a.AskError as e:
+            return 409, {"ok": False, "msg": str(e)}
+        return 200, {"ok": True, "memo": r["memo"], "to": r["target"]}
+    if op != "send":
+        return 400, {"ok": False, "msg": "op is send or withdraw"}
+    for k in ("to", "kind", "body", "title", "when", "ctx"):
+        if d.get(k) is not None and not isinstance(d.get(k), str):
+            return 400, {"ok": False, "msg": f"{k} is a string"}
+    refs = d.get("files") or []
+    if not isinstance(refs, list) or len(refs) > ASK_MAX_REFS or not all(isinstance(x, str) for x in refs):
+        return 400, {"ok": False, "msg": f"files is a list of at most {ASK_MAX_REFS} upload refs"}
+    paths, tokens = [], []
+    for ref in refs:
+        tok, _, nm = ref.partition("/")
+        p = os.path.join(_ask_stage(tok), nm)
+        if not ASK_STAGE_RE.match(tok) or not nm or a.clean_name(nm) != nm or nm == ".part":
+            return 400, {"ok": False, "msg": f"not an upload ref: {ref[:80]!r}"}
+        if os.path.islink(p) or not os.path.isfile(p):
+            return 400, {"ok": False, "msg": f"no such upload (older than a day?): {nm[:80]}"}
+        paths.append(p)
+        tokens.append(tok)
+    to, when = d.get("to") or "", d.get("when") or "next"
+    try:
+        r = a.send(to, d.get("kind") or "", d.get("body") or "", title=d.get("title"), files=paths,
+                   when=when, context=d.get("ctx"))
+    except a.AskError as e:
+        return 400, {"ok": False, "msg": str(e)}
+    for tok in set(tokens):                 # copied into files/<memo-id>/ by ask.send
+        shutil.rmtree(_ask_stage(tok), ignore_errors=True)
+    out = {"ok": True, "id": r["id"], "memo": r["memo"], "to": to, "lead": a.lead_for(to), "when": when,
+           "files": [a.show(p) for p in r["files"]]}
+    if when == "now":
+        out["now"] = ("recorded (When: now); the live session arrives in slice 3, "
+                      "so the lead picks this up on its next memo pass")
+    return 200, out
+
+
+def ask_get(path):
+    """GET /api/ask[?lead=<slug or lead seat id>] -> (code, {target, items[], counts{state: n}}).
+    items: ask.thread() newest first — {id, memo, date, title, via, asked, target, kind, when, context,
+    body, files[], replies[{date, text}], where (inbox|processed), path (~/...), status, state}; state is
+    waiting | picked up | replied | needs you. ?lead= takes a bus slug (clientco-db) or a seat id
+    (clientco_db_lead, pm)."""
+    from urllib.parse import urlparse, parse_qs
+    a = _ask()
+    lead = ((parse_qs(urlparse(path).query).get("lead") or [""])[0]).strip()
+    target = None
+    if lead:
+        target = "stocks" if lead == "pm" else (lead[:-5].replace("_", "-") if lead.endswith("_lead") else lead)
+        if not a.SLUG_RE.match(target):
+            return 400, {"ok": False, "msg": f"not a lead: {lead[:80]!r}"}
+    items = a.thread(target)
+    counts = {}
+    for x in items:
+        x["path"] = a.show(x["path"])
+        counts[x["state"]] = counts.get(x["state"], 0) + 1
+    return 200, {"target": target, "items": items, "counts": counts}
+
+
 def bus_send(target, title, body, launch):
     if target not in bus_projects():
         return {"ok": False, "msg": f"unknown project '{target}'"}
@@ -3378,6 +3533,10 @@ TT_ROUTES = {
 # v2.5: tt_crew.stamp() puts `agent` + `agent_name` on every run these feeds carry — one namer for
 # the desk, the crew, Recent runs and "Last used by"
 CREW_STAMPED = {"/api/fleet", "/api/live", "/api/sessions", "/api/timeline", "/api/flow"}
+# One display name per project (memo maintenance_lead-work-one-project-name, slice 2/2): these feeds carry
+# `project_names` {slug: identity name} for the projects they name, from dashboard/projname.py; the page's pname()
+# prefers it, so a row reads "ClientCo", never "clientco-db". Slugs stay the ids.
+NAMED_ROUTES = {"/api/timeline", "/api/sessions", "/api/crew", "/api/live", "/api/flow"}
 # Routes that never enter the hot cache (v2.2, 2026-09-24). /api/live is a now-view the page
 # polls every 3 s while something runs: its module keeps its own 2 s cache over incremental file
 # tails (a build is ~1 ms warm), so it goes straight through like a `since=` cursor. As a hot
@@ -3442,12 +3601,25 @@ def _tt_call(path, strict=False):
             data = _tt_fn("tt_crew", "stamp")(u.path, data)
         except Exception as e:              # the crew never blanks a feed
             print(f"[dashboard] crew stamp {u.path}: {type(e).__name__}: {e}", flush=True)
+    data = _project_names(u.path, data)
     if u.path in ("/api/sessions", "/api/flow") and isinstance(data, dict):
         try:
             data["memo_titles"] = memo_titles()     # K6: memos read by their H1 on every list
         except Exception as e:
             print(f"[dashboard] memo titles: {type(e).__name__}: {e}", flush=True)
     return data
+
+
+def _project_names(path, data):
+    """`project_names` on a NAMED_ROUTES payload, through the ONE helper (projname.stamp); never blanks a feed."""
+    if path not in NAMED_ROUTES:
+        return data
+    try:
+        import projname
+        return projname.stamp(data)
+    except Exception as e:
+        print(f"[dashboard] project names {path}: {type(e).__name__}: {e}", flush=True)
+        return data
 
 
 def _not_found(path, data):
@@ -3807,6 +3979,9 @@ class H(BaseHTTPRequestHandler):
             self._json(data, code=404 if _not_found(path, data) else 200)
         elif path.startswith("/api/overview"):        # unreachable: _hot_spec covers it
             self._json(overview())
+        elif path.split("?")[0] == "/api/ask":
+            code, r = ask_get(path)
+            self._json(r, code=code)
         elif path.startswith("/api/memos"):
             self._json(memos())
         elif path.startswith("/api/catalog/origin"):
@@ -3890,8 +4065,10 @@ class H(BaseHTTPRequestHandler):
         else:
             self._send(404, b"not found", "text/plain")
 
-    def _refuse_post(self):
-        """None if this POST may go on; else (status, reason).
+    def _refuse_post(self, cap=MAX_POST, ctype_ok="application/json"):
+        """None if this POST may go on; else (status, reason). `cap` / `ctype_ok`: only
+        /api/ask/upload passes others (a raw application/octet-stream body up to ask.py's 250 MB);
+        every other check is the same for it.
 
         Every POST here acts: it runs an OS update, starts a Claude session with
         --dangerously-skip-permissions, writes a memo, or (v2.1) records a decision whose
@@ -3928,11 +4105,11 @@ class H(BaseHTTPRequestHandler):
             return 400, "bad Content-Length"
         if n < 0:
             return 400, "bad Content-Length"
-        if n > MAX_POST:
-            return 413, f"body over {MAX_POST // 1024} KB"
+        if n > cap:
+            return 413, f"body over {cap // 1024} KB"
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if n and ctype != "application/json":
-            return 415, "send application/json"
+        if n and ctype != ctype_ok:
+            return 415, f"send {ctype_ok}"
         return None
 
     def _body(self):
@@ -3959,6 +4136,9 @@ class H(BaseHTTPRequestHandler):
         # _head too: after a HEAD on this kept-alive socket it was still True, so the POST's
         # headers went out with a Content-Length and no body, and the client hung
         self._head, self._sent, self._raw = False, False, b""
+        if self.path.split("?")[0] == "/api/ask/upload":
+            self._post_upload()
+            return
         bad = self._refuse_post()
         if bad:
             self.close_connection = True        # its body was never read
@@ -3975,8 +4155,38 @@ class H(BaseHTTPRequestHandler):
             else:
                 self.close_connection = True
 
+    def _post_upload(self):
+        """POST /api/ask/upload: ONE file as the raw body (lead-composer-central slice 2/5).
+        Content-Type application/octet-stream, the name URL-encoded in X-Filename, a
+        Content-Length (no chunked), at most ask.py's 250 MB. Streamed to disk, never held in
+        memory. Both headers make a cross-site fetch need a CORS preflight this server never
+        answers, on top of the Origin / Sec-Fetch-Site / peer / Host checks every POST gets."""
+        bad = self._refuse_post(cap=_ask().MAX_FILES, ctype_ok="application/octet-stream")
+        if not bad and int(self.headers.get("Content-Length") or 0) <= 0:
+            bad = (411, "send the file as the body, with a Content-Length")
+        if bad:
+            self.close_connection = True        # its body was never read
+            self._json({"ok": False, "msg": bad[1]}, code=bad[0])
+            return
+        try:
+            code, r = ask_upload(self.rfile, int(self.headers.get("Content-Length")),
+                                 self.headers.get("X-Filename"))
+        except Exception as x:
+            print(f"[dashboard] POST /api/ask/upload: {type(x).__name__}: {x}", flush=True)
+            code, r = 500, {"ok": False, "msg": f"{type(x).__name__}: {str(x)[:200]}"}
+        if code != 200:
+            self.close_connection = True        # the body may be only partly read
+        self._json(r, code=code)
+
     def _post(self):
         path = self.path.split("?")[0]
+        if path == "/api/ask":
+            code, r = ask_post(self._body())
+            if r.get("ok"):
+                # a sent or withdrawn ask changes the lead's work and seat on the next read
+                _hot_invalidate("/api/team", "/api/work", "/api/report")
+            self._json(r, code=code)
+            return
         m = re.match(r"^/api/experiments/([a-z0-9-]+)/run$", path)
         if path in TT_POSTS:
             body = self._body()
@@ -4356,7 +4566,8 @@ def selftest():
             open(os.path.join(MEMOBUS, "inbox/hbs/2026-09-22_fix-readme.md"), "w").write("x")
             bus_ignore("fix-readme")
             got = open(LEDGER).read().splitlines()
-            ok(got[2:5] == rows[2:5] and len(got) == 6 and "| hbs | rejected (ignored" in got[5]
+            # newest-first since a3d714a (ledger_rows.prepend): the new row sits under the header
+            ok(got[3:6] == rows[2:5] and len(got) == 6 and "| hbs | rejected (ignored" in got[2]
                and os.path.exists(os.path.join(MEMOBUS, "processed/2026-09-22_fix-readme.md")),
                "ignore from an inbox with no row: a new row for that target, the others untouched")
             # 5c. a fan-out memo (one name in several inboxes) never overwrites a processed copy
@@ -4542,6 +4753,132 @@ def selftest():
         ok(w and w["stale"] and w["five_hour_pct"] is None and w["seven_day_pct"] == 18,
            f"window: stale past 2 h; a window past its reset reads null ({w})")
         ok(window_state(wp, t0 + 2 * 86400) is None, "window: both windows reset, no window")
+
+    # 6c. the composer's routes (lead-composer-central slice 2/5): a TEMP bus only (ASK_MEMOS_ROOT),
+    #     never the real ~/memos; the route functions, then the same over the wire with the guard
+    import shutil
+    real_ledger = os.path.join(HOME, "memos", "LEDGER.md")
+    try:
+        real_before = os.stat(real_ledger).st_mtime_ns
+    except OSError:
+        real_before = None
+    tb = tempfile.mkdtemp(prefix="mc-ask-selftest.")
+    saved_root = os.environ.get("ASK_MEMOS_ROOT")
+    os.environ["ASK_MEMOS_ROOT"] = tb
+    asrv = None
+    try:
+        A = _ask()
+        ok(A.root() == os.path.abspath(tb), "ask routes: the selftest bus is a temp dir, not ~/memos")
+        for sl in ("maintenance", "clientco-db"):
+            os.makedirs(os.path.join(tb, "inbox", sl))
+        os.makedirs(os.path.join(tb, "processed"))
+        with open(A.ledger_path(), "w") as fh:
+            fh.write("# Memo ledger\n\n| Date | Memo | Source | Target | Status | Evidence |\n|---|---|---|---|---|---|\n")
+        import io
+        c0, up = ask_upload(io.BytesIO(b"a,b\n1,2\n"), 8, "sales%20detail.csv")
+        ok(c0 == 200 and up["file"].endswith("/sales detail.csv") and up["size"] == 8
+           and os.path.isfile(os.path.join(_ask_stage(), up["file"])), f"ask_upload stages one file ({c0}, {up})")
+        cs, short = ask_upload(io.BytesIO(b"abc"), 10, "x.bin")
+        ok(cs == 400 and len(os.listdir(_ask_stage())) == 1, f"a short upload is refused and leaves nothing ({cs})")
+        ok(ask_upload(io.BytesIO(b"x"), 1, "")[0] == 400, "an upload with no X-Filename: 400")
+        code, r = ask_post({"op": "send", "to": "maintenance", "kind": "question", "body": "Why is it late?",
+                            "files": [up["file"]], "when": "now", "ctx": "#box/janitor"})
+        mp = os.path.join(tb, "inbox", "maintenance", r.get("id", "?"))
+        txt = open(mp).read() if os.path.isfile(mp) else ""
+        ok(code == 200 and r["memo"] == "ask-why-is-it-late" and r["lead"] == "maintenance_lead" and "slice 3" in r["now"]
+           and "\nWhen: now\n" in txt and "Context: #box/janitor" in txt
+           and os.path.isfile(os.path.join(A.files_dir("ask-why-is-it-late"), "sales detail.csv"))
+           and not os.path.exists(os.path.join(_ask_stage(), up["file"].split("/")[0])),
+           f"POST send: memo in the temp inbox, When: now recorded, the upload moved to files/<id>/ ({code}, {r})")
+        ok("| ask-why-is-it-late | dashboard (David) | maintenance | proposed |" in open(A.ledger_path()).read(),
+           "POST send: its row in the temp ledger")
+        for what, dd in (("a bad kind", {"op": "send", "to": "maintenance", "kind": "order", "body": "x"}),
+                         ("an unknown target", {"op": "send", "to": "nosuch", "kind": "task", "body": "x"}),
+                         ("a path target", {"op": "send", "to": "../etc", "kind": "task", "body": "x"}),
+                         ("a bad when", {"op": "send", "to": "maintenance", "kind": "task", "body": "x", "when": "later"}),
+                         ("a non-string kind", {"op": "send", "to": "maintenance", "kind": ["task"], "body": "x"}),
+                         ("a forged file ref", {"op": "send", "to": "maintenance", "kind": "file", "body": "x",
+                                                "files": ["up-0000000000000000/../../LEDGER.md"]}),
+                         ("an unknown op", {"op": "launch"}), ("no object", [1])):
+            ok(ask_post(dd)[0] == 400, f"POST /api/ask refuses {what}: 400")
+        c2, r2 = ask_post({"op": "send", "to": "clientco-db", "kind": "correction", "body": "FY24 is wrong"})
+        A.set_status("ask-why-is-it-late", "maintenance", "accepted — on it")
+        ok(ask_post({"op": "withdraw", "id": "ask-why-is-it-late"})[0] == 409,
+           "withdraw: 409 once the lead has picked it up")
+        cw, rw = ask_post({"op": "withdraw", "id": r2["id"]})
+        ok(cw == 200 and rw["to"] == "clientco-db" and not os.listdir(os.path.join(tb, "inbox", "clientco-db"))
+           and f"| {A.WITHDRAWN} |" in open(A.ledger_path()).read(), f"withdraw: while in the inbox ({cw}, {rw})")
+        ok(ask_post({"op": "withdraw", "id": r2["id"]})[0] == 409, "withdraw: a second time, 409 (gone from the inbox)")
+        ok(ask_post({"op": "withdraw", "id": "../LEDGER"})[0] == 400, "withdraw: a non-ask id, 400")
+        cg, g = ask_get("/api/ask?lead=maintenance_lead")
+        ok(cg == 200 and g["target"] == "maintenance" and [x["memo"] for x in g["items"]] == ["ask-why-is-it-late"]
+           and g["items"][0]["state"] == "picked up" and g["counts"] == {"picked up": 1},
+           f"GET /api/ask?lead=<seat id>: that lead's thread ({g})")
+        ok(ask_get("/api/ask?lead=pm")[1]["target"] == "stocks" and ask_get("/api/ask?lead=clientco-db")[1]["target"] == "clientco-db"
+           and ask_get("/api/ask?lead=../x")[0] == 400, "GET /api/ask: pm -> stocks, a slug as itself, junk 400")
+        old = os.path.join(_ask_stage(), "up-" + "0" * 16)
+        os.makedirs(old)
+        os.utime(old, (time.time() - 2 * 86400,) * 2)
+        _ask_stage_sweep()
+        ok(not os.path.exists(old), "a staged upload older than a day is swept")
+        # the guard for the upload route: the same checks, its own type and cap
+        def up_refused(**hd):
+            h = H.__new__(H)
+            h.client_address = ("127.0.0.1", 50000)
+            h.headers = email.message.Message()
+            for k, v in hd.items():
+                h.headers[k.replace("_", "-")] = v
+            r_ = h._refuse_post(cap=A.MAX_FILES, ctype_ok="application/octet-stream")
+            return r_[0] if r_ else None
+        oc = {"Host": "spark:8900", "Content_Type": "application/octet-stream"}
+        ok(up_refused(**oc, Content_Length=str(5 * 1024 * 1024)) is None
+           and up_refused(**oc, Content_Length=str(A.MAX_FILES + 1)) == 413
+           and up_refused(**oc, Content_Length="9", Origin="https://evil.example") == 403
+           and up_refused(Host="spark:8900", Content_Type="multipart/form-data; boundary=x", Content_Length="9") == 415,
+           "upload guard: 5 MB passes, over 250 MB 413, another origin 403, a form post 415")
+        # over the wire, in this temp bus
+        asrv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=asrv.serve_forever, daemon=True).start()
+        port = asrv.server_address[1]
+        def call(method, url, body=None, **hd):
+            cc = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+            cc.request(method, url, body=body, headers=hd)
+            rr = cc.getresponse()
+            out = (rr.status, json.loads(rr.read() or b"null"))
+            cc.close()
+            return out
+        st, wu = call("POST", "/api/ask/upload", b"%PDF-1.4 x", **{"Content-Type": "application/octet-stream",
+                                                                   "X-Filename": "deck%20v2.pdf"})
+        st2, ws = call("POST", "/api/ask", json.dumps({"op": "send", "to": "maintenance", "kind": "file",
+                                                       "body": "", "title": "The deck", "files": [wu.get("file")]}).encode(),
+                       **{"Content-Type": "application/json"})
+        st3, wg = call("GET", "/api/ask?lead=maintenance")
+        ok(st == 200 and st2 == 200 and ws["memo"] == "ask-the-deck" and st3 == 200
+           and any(x["memo"] == "ask-the-deck" and x["files"] for x in wg["items"]),
+           f"over the wire: upload -> send -> GET shows it ({st}, {st2}, {st3})")
+        ok(call("POST", "/api/ask/upload", b"{}", **{"Content-Type": "application/json", "X-Filename": "a"})[0] == 415
+           and call("POST", "/api/ask", b"x" * 10, **{"Content-Type": "text/plain"})[0] == 415
+           and call("POST", "/api/ask", b'{"op":"send","to":"maintenance","kind":"task","body":"x"}',
+                    **{"Content-Type": "application/json", "Origin": "https://evil.example"})[0] == 403
+           and call("POST", "/api/ask", b'{"op":"send"}', **{"Content-Type": "application/json"})[0] == 400,
+           "over the wire: upload as JSON 415, text/plain 415, another origin 403, a bad send 400")
+    except Exception as x:
+        ok(False, f"the ask route checks ran to the end ({type(x).__name__}: {x})")
+    finally:
+        if asrv:
+            asrv.shutdown()
+        if saved_root is None:
+            os.environ.pop("ASK_MEMOS_ROOT", None)
+        else:
+            os.environ["ASK_MEMOS_ROOT"] = saved_root
+        shutil.rmtree(tb, ignore_errors=True)
+    try:
+        real_after = os.stat(real_ledger).st_mtime_ns
+    except OSError:
+        real_after = None
+    rl = open(real_ledger, encoding="utf-8", errors="replace").read() if real_after else ""
+    ok("| ask-why-is-it-late |" not in rl and "| ask-the-deck |" not in rl,
+       f"ask routes: the real ~/memos/LEDGER.md carries none of these rows (mtime {'same' if real_after == real_before else 'moved: another writer'})")
 
     # 7. over the wire: keep-alive, HEAD, ETag/304, the guard, a tt POST that is not there
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)

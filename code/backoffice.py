@@ -1773,31 +1773,48 @@ def _guard_denials(rows, now_ts=None, hours=24):
 
 def _guard_deny_findings(f, by_ledger, now_ts=None):
     """Rule guard-deny (memo wa-security-detection slice 3): any refusal in the last 24 h, one
-    finding per ledger. A lead denied by hook-guard-lead is the guard working as designed (med);
+    finding per ledger, and per lead on the lead ledger (on that lead's project). A lead denied by
+    hook-guard-lead is the guard working as designed (low);
     a broker or bare-claude refusal is an unattended session reaching for something it must not
     (high). No command or excerpt is carried: who, which tool, the guard's first reason."""
     for name, fname, sev in GUARD_LEDGERS:
         den = _guard_denials(by_ledger.get(name), now_ts)
         if not den:
             continue
-        last = den[-1]
-        who = last.get("lead") or last.get("who") or last.get("class") or "a session"
-        tool = last.get("tool") or ("Bash" if name == "claude" else "?")
-        why = last.get("reason")
-        why = (why[0] if isinstance(why, list) and why else why) or (
-            "a bare `claude -p` spawn" if name == "claude" else "")
-        why = _scrub_secrets(str(why)[:160])
-        _finding(f, "guard-deny", sev, f"the {name} guard refused {len(den)} action(s) in 24 h",
-                 f"state/{fname}: {len(den)} denial(s) since {dt_from(den[0].get('ts', den[0].get('time')))}Z. "
-                 f"Latest {dt_from(last.get('ts', last.get('time')))}Z: session "
-                 f"{str(last.get('session') or '?')[:8]}, {who}, tool {tool}"
-                 + (f", because {why}" if why else "") + ". "
-                 + ("A lead stopped at its fence is the guard working; read the ledger for a lead that keeps "
-                    "trying the same thing (it should file a proposal patch or a memo instead)."
-                    if name == "lead" else
-                    "An unattended session tried something only David (or the Stocks PM) may do: read the "
-                    "session's transcript and docs/INCIDENTS.md before anything else."),
-                 project="maintenance", key=name)
+        if name == "lead":
+            # One finding per LEAD, filed on that lead's project (repeat memo 2026-10-09
+            # repeat-guard-deny-maintenance-lead): one shared key reopened on any lead's fence hit, so
+            # five leads' unrelated denials read as one repeat failure on maintenance. Keyed per lead, a
+            # repeat is that lead trying the same thing again, and its root-cause memo reaches it.
+            groups = {}
+            for r in den:
+                slug = r.get("slug") or str(r.get("lead") or "").removesuffix("_lead").replace("_", "-")
+                groups.setdefault(slug or "maintenance", []).append(r)
+            for slug, rows in sorted(groups.items()):
+                _guard_deny_one(f, name, fname, sev, rows, project=slug)
+            continue
+        _guard_deny_one(f, name, fname, sev, den)
+
+
+def _guard_deny_one(f, name, fname, sev, den, project="maintenance"):
+    last = den[-1]
+    who = last.get("lead") or last.get("who") or last.get("class") or "a session"
+    tool = last.get("tool") or ("Bash" if name == "claude" else "?")
+    why = last.get("reason")
+    why = (why[0] if isinstance(why, list) and why else why) or (
+        "a bare `claude -p` spawn" if name == "claude" else "")
+    why = _scrub_secrets(str(why)[:160])
+    _finding(f, "guard-deny", sev, f"the {name} guard refused {len(den)} action(s) in 24 h",
+             f"state/{fname}: {len(den)} denial(s) since {dt_from(den[0].get('ts', den[0].get('time')))}Z. "
+             f"Latest {dt_from(last.get('ts', last.get('time')))}Z: session "
+             f"{str(last.get('session') or '?')[:8]}, {who}, tool {tool}"
+             + (f", because {why}" if why else "") + ". "
+             + ("A lead stopped at its fence is the guard working; read the ledger for a lead that keeps "
+                "trying the same thing (it should file a proposal patch or a memo instead)."
+                if name == "lead" else
+                "An unattended session tried something only David (or the Stocks PM) may do: read the "
+                "session's transcript and docs/INCIDENTS.md before anything else."),
+             project=project, key=name)
 
 
 def _restore_unproven_finding(f, rows, now_ts=None, days=30, sources=None):
@@ -6371,13 +6388,25 @@ def selftest():
         by = {x["key"]: x for x in fgd}
         check("guard-deny: a broker deny in 24 h -> high; a lead deny -> low (the guard working as designed); a warn or a deny older than 24 h -> nothing",
               sorted((k, v["sev"]) for k, v in by.items()) == [("guard-deny:maintenance:broker", "high"),
-                                                                ("guard-deny:maintenance:lead", "low")], by)
+                                                                ("guard-deny:poker:lead", "low")], by)
         check("guard-deny: names the count, session, agent and tool, never the excerpt or command",
               "1 denial" in by["guard-deny:maintenance:broker"]["detail"]
               and "abcdef12" in by["guard-deny:maintenance:broker"]["detail"]
               and "mcp__fixture_broker__order" in by["guard-deny:maintenance:broker"]["detail"]
-              and "poker_lead" in by["guard-deny:maintenance:lead"]["detail"]
+              and "poker_lead" in by["guard-deny:poker:lead"]["detail"]
               and not any("SECRET-EXCERPT" in x["detail"] or "claude -p" in x["detail"] for x in fgd), fgd)
+        fgd = []
+        _guard_deny_findings(fgd, {"lead": [{"ts": N - 50, "verdict": "deny", "lead": "poker_appstore_lead",
+                                             "slug": "poker-appstore", "session": "a1", "tool": "Bash"},
+                                            {"ts": N - 40, "verdict": "deny", "lead": "maintenance_lead",
+                                             "session": "m1", "tool": "Bash"},
+                                            {"ts": N - 30, "verdict": "deny", "lead": "maintenance_lead",
+                                             "session": "m2", "tool": "Edit"}]}, N)
+        check("guard-deny: lead denials are one finding PER LEAD on its own project (a fence hit by one lead "
+              "never reopens another's key)",
+              sorted((x["key"], x["project"], x["detail"].split(" denial")[0][-1]) for x in fgd)
+              == [("guard-deny:maintenance:lead", "maintenance", "2"),
+                  ("guard-deny:poker-appstore:lead", "poker-appstore", "1")], fgd)
         fgd = []
         _guard_deny_findings(fgd, {"claude": [{"time": N - 30, "mode": "deny", "session": "c1",
                                                "command": "claude -p x"}]}, N)

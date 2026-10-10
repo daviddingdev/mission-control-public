@@ -19,7 +19,8 @@ no push. Any other argument exits 2 without running.
 state/model_watch.json is written on EVERY run, "nothing new" included (2026-10-04): a
 weekly job that only wrote when it found something read as stale for weeks, and a fetch
 error was swallowed, so "nothing new" and "Hugging Face unreachable" looked the same. The
-file carries checked_at, the orgs checked, and errors (count + list); every org failing
+file carries checked_at, the orgs checked, and errors (count + list), and each failed fetch logs one
+stderr line (2026-10-10); every org failing
 exits 1.
 """
 import json
@@ -105,7 +106,8 @@ def scan(seen, days, fetch=None):
             models = fetch(f"https://huggingface.co/api/models?author={org}&sort=createdAt&direction=-1&limit=12")
         except Exception as e:
             errors.append({"org": org, "error": f"{type(e).__name__}: {e}"[:160]})
-            continue
+            print(f"model-watch: fetch error {org}: {errors[-1]['error']}", file=sys.stderr, flush=True)
+            continue                         # one log line per failed org, then the next org
         checked.append(org)
         for m in models:
             mid = m.get("id", "")
@@ -194,8 +196,14 @@ def _selftest():
         if "author=openai" in url or "author=google" in url:
             raise OSError("HTTP 503")
         return [{"id": "old/one", "createdAt": "2020-01-01T00:00:00Z", "tags": ["text-generation"]}]
-    fresh, checked, errors = scan(set(), 8, fetch=fetch)
+    import contextlib, io
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        fresh, checked, errors = scan(set(), 8, fetch=fetch)
+    logged = [ln for ln in err.getvalue().splitlines() if ln.startswith("model-watch: fetch error ")]
     cases += [("fetch errors are counted, not swallowed", len(errors), 2),
+              ("each fetch error logs one line", sorted(ln.split()[3].rstrip(":") for ln in logged),
+               ["google", "openai"]),
               ("the other orgs still count as checked", len(checked), len(ORGS) - 2),
               ("nothing new inside the window", len(fresh), 0)]
     real, d = STATE, tempfile.mkdtemp()
