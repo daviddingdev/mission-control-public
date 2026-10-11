@@ -1689,7 +1689,26 @@ def _iso_ts(s):
         return None
 
 
-def _browser_signin_findings(f, state, sites_cfg):
+_SIGNIN_HELD_RE = re.compile(r"needs-you-([a-z0-9]+)-signin$")
+
+
+def _signin_held(ledger_text):
+    """{site: memo} for every open `needs-david [...]` LEDGER row named `<lead>-needs-you-<site>-signin`
+    (root-cause-browser-signin-maintenance-vii, 2026-10-11): a lead that already parked the sign-in on
+    David holds the one question, so the janitor's own finding would only be a second copy of it, and
+    the auto-fix policy took that copy as team work on 10-10. Closed or answered rows hold nothing."""
+    held = {}
+    for line in (ledger_text or "").splitlines():
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 7:
+            continue
+        m = _SIGNIN_HELD_RE.search(cells[2])
+        if m and cells[5].startswith("needs-david ["):
+            held[m.group(1)] = cells[2]
+    return held
+
+
+def _browser_signin_findings(f, state, sites_cfg, held=None):
     """Rule browser-signin (memo browser-signin-needs-attention ask 1): a site the Spark browser was
     signed in to once (`signed_in_once`) that `browser.py daily` now reads as logged_out or
     challenge. A registered site David never signed in to stays silent, and so does a signed-out site
@@ -1704,6 +1723,8 @@ def _browser_signin_findings(f, state, sites_cfg):
             continue
         if st == "logged_out" and (cfg.get(site) or {}).get("ask") == "when_needed":
             continue        # 12twenty (2026-10-05): its job asks with `browser.py ask-signin` when it needs him
+        if site in (held or {}):
+            continue        # a lead already parked this sign-in on David (its row is the one question)
         label = (cfg.get(site) or {}).get("label") or site
         what = "a bot check (challenge)" if st == "challenge" else "signed out"
         _finding(f, "browser-signin", "med", f"the Spark browser is signed out of {label}",
@@ -3853,8 +3874,13 @@ def audit(c=None):
     #     signed in to once that `browser.py daily` now reads logged_out or challenge. Options come from the
     #     kind template in dashboard/tt_decide.py. 37b: its pure selftest beside the other morning ones.
     try:
+        try:
+            with open(os.path.join(MEMOS, "LEDGER.md")) as _fh:
+                _held = _signin_held(_fh.read())
+        except OSError:
+            _held = {}
         _browser_signin_findings(f, load(os.path.join(STATE, "browser.json"), {}),
-                                 load(os.path.join(CONFIG, "browser_sites.json"), {}))
+                                 load(os.path.join(CONFIG, "browser_sites.json"), {}), _held)
     except Exception as e:
         _finding(f, "browser-signin", "low", "the browser-signin rule could not run",
                  f"{type(e).__name__}: {str(e)[:160]}. It reads state/browser.json and config/browser_sites.json.",
@@ -6350,6 +6376,15 @@ def selftest():
         _browser_signin_findings(fbr, {"sites": {"onefinnet": {"state": "logged_out", "signed_in_once": False}}}, {})
         _browser_signin_findings(fbr, {}, {})
         check("browser-signin: a registered site never signed in, and no state file, stay quiet", fbr == [], fbr)
+        _led = ("| 2026-10-07 | data_desk_lead-needs-you-vii-signin | data-desk | data-desk | needs-david [only-you] — sign in? |  |\n"
+                "| 2026-10-07 | x_lead-needs-you-wsj-signin | x | x | **implemented** — answered |  |\n")
+        fbr = []
+        _browser_signin_findings(fbr, {"sites": {
+            "vii": {"state": "logged_out", "signed_in_once": True},
+            "wsj": {"state": "logged_out", "signed_in_once": True}}}, {}, _signin_held(_led))
+        check("browser-signin: a site whose sign-in a lead already parked (open needs-david row) files no second copy; "
+              "an answered row holds nothing", _signin_held(_led) == {"vii": "data_desk_lead-needs-you-vii-signin"}
+              and [x["key"] for x in fbr] == ["browser-signin:maintenance:wsj"], (_signin_held(_led), fbr))
         fdc = []
         _dash_check_finding(fdc, {"ok": False, "at": "2026-10-05T08:29:47Z", "rc": 1,
                                   "summary": ["FAIL overview tab", "FAIL - a check :: detail"]}, N)

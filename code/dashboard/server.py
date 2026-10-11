@@ -2234,12 +2234,122 @@ def _lead_live_brief(lead, root, target, fname):
             f"available for follow-up when the task is done.")
 
 
-def _lead_tmux_argv(name, root, lead, run_id, slug, prompt):
-    """tmux new-session for an interactive lead: `claude --agent <lead> "<brief>"` in the project root,
-    with the lead env (the lead guard and the commit trailer read it)."""
-    return ["tmux", "new-session", "-d", "-s", name, "-c", root,
-            "-e", f"SPARK_LEAD={lead}", "-e", f"SPARK_LEAD_RUN={run_id}", "-e", f"SPARK_CATALOG_JOB=lead:{slug}",
-            CLAUDE_BIN, "--agent", lead, prompt]
+# lead-composer-central slice 4 (2026-10-11): a LIVE session is one David can follow from his phone.
+# Every interactive tmux launch passes `--remote-control "<name>"` explicitly (CLI 2.1.280), named
+# in ONE place (_rc_name), built in ONE place (_live_tmux_argv), started and put on the box Claude
+# slot in ONE place (_live_launch) — the dispatch button and the composer's "Now" both come here.
+RC_NAME_MAX = 60
+RC_NAME_FALLBACK = "Mission Control session"
+# A live session holds the box slot while its pid lives. claudeq's overrun reaper SIGTERMs a holder
+# past est * KILL_OVERRUN_FACTOR (1.7) + lease_grace_min (30): 120 -> ~234 min (~3.9 h), which is the
+# de-facto hard cap on a forgotten live session until claudeq learns a live kind (see the report).
+LIVE_EST_MIN = 120
+
+
+def _rc_clean(s):
+    """A Remote Control session name made safe: letters, digits, space and . _ - ( ) ' : · only,
+    whitespace collapsed, starting with a letter or digit (the CLI can never read it as a flag), at
+    most RC_NAME_MAX chars, never empty. Idempotent, so a builder may re-clean what it is handed."""
+    s = re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9 ._()'·:-]+", " ", str(s or ""))).strip()
+    s = re.sub(r"^[^A-Za-z0-9]+", "", s)[:RC_NAME_MAX].rstrip(" .·:-")
+    return s or RC_NAME_FALLBACK
+
+
+def _rc_name(who, what=None):
+    """The Remote Control session name: "<who> · <what or 'inbox'>", through _rc_clean."""
+    def part(x):
+        return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9 ._()'·:-]+", " ", str(x or ""))).strip()
+    who, what = part(who), part(what) or "inbox"
+    return _rc_clean(f"{who} · {what}" if who else what)
+
+
+def _live_tmux_argv(name, root, prompt, rc, lead=None, run_id=None, slug=None):
+    """tmux new-session for a LIVE (interactive) session: `claude --remote-control "<rc>" [--agent
+    <lead>] "<brief>"` in the project root. -P -F prints the pane pid (the claude process: tmux execs a
+    multi-word command directly), which is what takes the box slot. A lead gets the lead env (the
+    lead guard and the commit trailer read it); a lead-less project (Stocks) gets none."""
+    rc = _rc_clean(rc)
+    env = (["-e", f"SPARK_LEAD={lead}", "-e", f"SPARK_LEAD_RUN={run_id}", "-e", f"SPARK_CATALOG_JOB=lead:{slug}"]
+           if lead else [])
+    return (["tmux", "new-session", "-d", "-P", "-F", "#{pane_pid}", "-s", name, "-c", root, *env,
+             CLAUDE_BIN, "--remote-control", rc] + (["--agent", lead] if lead else []) + [prompt])
+
+
+def _lead_tmux_argv(name, root, lead, run_id, slug, prompt, rc=None):
+    """The lead form of _live_tmux_argv (kept for callers that name it)."""
+    return _live_tmux_argv(name, root, prompt, rc or _rc_name(f"{lead}"), lead=lead, run_id=run_id, slug=slug)
+
+
+def _live_who(target, lead=None):
+    """The display half of a live session's name: "<Project> lead", or "Stocks PM", or the project."""
+    try:
+        import projname
+        proj = projname.name(target) or target
+    except Exception:
+        proj = target
+    return f"{proj} PM" if target == "stocks" else (f"{proj} lead" if lead else proj)
+
+
+def _dispatch_brief(label, target, fname, root):
+    """The pre-lead dispatch brief (Stocks / lead-less projects), headless or live: one memo, per LEDGER.md."""
+    return (f"You are a {label} session, dispatched by David from the Mission Control dashboard. "
+            f"Your task is the memo at ~/memos/inbox/{target}/{fname} — read it and process it per the "
+            f"protocol in ~/memos/LEDGER.md: assess honestly, implement it in this project OR reject it "
+            f"with clear reasoning; update its ledger row (accepted/implemented with commit hash/"
+            f"rejected with why — never leave 'proposed'); move the file to ~/memos/processed/ with "
+            f"`mv -n` (add a `_{target}` suffix if that name is taken); commit "
+            f"if this project is a git repo (never paths .gitignore marks private). Work strictly within "
+            f"{root} + ~/memos/. David may join this session live from claude.ai/code — narrate key "
+            f"decisions as you go, and stay available for follow-up when the task is done.")
+
+
+def _live_launch(target, fname, title=None):
+    """Start the LIVE session for the memo inbox/<target>/<fname> (already on the bus) and put it on
+    the box Claude slot with preempt (David's click: exempt from the clock, never the credential).
+    A project with a lead: `claude --agent <lead>` with the lead brief, job `lead <target>:live`
+    (so _lead_busy and the lead's own passes see it). Stocks / lead-less: the pre-lead dispatch brief,
+    job `dispatch (<target>)`. -> {ok, session, run_id?, rc, msg}."""
+    if os.environ.get("MC_TEST") or os.environ.get("ASK_MEMOS_ROOT"):
+        # a test copy (MC_TEST) or a temp bus (ASK_MEMOS_ROOT) never starts a real Claude session
+        return {"ok": False, "msg": "test copy: no live session started"}
+    projs = bus_projects()
+    if target not in projs:
+        return {"ok": False, "msg": f"unknown project '{target}'"}
+    root, label = projs[target]
+    slug = re.sub(r"^[\d-]+_", "", os.path.basename(fname))
+    slug = slug[:-3] if slug.endswith(".md") else slug
+    e = _lead_entry(target)
+    run_id = None
+    if e:
+        L = _bin_mod("lead")
+        run_id = L.new_run_id(target, "live")
+        root = e["root"]
+        name = re.sub(r"[^a-zA-Z0-9_-]", "-", f"lead-{slug[:22]}-{time.strftime('%H%M')}")
+        rc = _rc_name(_live_who(target, e["lead"]), title or slug)
+        argv = _live_tmux_argv(name, root, _lead_live_brief(e["lead"], root, target, fname), rc,
+                               lead=e["lead"], run_id=run_id, slug=target)
+        job, kind, who = f"lead {target}:live", "lead", e["lead"]
+    else:
+        prompt = _dispatch_brief(label, target, fname, root)
+        name = re.sub(r"[^a-zA-Z0-9_-]", "-", f"memo-{slug[:24]}-{time.strftime('%H%M')}")
+        rc = _rc_name(_live_who(target), title or slug)
+        argv = _live_tmux_argv(name, root, prompt, rc)
+        job, kind, who = f"dispatch ({target})", "foreign", "session"
+    try:
+        r = subprocess.run(_scoped(argv), env=_tmux_env(), timeout=15, check=True, capture_output=True, text=True)
+    except Exception as x:
+        return {"ok": False, "msg": f"tmux launch failed: {type(x).__name__}: {x}"[:160]}
+    pid = next((int(t) for t in str(getattr(r, "stdout", "") or "").split() if t.isdigit()), None)
+    if pid:
+        _claim_slot(job, kind, pid, LIVE_EST_MIN)
+    else:
+        print(f"[dashboard] live session {name}: tmux printed no pane pid — NOT on the Claude slot", flush=True)
+    out = {"ok": True, "session": name, "rc": rc, "pid": pid,
+           "msg": f"{'Dispatched to ' + who if e else 'Dispatched'} — session '{name}' is live as \"{rc}\" "
+                  f"(join from claude.ai/code or the app)."}
+    if run_id:
+        out["run_id"] = run_id
+    return out
 
 
 def bus_process(target):
@@ -2289,8 +2399,10 @@ def bus_process(target):
 # ------------------------------------------------------------------ the composer's routes
 # lead-composer-central slice 2/5 (2026-10-10): David asks a lead from the page. The engine is
 # bin/ask.py (slice 1); these are thin wrappers that validate the request's shape and map
-# ask.AskError to a 4xx. Nothing here starts Claude or pushes: when:"now" is only recorded in the
-# memo (`When: now`), slice 3 starts the live session. ASK_MEMOS_ROOT moves the whole bus (tests).
+# ask.AskError to a 4xx. Nothing here pushes. when:"now" is recorded in the memo (`When: now`) AND,
+# since slice 4 (2026-10-11), starts the live session for that memo through _live_launch — the same
+# launcher as the dispatch button (--remote-control name, the box slot with preempt). Only through
+# this route: `bin/ask.py send --when now` still only records. ASK_MEMOS_ROOT moves the whole bus (tests).
 ASK_STAGE_RE = re.compile(r"^up-[0-9a-f]{16}$")
 ASK_STAGE_TTL = 24 * 3600          # a staged upload the composer never sent is dropped after a day
 ASK_MAX_REFS = 50
@@ -2365,7 +2477,9 @@ def ask_upload(rfile, n, filename):
 def ask_post(d):
     """POST /api/ask. -> (code, body).
       {op:"send", to, kind, body, title?, files?:["<token>/<name>" from /api/ask/upload], when?:"next"|"now", ctx?}
-        -> 200 {ok, id, memo, to, lead, when, files[], now?}   (now: a note that slice 3 starts it; nothing ran)
+        -> 200 {ok, id, memo, to, lead, when, files[], now?, live?}   (when "now": `now` says what happened,
+           `live` is _live_launch's result {ok, session, rc, pid, run_id?, msg}; a failed launch is still a
+           200, the memo is on the bus and the lead takes it on its next pass)
       {op:"withdraw", id}   (the memo file name or the ask- id)
         -> 200 {ok, memo, to}; 409 once the lead has picked it up
     A bad shape, target, kind, when or file ref is 400 {ok:false, msg}."""
@@ -2414,8 +2528,15 @@ def ask_post(d):
     out = {"ok": True, "id": r["id"], "memo": r["memo"], "to": to, "lead": a.lead_for(to), "when": when,
            "files": [a.show(p) for p in r["files"]]}
     if when == "now":
-        out["now"] = ("recorded (When: now); the live session arrives in slice 3, "
-                      "so the lead picks this up on its next memo pass")
+        try:
+            first = ((d.get("body") or "").strip().splitlines() or [""])[0]
+            live = _live_launch(to, r["id"], d.get("title") or first or r["memo"])
+        except Exception as x:              # the memo is on the bus either way
+            live = {"ok": False, "msg": f"live launch failed: {type(x).__name__}: {x}"[:160]}
+        out["live"] = live
+        out["now"] = (live.get("msg") if live.get("ok") else
+                      f"recorded (When: now), but the live session did not start ({live.get('msg')}); "
+                      f"the lead picks this up on its next memo pass")
     return 200, out
 
 
@@ -2599,16 +2720,8 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
     if e:
         # a project lead: the same memo, through the lead (Stocks and lead-less projects: below, unchanged)
         try:
-            if interactive:
-                L = _bin_mod("lead")
-                run_id = L.new_run_id(target, "live")
-                name = re.sub(r"[^a-zA-Z0-9_-]", "-", f"lead-{slug[:22]}-{time.strftime('%H%M')}")
-                subprocess.run(_scoped(_lead_tmux_argv(name, e["root"], e["lead"], run_id, target,
-                                                       _lead_live_brief(e["lead"], e["root"], target, fname))),
-                               env=_tmux_env(), timeout=15, check=True)
-                return {"ok": True, "session": name, "run_id": run_id,
-                        "msg": f"Dispatched to {e['lead']} — session '{name}' is live (join from claude.ai/code "
-                               f"or the app)."}
+            if interactive:                 # the live lead session: _live_launch (RC name + the slot)
+                return _live_launch(target, fname, title or slug)
             busy = _lead_busy(target)
             if busy:
                 return {"ok": True, "msg": f"Memo dropped in inbox/{target}/. {e['lead']} is already at work "
@@ -2621,24 +2734,9 @@ def bus_dispatch(target, title, body, source_file="", interactive=True):
                     "msg": f"Dispatched headless to {e['lead']} (up to {cap} min, run {r.get('run_id')})."}
         except Exception as x:
             return {"ok": False, "msg": f"lead launch failed: {type(x).__name__}: {x}"[:160]}
-    prompt = (f"You are a {label} session, dispatched by David from the Mission Control dashboard. "
-              f"Your task is the memo at ~/memos/inbox/{target}/{fname} — read it and process it per the "
-              f"protocol in ~/memos/LEDGER.md: assess honestly, implement it in this project OR reject it "
-              f"with clear reasoning; update its ledger row (accepted/implemented with commit hash/"
-              f"rejected with why — never leave 'proposed'); move the file to ~/memos/processed/ with "
-              f"`mv -n` (add a `_{target}` suffix if that name is taken); commit "
-              f"if this project is a git repo (never paths .gitignore marks private). Work strictly within "
-              f"{root} + ~/memos/. David may join this session live from claude.ai/code — narrate key "
-              f"decisions as you go, and stay available for follow-up when the task is done.")
-    if interactive:
-        name = re.sub(r"[^a-zA-Z0-9_-]", "-", f"memo-{slug[:24]}-{time.strftime('%H%M')}")
-        try:
-            subprocess.run(_scoped(["tmux", "new-session", "-d", "-s", name, "-c", root,
-                                    CLAUDE_BIN, prompt]), env=_tmux_env(), timeout=15, check=True)
-        except Exception as e:
-            return {"ok": False, "msg": f"tmux launch failed: {e}"[:140]}
-        return {"ok": True, "msg": f"Dispatched — session '{name}' is live (join from claude.ai/code or the app).",
-                "session": name}
+    prompt = _dispatch_brief(label, target, fname, root)
+    if interactive:                         # Stocks / lead-less: the same live launcher, no --agent
+        return _live_launch(target, fname, title or slug)
     log = f"{HOME}/maintenance/logs/memo_process_{target}.log"
     os.makedirs(os.path.dirname(log), exist_ok=True)
     with open(log, "ab") as fh:
@@ -4586,6 +4684,7 @@ def selftest():
             G = globals()
             L = _bin_mod("lead")
             real = {k: G[k] for k in ("_lead_entry", "_claim_slot", "_lead_busy")}
+            claims = []
             real_launch, real_run, real_popen = L.launch, subprocess.run, subprocess.Popen
             launched, ran, popened = [], [], []
             fake = {"slug": "poker", "lead": "poker_lead", "root": os.path.join(tmp, "poker"),
@@ -4600,11 +4699,12 @@ def selftest():
                 pid = 4242
             try:
                 G["_lead_entry"] = lambda t: fake if t == "poker" else None
-                G["_claim_slot"] = lambda *a, **k: None
+                G["_claim_slot"] = lambda *a, **k: claims.append(a)
                 G["_lead_busy"] = lambda t: None
                 L.launch = lambda *a, **kw: launched.append((a, kw)) or {"ok": True, "state": "launched",
                                                                          "run_id": "r-1", "pid": 1}
-                subprocess.run = lambda argv, **kw: ran.append(argv) or subprocess.CompletedProcess(argv, 0)
+                subprocess.run = lambda argv, **kw: ran.append(argv) or subprocess.CompletedProcess(
+                    argv, 0, stdout="4243\n" if "new-session" in argv else "")
                 subprocess.Popen = lambda argv, **kw: popened.append(argv) or _P()
                 r = bus_process("poker")
                 a, kw = launched[-1] if launched else ((), {})
@@ -4629,10 +4729,16 @@ def selftest():
                 tm = tm[i:]
                 ok(r.get("ok") and tm[:2] == ["tmux", "new-session"] and tm[tm.index("-c") + 1] == fake["root"]
                    and "SPARK_LEAD=poker_lead" in tm and any(x.startswith("SPARK_LEAD_RUN=") for x in tm)
-                   and tm[-4:-1] == [CLAUDE_BIN, "--agent", "poker_lead"]
+                   and tm[-6:-4] == [CLAUDE_BIN, "--remote-control"] and tm[-4] and tm[-4] == _rc_clean(tm[-4])
+                   and tm[-4].endswith("lead · Live one") and tm[-3:-1] == ["--agent", "poker_lead"]
                    and tm[-1].startswith("You are poker_lead, dispatched by David") and "live-one.md" in tm[-1],
-                   "dispatch interactive (lead): tmux `claude --agent poker_lead \"<brief>\"` in the project root, "
-                   "with the lead env")
+                   f"dispatch interactive (lead): tmux `claude --remote-control \"<name>\" --agent poker_lead "
+                   f"\"<brief>\"` in the project root, with the lead env ({tm[-4] if len(tm) > 4 else tm})")
+                ok(claims[-1:] == [("lead poker:live", "lead", 4243, LIVE_EST_MIN)] and r.get("pid") == 4243
+                   and "-P" in tm and tm[tm.index("-F") + 1] == "#{pane_pid}",
+                   f"dispatch interactive (lead): the pane pid takes the box slot with preempt as `lead poker:live`, "
+                   f"est {LIVE_EST_MIN} ({claims[-1:]})")
+                claims.clear()
                 ran.clear()
                 n0 = len(launched)
                 os.makedirs(os.path.join(tmp, "Stocks"), exist_ok=True)
@@ -4640,13 +4746,16 @@ def selftest():
                 bus_dispatch("stocks", "Stock ask 2", "Do it headless.", interactive=False)
                 bus_process("stocks")
                 tm = next((x for x in ran if "new-session" in x), [])
-                ok(len(launched) == n0 and tm and tm[-2] == CLAUDE_BIN and "--agent" not in tm
+                ok(len(launched) == n0 and tm and tm[-4:-2] == [CLAUDE_BIN, "--remote-control"]
+                   and tm[-2].endswith("· Stock ask") and tm[-2] == _rc_clean(tm[-2]) and "--agent" not in tm
+                   and not any(str(x).startswith("SPARK_LEAD") for x in tm)
+                   and ("dispatch (stocks)", "foreign", 4243, LIVE_EST_MIN) in claims
                    and "session, dispatched by David from the Mission Control dashboard" in tm[-1]
                    and len(popened) == 2 and all(CLAUDE_HEADLESS in p and "--agent" not in p for p in popened)
                    and "dispatched by David" in " ".join(popened[0])
                    and "Process the cross-project memo inbox" in " ".join(popened[1]),
-                   "Stocks (no lead): the pre-lead tmux, headless and process paths, unchanged — no lead.launch, "
-                   "no --agent")
+                   "Stocks (no lead): the pre-lead tmux (now with --remote-control and the slot), headless and "
+                   "process paths — no lead.launch, no --agent, no lead env")
                 G["_lead_busy"] = lambda t: "lead poker:inbox" if t == "poker" else None
                 n0 = len(launched)
                 r1 = bus_process("poker")
@@ -4672,6 +4781,34 @@ def selftest():
                 L.launch, subprocess.run, subprocess.Popen = real_launch, real_run, real_popen
     finally:
         LEDGER, MEMOBUS, HOME = saved
+
+    # 5e. lead-composer-central slice 4: every LIVE launch is followable from the phone. Each live argv
+    #     builder puts `--remote-control "<name>"` in front of the prompt, the name non-empty and clean.
+    #     Pure: nothing runs.
+    evil = ["--dangerously-skip-permissions", "$(rm -rf ~); `id` | x > y", "", None, "  ·  ", "x" * 300,
+            "Fix the \"thing\"\n\tnow", "日本語 only", "-a · -b"]
+    cleaned = [_rc_clean(x) for x in evil] + [_rc_name(w, x) for w in ("", "Poker lead", "--x") for x in evil]
+    ok(all(c and len(c) <= RC_NAME_MAX and c[0].isalnum() and re.fullmatch(r"[A-Za-z0-9 ._()'·:-]+", c)
+           and _rc_clean(c) == c for c in cleaned),
+       f"Remote Control names: never empty, <= {RC_NAME_MAX} chars, start alphanumeric, safe chars only, "
+       f"idempotent ({len(cleaned)} hostile inputs)")
+    ok(_rc_name("Poker lead", None) == "Poker lead · inbox" and _rc_name("Stocks PM", "Fix: the $ROI")
+       == "Stocks PM · Fix: the ROI" and _live_who("stocks") == "Stocks PM",
+       "Remote Control names: \"<who> · <ask title>\", 'inbox' when there is no title, Stocks is the PM")
+
+    def rc_of(argv):
+        i = argv.index(CLAUDE_BIN) if CLAUDE_BIN in argv else -1
+        return argv[i + 2] if i >= 0 and argv[i + 1:i + 2] == ["--remote-control"] and len(argv) > i + 3 else None
+    built = {"lead": _live_tmux_argv("n", "/tmp", "brief", "Poker lead · x", lead="poker_lead", run_id="r", slug="poker"),
+             "lead (wrapper)": _lead_tmux_argv("n", "/tmp", "poker_lead", "r", "poker", "brief"),
+             "non-lead": _live_tmux_argv("n", "/tmp", "brief", "Stocks PM · y"),
+             "non-lead, hostile name": _live_tmux_argv("n", "/tmp", "brief", "--agent evil; $(x)"),
+             "non-lead, empty name": _live_tmux_argv("n", "/tmp", "brief", "")}
+    ok(all(rc_of(a) and rc_of(a) == _rc_clean(rc_of(a)) and a[-1] == "brief" for a in built.values())
+       and built["non-lead, hostile name"][-2] == "agent evil (x)" and "--agent" not in built["non-lead"]
+       and built["lead"][-3:-1] == ["--agent", "poker_lead"],
+       f"armed: every live tmux argv passes --remote-control with a clean, non-empty name "
+       f"({ {k: rc_of(a) for k, a in built.items()} })")
 
     # 6. counts, diagrams, catalog, relogin
     cs = crons_summary()
@@ -4766,6 +4903,22 @@ def selftest():
     saved_root = os.environ.get("ASK_MEMOS_ROOT")
     os.environ["ASK_MEMOS_ROOT"] = tb
     asrv = None
+    _saved_t = os.environ.get("MC_TEST")
+    os.environ["MC_TEST"] = "1"
+    try:
+        _tl = _live_launch("maintenance", "2026-10-11_ask-x.md", "x")
+    finally:
+        if _saved_t is None:
+            os.environ.pop("MC_TEST", None)
+        else:
+            os.environ["MC_TEST"] = _saved_t
+    ok(_tl.get("ok") is False and "test copy" in _tl.get("msg", ""),
+       f"live launch: a test copy (MC_TEST) or a temp bus never starts a real session ({_tl})")
+    real_live, lives = globals()["_live_launch"], []
+    # slice 4: a "now" send starts the live session through _live_launch, so it is a recorder here
+    globals()["_live_launch"] = lambda *a: lives.append(a) or {
+        "ok": True, "session": "lead-x-0000", "rc": "Mission Control lead · Why is it late", "pid": 1,
+        "msg": "Dispatched to maintenance_lead — session 'lead-x-0000' is live"}
     try:
         A = _ask()
         ok(A.root() == os.path.abspath(tb), "ask routes: the selftest bus is a temp dir, not ~/memos")
@@ -4785,11 +4938,22 @@ def selftest():
                             "files": [up["file"]], "when": "now", "ctx": "#box/janitor"})
         mp = os.path.join(tb, "inbox", "maintenance", r.get("id", "?"))
         txt = open(mp).read() if os.path.isfile(mp) else ""
-        ok(code == 200 and r["memo"] == "ask-why-is-it-late" and r["lead"] == "maintenance_lead" and "slice 3" in r["now"]
+        ok(code == 200 and r["memo"] == "ask-why-is-it-late" and r["lead"] == "maintenance_lead"
+           and lives == [("maintenance", r.get("id"), "Why is it late?")] and r.get("live", {}).get("ok")
+           and "is live" in r.get("now", "")
            and "\nWhen: now\n" in txt and "Context: #box/janitor" in txt
            and os.path.isfile(os.path.join(A.files_dir("ask-why-is-it-late"), "sales detail.csv"))
            and not os.path.exists(os.path.join(_ask_stage(), up["file"].split("/")[0])),
-           f"POST send: memo in the temp inbox, When: now recorded, the upload moved to files/<id>/ ({code}, {r})")
+           f"POST send: memo in the temp inbox, When: now recorded AND the live session started for that memo "
+           f"(_live_launch(target, memo file, title)), the upload moved to files/<id>/ ({code}, {r}, {lives})")
+        globals()["_live_launch"] = lambda *a: (_ for _ in ()).throw(RuntimeError("planted"))
+        os.makedirs(os.path.join(tb, "inbox", "hbs"))      # its own inbox: the maintenance thread stays one item
+        cf, rf = ask_post({"op": "send", "to": "hbs", "kind": "task", "body": "Live but broken", "when": "now"})
+        ok(cf == 200 and rf.get("ok") and rf["live"]["ok"] is False and "did not start" in rf["now"]
+           and os.path.isfile(os.path.join(tb, "inbox", "hbs", rf["id"])),
+           f"POST send now, the launch raising: still 200, the memo on the bus, `now` says it did not start ({cf})")
+        globals()["_live_launch"] = lambda *a: lives.append(a) or {"ok": True}
+        n_live = len(lives)
         ok("| ask-why-is-it-late | dashboard (David) | maintenance | proposed |" in open(A.ledger_path()).read(),
            "POST send: its row in the temp ledger")
         for what, dd in (("a bad kind", {"op": "send", "to": "maintenance", "kind": "order", "body": "x"}),
@@ -4862,9 +5026,11 @@ def selftest():
                     **{"Content-Type": "application/json", "Origin": "https://evil.example"})[0] == 403
            and call("POST", "/api/ask", b'{"op":"send"}', **{"Content-Type": "application/json"})[0] == 400,
            "over the wire: upload as JSON 415, text/plain 415, another origin 403, a bad send 400")
+        ok(len(lives) == n_live, f"a send without when:now starts nothing live ({len(lives) - n_live} launches)")
     except Exception as x:
         ok(False, f"the ask route checks ran to the end ({type(x).__name__}: {x})")
     finally:
+        globals()["_live_launch"] = real_live
         if asrv:
             asrv.shutdown()
         if saved_root is None:
