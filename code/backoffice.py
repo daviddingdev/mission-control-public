@@ -3961,7 +3961,32 @@ def expire_mutes(today=None):
         cfg.setdefault("_expired", {})[k] = {"until": until.pop(k),
                                              "reason": (cfg.get("_reasons") or {}).pop(k, None)}
     save(MUTE, cfg, indent=1)
+    EXPIRED_THIS_PASS[:] = gone
     return gone
+
+
+# what expire_mutes() moved this pass, for commit_mute_expiry() (the run's caller, not the
+# function: the selftests call expire_mutes() on a scratch MUTE and must never reach git)
+EXPIRED_THIS_PASS = []
+
+
+def commit_mute_expiry(was_dirty, dry=False):
+    """Commit the expiry the pass just wrote, by path (2026-10-12, memo
+    maintenance_lead-work-fence-script-mute-rebase): expire_mutes() rewrote config/backoffice_mute.json
+    and nothing committed it, so the file sat modified from 10-06; the next answer's promote then read
+    it as another session's work (dirty_before) and skipped it, and two fence patches in David's apply
+    script stopped matching the tree. Commits only when the file was clean before this pass, so
+    another session's edit is never swept in. -> the sha, or ""."""
+    gone = list(EXPIRED_THIS_PASS)
+    if dry or not gone or was_dirty:
+        if gone and was_dirty and not dry:
+            print("  mute expiry left uncommitted (config/backoffice_mute.json was already modified)")
+        return ""
+    sha = _commit(["config/backoffice_mute.json"],
+                  f"Back office: {len(gone)} mute(s) past their end date leave the list for _expired: "
+                  + ", ".join(gone)[:160])
+    print(f"  mute expiry committed {sha or '(nothing to commit)'}: {', '.join(gone)[:160]}")
+    return sha
 
 
 # A key's life across episodes (memo 2026-10-03_wa-repeat-failures, ask 1). first_seen and
@@ -5131,7 +5156,9 @@ def run(dry=False):
     fresh += _ed_f
     # David's dashboard answers first, so a mute he chose skips this very pass's merge
     decided = apply_decisions(fresh, dry=dry)
+    _mute_dirty = bool(dirty_before({"config/backoffice_mute.json"}))
     new, resolved, open_f = merge_findings(fresh)
+    commit_mute_expiry(_mute_dirty, dry=dry)
     fixed = fix(open_f, dry=dry)
     filed = file_memos(new, dry=dry)
     try:
@@ -5602,6 +5629,11 @@ def selftest():
               gone == ["k-old"] and mc["muted"] == ["k-new", "k-plain"]
               and mc["_expired"]["k-old"] == {"until": "2026-09-01", "reason": "why"}
               and "k-old" not in mc["_until"] and "k-old" not in mc["_reasons"], mc)
+        check("mute expiry is committed by the run, never when dry or when the file was already dirty",
+              EXPIRED_THIS_PASS == ["k-old"] and commit_mute_expiry(True) == ""
+              and commit_mute_expiry(False, dry=True) == "", EXPIRED_THIS_PASS)
+        EXPIRED_THIS_PASS[:] = []
+        check("…and with nothing expired there is nothing to commit", commit_mute_expiry(False) == "")
         save(MUTE, {"muted": []})
 
         # keys
