@@ -392,6 +392,60 @@ def publish(repo=None, dry=False):
     return 0
 
 
+# ONE-SHOT RESYNC (2026-10-13, decision:78c907fe, David: "Reset the local copy for me"). A ~/public clone that has
+# drifted from its live remote (auto-made commits ahead, a page pushed from elsewhere behind) can never push fast-forward.
+# state/publish_resync.json names {repo: {"decision": "<id>"}}; refresh resets that clone to origin/main ONLY when the id
+# is a David answer in state/decisions.jsonl, then builds over it and pushes as usual: fast-forward, never forced. The
+# entry is consumed after the reset. Files outside code/ that the remote has (support/, privacy/) survive the build.
+RESYNC = os.path.join(MC, "state/publish_resync.json")
+
+
+def _resync_ok(rec, decisions_lines):
+    """-> True when rec names a decision id that David answered (an exec claude/code row by id, not by policy)."""
+    did = (rec or {}).get("decision") if isinstance(rec, dict) else None
+    if not did:
+        return False
+    for ln in decisions_lines:
+        try:
+            e = json.loads(ln)
+        except Exception:
+            continue
+        if e.get("id") == did and e.get("by", "david") == "david" and e.get("option"):
+            return True
+    return False
+
+
+def _resync(dry=False):
+    try:
+        todo = json.load(open(RESYNC))
+    except Exception:
+        return []
+    try:
+        lines = open(os.path.join(MC, "state/decisions.jsonl")).read().splitlines()
+    except Exception:
+        lines = []
+    done = []
+    for repo, rec in list(todo.items()):
+        d = os.path.join(root(), repo)
+        if not os.path.isdir(os.path.join(d, ".git")) or not _resync_ok(rec, lines):
+            print(f"  resync {repo}: skipped (no clone, or decision {rec!r} is not a David answer)")
+            continue
+        if dry:
+            print(f"  dry: would reset {repo} to origin/main ({rec['decision']})")
+            continue
+        _git(d, "fetch", "-q", "origin", "main")
+        was = _git(d, "rev-parse", "--short", "HEAD")
+        _git(d, "reset", "-q", "--hard", "origin/main")
+        print(f"  resync {repo}: reset {was} -> {_git(d, 'rev-parse', '--short', 'HEAD')} = origin/main "
+              f"(decision:{rec['decision']})")
+        todo.pop(repo)
+        done.append(repo)
+    if done:
+        with open(RESYNC, "w") as fh:
+            json.dump(todo, fh, indent=1)
+    return done
+
+
 def refresh(dry=False):
     """Re-sync the allowlisted code, then publish what is still clean.
 
@@ -402,6 +456,7 @@ def refresh(dry=False):
     reported, because the failure mode to design against is a private detail arriving in a
     file that was safe when somebody last looked at it.
     """
+    _resync(dry=dry)
     build()
     quarantined, changed, failed = [], [], []
     for name, spec in cfg()["projects"].items():
@@ -498,6 +553,13 @@ def selftest():
 
     def check(name, got, want):
         cases.append((name, got == want, got))
+
+    # the one-shot resync obeys only a David answer, found by id (decision:78c907fe)
+    _dl = ['{"id":"aa11","by":"david","option":"choice-1"}', '{"id":"bb22","by":"policy","option":"choice-1"}', 'junk']
+    check("resync: David's answer", _resync_ok({"decision": "aa11"}, _dl), True)
+    check("resync: a policy default is not enough", _resync_ok({"decision": "bb22"}, _dl), False)
+    check("resync: unknown id", _resync_ok({"decision": "zz99"}, _dl), False)
+    check("resync: no id", _resync_ok({}, _dl), False)
 
     for src, want in fx.MASK_CASES:
         check(f"mask: {src[:34]}", pseudonymize(src)[0], want)

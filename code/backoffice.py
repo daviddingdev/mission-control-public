@@ -470,12 +470,19 @@ def _ollama_callers():
         root = os.path.join(HOME, name)
         # api/embed (2026-09-29): ollama's batch embedding endpoint, which the Data Desk is the
         # first to call; the older api/embeddings is a prefix match of it
-        hits = sh(["grep", "-rl", "--include=*.py", "-e", "api/chat", "-e", ":11434",
+        # dependency trees are not ours and not callers (2026-10-13: gradio and acestep inside
+        # poker-appstore/marketing/.venv-acestep were filed as unmanaged; a cold walk of those
+        # trees can also outrun sh()'s timeout and drop the whole project from the scan)
+        hits = sh(["grep", "-rl", "--include=*.py", "--exclude-dir=.git", "--exclude-dir=node_modules",
+                   "--exclude-dir=.venv*", "--exclude-dir=venv", "--exclude-dir=site-packages",
+                   "--exclude-dir=dist-packages",
+                   "-e", "api/chat", "-e", ":11434",
                    "-e", "chat_url(", "-e", "api/generate", "-e", "api/embed",
                    root]).splitlines()
         for f in hits:
             if any(skip in f for skip in ("/.git/", "/node_modules/", "/worktrees/",
-                                          "/archive/", "/backups/")):
+                                          "/archive/", "/backups/", "/site-packages/",
+                                          "/dist-packages/")):
                 continue
             try:
                 text = open(f, errors="replace").read()
