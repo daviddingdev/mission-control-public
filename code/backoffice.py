@@ -5147,6 +5147,25 @@ def _attention_weekly(today=None, rows=None, run=None, dry=False):
 
 
 def run(dry=False):
+    """One janitor pass. The log's LAST line is always the pass's verdict (2026-10-15, memo
+    maintenance_lead-work-janitor-log-verdict): `pass done: N open, M new, K fixed in Ss`, or
+    `pass FAILED: <why>` after the traceback. Before this the last line was the newest finding's
+    title, and a title holding "fails" made the dashboard read the janitor itself as failed."""
+    t0 = time.time()
+    try:
+        new, fixed, still_open = _run_pass(dry=dry)
+    except Exception as e:                       # the verdict line must survive any failure
+        import traceback
+        traceback.print_exc(file=sys.stdout)
+        why = _scrub_secrets(f"{type(e).__name__}: {e}").replace("\n", " ")[:200]
+        print(f"pass FAILED: {why} (after {time.time() - t0:.0f}s)", flush=True)
+        return 1
+    print(f"pass done: {len(still_open)} open, {len(new)} new, {len(fixed)} fixed in {time.time() - t0:.0f}s",
+          flush=True)
+    return 0
+
+
+def _run_pass(dry=False):
     c = census()
     fresh = audit(c)
     # rule 43 (memo wa-cost-attribution slice 3/4): true the weights up once a day, file weight-drift
@@ -5228,7 +5247,7 @@ def run(dry=False):
         if filed:
             msg += f"\n{len(filed)} memo(s) filed to the bus"
         sh([os.path.join(MC, "bin/notify.sh"), "maintenance", "Back office", msg], timeout=30)
-    return 0
+    return new, fixed, still_open
 
 
 def show():
@@ -5252,7 +5271,7 @@ def selftest():
     stored-copy scrub, the diagram rules and the render that must not claim a false repair.
     Nothing here touches the live state, config or git."""
     import tempfile
-    global FINDINGS, MUTE, CONFIG, MC, _commit, MEMOS, BLOCKERS, REPEAT_ASKED, ARGV_ASKED, ARGV_MAX_PY
+    global FINDINGS, MUTE, CONFIG, MC, _commit, MEMOS, BLOCKERS, REPEAT_ASKED, ARGV_ASKED, ARGV_MAX_PY, _run_pass
     ok = True
 
     def check(name, cond, info=""):
@@ -5266,6 +5285,28 @@ def selftest():
     check("a finding title says 3 jobs / 1 action, never (s); its id keeps the raw title",
           [x["title"] for x in pt] == ["3 queue jobs reach no lead", "the x guard refused 1 action in 24 h"]
           and pt[0]["id"] == "k::3-queue-job-s-reach-no-lead", [(x["id"], x["title"]) for x in pt])
+    # the log's last line is the pass's verdict (memo maintenance_lead-work-janitor-log-verdict)
+    import contextlib
+    import io
+    _real_pass = _run_pass
+
+    def _pass_ok(dry=False):
+        print("  new [med] a dashboard selftest fails — a page can show a wrong count")
+        return [{"sev": "med"}], [], [{}, {}, {}]
+
+    def _pass_boom(dry=False):
+        raise KeyError("census")
+    try:
+        for fake, want_rc, want in ((_pass_ok, 0, "pass done: 3 open, 1 new, 0 fixed in "),
+                                    (_pass_boom, 1, "pass FAILED: KeyError: 'census'")):
+            _run_pass, buf = fake, io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run(dry=True)
+            last = buf.getvalue().strip().splitlines()[-1]
+            check(f"run() ends with its verdict line ({want.split(':')[0]})",
+                  rc == want_rc and last.startswith(want), (rc, last))
+    finally:
+        _run_pass = _real_pass
     saved = (FINDINGS, MUTE, CONFIG, MC, _commit, os.environ.get("MC_DECISIONS_FILE"))
     t = tempfile.mkdtemp(prefix="backoffice-selftest.")
     try:
