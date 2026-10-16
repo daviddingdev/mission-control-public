@@ -4408,10 +4408,25 @@ EXP_DRIVE_WEEK_MAX = 3
 EXP_DRIVE_PER_PASS = 1                          # one a day keeps three 30-min sessions from stacking
 EXP_DRIVE_SKIPS_MAX = 5                         # refused this many times running -> a finding
 EXP_DRIVE_EST = 30
-# OFF (maintenance_lead 2026-10-07): bin/ is a zero-Claude-token zone, and the janitor must not start a Claude
-# session itself. Until the design run has its own cron line (prompts/experiment_design.md through claudeq, after
-# the pilot ends 10-16: memo wa-handoffs-and-frontier slice 3/3), the rule only reports what it would launch.
+# OFF for good in the janitor (maintenance_lead 2026-10-07): bin/ is a zero-Claude-token zone, and the janitor must
+# not start a Claude session itself. Since 2026-10-16 (memo wa-handoffs-and-frontier slice 3/4) the design run has its
+# own cron line: `backoffice.py experiment-next` (code: picks the item by the same rules, renders the prompt, records
+# the attempt, prints its slug) and the cron line itself runs claudeq.py + claude-headless on it. The janitor's pass
+# keeps the report and the findings (ran without a memo, refused 5 times).
 EXP_DRIVE_LAUNCH = False
+
+
+def experiment_next(dry=False, **kw):
+    """The cron half of rule 46 -> (slug or None, lines). Same picks, caps and records as the driver; instead of
+    spawning, the attempt is recorded with no pid and the slug is returned for the cron line to launch. The
+    attempt then reads `ran` unless the queue's SKIPPED lands after its marker in logs/experiment_design_<slug>.log
+    (the cron line appends there), which makes it retried."""
+    picked = []
+    lines, _f = experiment_driver(dry=dry, spawn=lambda argv, log: picked.append(log), **kw)
+    slug = None
+    if picked:
+        slug = os.path.basename(picked[0])[len("experiment_design_"):-len(".log")]
+    return slug, lines
 
 
 def _exp_memo_slug(title):
@@ -6798,6 +6813,25 @@ def selftest():
         open(f"{_ex}/proposals/2026-10-01_fourth-stale-item.md", "w").write("# memo")
         check("experiment-no-driver: a memo file in proposals/ counts as a memo; fresh items wait their week",
               not any("Fourth stale" in x or "Fresh item" in x for x in ED(dry=True, ts=T)[0]))
+        # the cron half (2026-10-16): experiment-next picks by the same rules, spawns nothing, records a pid-less try
+        shutil.rmtree(f"{_ex}/state", ignore_errors=True); os.remove(f"{_ex}/proposals/2026-10-01_fourth-stale-item.md")
+        n = len(spawned)
+        EN = lambda dry=False, ts=T: experiment_next(dry=dry, now_ts=ts, mc=_ex, state_dir=f"{_ex}/state",
+                                                    alive=_alive, read=_read)
+        _s0, _l0 = EN(dry=True)
+        _s1, _l1 = EN()
+        _att = load(f"{_ex}/state/{EXP_DRIVER}", {}).get("stale-poker-corpus", {}).get("attempts", [])
+        check("experiment-next: dry picks nothing; live returns the oldest stale slug, spawns nothing, records one "
+              "pid-less attempt with its marker in logs/experiment_design_<slug>.log",
+              _s0 is None and _s1 == "stale-poker-corpus" and len(spawned) == n and len(_att) == 1
+              and not _att[0].get("pid") and _att[0]["marker"] in open(_att[0]["log"]).read()
+              and os.path.exists(f"{_ex}/state/experiment_design/stale-poker-corpus.md"), (_s0, _s1, _att))
+        _s2, _ = EN(ts=T + 86400)
+        with open(f"{_ex}/logs/experiment_design_second-stale-item.log", "a") as _fh:
+            _fh.write("claudeq run: SKIPPED frontier design: second-stale-item — 5h budget\n")
+        _s3, _ = EN(ts=T + 2 * 86400)
+        check("experiment-next: a pid-less try is never repeated; one the queue SKIPPED is picked again",
+              _s2 == "second-stale-item" and _s3 == "second-stale-item", (_s2, _s3))
     finally:
         shutil.rmtree(_ex, ignore_errors=True)
 
@@ -6806,6 +6840,9 @@ def selftest():
     check("argv: `experiments` and `experiments --dry` parse; `experiments --now` is exit 2",
           P(["experiments", "--dry"]) == ("experiments", True, "") and P(["experiments"]) == ("experiments", False, "")
           and bool(P(["experiments", "--now"])[2]))
+    check("argv: `experiment-next [--dry]` parses; `experiment-next --launch` is exit 2",
+          P(["experiment-next", "--dry"]) == ("experiment-next", True, "")
+          and P(["experiment-next"]) == ("experiment-next", False, "") and bool(P(["experiment-next", "--launch"])[2]))
     check("argv: history-backfill takes --dry / --dry-run, and an unknown flag after it is exit 2",
           P(["history-backfill", "--dry"]) == ("history-backfill", True, "")
           and P(["history-backfill"]) == ("history-backfill", False, "")
@@ -6822,8 +6859,9 @@ def selftest():
 
 
 COMMANDS = ("census", "audit", "fix", "brief", "run", "show", "decide", "selftest", "history-backfill",
-            "experiments")
-USAGE = ("usage: backoffice.py [census|audit|fix|brief|run|show|decide|selftest|history-backfill|experiments] "
+            "experiments", "experiment-next")
+USAGE = ("usage: backoffice.py [census|audit|fix|brief|run|show|decide|selftest|history-backfill|experiments|"
+         "experiment-next] "
          "[--dry|--dry-run] | --help")
 
 
@@ -6881,5 +6919,11 @@ if __name__ == "__main__":
             print(_ln)
         for _f in _fs:
             print(f"[{_f['sev']:>4}] {_f['kind']:<18} {_f['title']}")
+    elif cmd == "experiment-next":               # the design run's cron line: prints the slug to launch, or nothing
+        _slug, _ls = experiment_next(dry=dry)
+        for _ln in _ls or ["experiment driver: nothing to drive"]:
+            print(f"{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ} {_ln}", file=sys.stderr)
+        if _slug:
+            print(_slug)
     elif cmd == "run":
         sys.exit(run(dry=dry))

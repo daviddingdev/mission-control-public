@@ -350,8 +350,12 @@ def _git(d, *args, check=True):
     return r.stdout.strip()
 
 
-def publish(repo=None, dry=False):
-    build(repo)
+def publish(repo=None, dry=False, rebuild=True):
+    # refresh() builds once, quarantines, then publishes with rebuild=False: a rebuild here would
+    # copy the quarantined file straight back and refuse the whole repo (poker-appstore-public,
+    # refused 10-13..10-16 while the log said "updated").
+    if rebuild:
+        build(repo)
     hits = scan(repo)
     if hits:
         print(f"REFUSED — {len(hits)} leak(s):")
@@ -482,7 +486,10 @@ def refresh(dry=False):
             # David can make — and the exception aborted the loop, so stocks-public stopped
             # refreshing too). The failure is still recorded, printed and returned non-zero.
             try:
-                publish(repo)
+                if publish(repo, rebuild=False):            # 1 = the scan refused it
+                    changed.remove(repo)
+                    failed.append({"repo": repo, "error": "scan refused the repo after quarantine"})
+                    print(f"  {repo}: REFUSED after quarantine — NOT published")
             except RuntimeError as e:
                 changed.remove(repo)
                 failed.append({"repo": repo, "error": str(e)[-400:]})
