@@ -431,6 +431,25 @@ def _script_path(job, name):
     return None
 
 
+def _backfill_scripts(live, path=None):
+    """Scripts the GPU backfill tick launches (config/gpu_backfill.json `consumers[].run`).
+
+    They have no cron line of their own once handed to the idle hours (model-watch.py and
+    build-journal.py, 2026-10-16), yet they are scheduled: by the tick, which is. Counted only
+    while the tick's own line is live and the config is enabled, so a paused backfill still
+    shows its consumers as orphans (decision:20ced170, decision:65166058)."""
+    if "gpu_backfill.py" not in live:
+        return set()
+    try:
+        cfg = json.load(open(path or os.path.join(CONFIG, "gpu_backfill.json")))
+    except (OSError, ValueError):
+        return set()
+    if not cfg.get("enabled", True):
+        return set()
+    return {os.path.basename(t) for c in cfg.get("consumers", [])
+            for t in re.findall(r"[\w./~-]+\.(?:py|sh)\b", c.get("run", ""))}
+
+
 def _declared_zero(cmd):
     """True when config/job_weights.json declares this invocation as spending no tokens.
 
@@ -2634,6 +2653,7 @@ def audit(c=None):
                          job.get("project", ""))
 
     live_scripts = {s for j in c["crons"] for s in j["scripts"]}
+    live_scripts |= _backfill_scripts(live_scripts)
     for row in re.findall(r"^\|[^|]*\|\s*`?([\w./-]+\.(?:py|sh))", d["registry_text"], re.M):
         base = os.path.basename(row)
         if base not in live_scripts:
@@ -5293,6 +5313,20 @@ def selftest():
         nonlocal ok
         print(("PASS " if cond else "FAIL ") + name + (f"  — {info}" if info and not cond else ""))
         ok = ok and bool(cond)
+
+    with tempfile.TemporaryDirectory() as _tb:
+        _bf = os.path.join(_tb, "gpu_backfill.json")
+        with open(_bf, "w") as fh:
+            json.dump({"enabled": True, "consumers": [
+                {"run": "python3 ~/maintenance/bin/model-watch.py run"},
+                {"run": "~/data-desk/.venv/bin/python ~/data-desk/bin/desk.py shift --until {until}"}]}, fh)
+        _on = _backfill_scripts({"gpu_backfill.py"}, _bf)
+        _notick = _backfill_scripts({"healthcheck.sh"}, _bf)
+        with open(_bf, "w") as fh:
+            json.dump({"enabled": False, "consumers": [{"run": "python3 bin/model-watch.py run"}]}, fh)
+        _off = _backfill_scripts({"gpu_backfill.py"}, _bf)
+    check("registry-orphan: a backfill consumer counts as scheduled only while the tick is live and enabled",
+          _on == {"model-watch.py", "desk.py"} and _notick == set() and _off == set(), (_on, _notick, _off))
 
     pt = []
     _finding(pt, "k", "low", "3 queue job(s) reach no lead", "d")
