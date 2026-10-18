@@ -10,7 +10,8 @@
 # channel per day, digest never sends on its own and is consolidated into the 23:00 UTC rollup.
 # Pass --tier to override the policy for a caller that knows better.
 #
-# Everything is recorded to state/notifications.jsonl either way (with tier + pushed), which is
+# Everything is recorded to state/notifications.jsonl either way (with tier + pushed, and for a send
+# `delivered`, written after the attempt; an undelivered send is spooled for healthcheck.sh), which is
 # the permanent history the dashboard renders and the rollup reads — ntfy.sh keeps only ~12h.
 # If the policy layer errors, the push is SENT: a throttle bug must never eat an outage alert.
 #
@@ -48,7 +49,24 @@ if [ -n "$DRY" ]; then
 fi
 mkdir -p state
 
-DECISION=$(python3 bin/notify_policy.py "$CH" "$TITLE" "$MSG" "$TIER" 2>/dev/null) || DECISION=SEND
-[ "$DECISION" = "SEND" ] || exit 0
+# Delivered, not decided (memo wa-alerts-and-boot, 2026-10-05). The policy records a HOLD at once;
+# a SEND is recorded only after the attempt, with `delivered`. A push counts only when ntfy answers
+# 2xx with a message id (`curl -fsS`; a captive portal's 200 page is not delivery). An undelivered
+# push, or any push while a backlog stands, goes to healthcheck.sh's spool (state/alerts_pending),
+# which every 15-min run retries oldest first and drops after 24 h; exit 1 says it did not arrive.
+DECISION=$(python3 bin/notify_policy.py decide "$CH" "$TITLE" "$MSG" "$TIER" 2>/dev/null) \
+  || DECISION=$'SEND\tcritical\tpolicy error, sent anyway'
+[ "${DECISION%%$'\t'*}" = "SEND" ] || exit 0
+IFS=$'\t' read -r _ PTIER PWHY <<<"$DECISION"
+SPOOL=${NOTIFY_SPOOL:-state/alerts_pending}
 
-curl -s -m 10 -H "Title: $TITLE" -d "$MSG" "https://ntfy.sh/$TOPIC" >/dev/null
+if [ ! -s "$SPOOL" ] && RESP=$(curl -fsS -m 10 -H "Title: $TITLE" -d "$MSG" "https://ntfy.sh/$TOPIC" 2>/dev/null) \
+   && [[ $RESP == *'"id"'* ]]; then
+  python3 bin/notify_policy.py delivered "$CH" "$TITLE" "$MSG" "$PTIER" 1 "$PWHY" "$RESP" || true
+  exit 0
+fi
+python3 bin/notify_policy.py spool "$CH" "$TITLE" "$MSG" "$PTIER" "$PWHY" \
+  || echo "notify.sh: could not spool either: $TITLE" >&2
+python3 bin/notify_policy.py delivered "$CH" "$TITLE" "$MSG" "$PTIER" 0 "$PWHY" || true
+echo "notify.sh: ntfy did not take '$TITLE'; spooled to $SPOOL (healthcheck.sh retries it every 15 min)" >&2
+exit 1

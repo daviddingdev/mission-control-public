@@ -16,7 +16,8 @@
 #
 #   healthcheck.sh                 the live run (cron)
 #   healthcheck.sh --dry|--dry-run what this run finds and what the alarm would do; writes and sends nothing
-#   healthcheck.sh selftest        the alarm's plan, arm, cancel and the ledger rows, on a stub curl
+#   healthcheck.sh selftest        the alarm's plan, arm, cancel and the ledger rows, on a stub curl;
+#                                  the UPS transitions on fixture upsc output and a stub notify.sh
 #   healthcheck.sh deadman-cancel  delete the scheduled alarm before a planned shutdown (the next
 #                                  live run re-arms it; run it as the last thing before powering off)
 # Any other argument exits 2 and checks and sends nothing. HEALTHCHECK_DRY=1 is --dry.
@@ -110,10 +111,10 @@ PYEOF
 # push is delivered (late ones say so) or dropped, never one per failed retry.
 HC_SPOOL=${HC_SPOOL:-state/alerts_pending}
 HC_SPOOL_MAX=86400
-hc_send(){ # <title> <tags> <priority or ""> <message> -> ntfy's JSON on stdout; 0 only when ntfy took it
+hc_send(){ # <title> <tags> <priority or ""> <message> [topic] -> ntfy's JSON on stdout; 0 only when ntfy took it
   local h=(-H "Title: $1" -H "Tags: $2") resp
   [ -n "$3" ] && h+=(-H "Priority: $3")
-  resp=$(curl -fsS -m 10 "${h[@]}" -d "$4" "https://ntfy.sh/$TOPIC") || return 1
+  resp=$(curl -fsS -m 10 "${h[@]}" -d "$4" "https://ntfy.sh/${5:-$TOPIC}") || return 1
   printf '%s' "$resp"
   [[ $resp == *'"id"'* ]]
 }
@@ -136,7 +137,10 @@ hc_post(){ # <title> <tags> <priority or ""> <message> <state>: deliver and ledg
   return 1
 }
 hc_flush(){ # retry the spool oldest first; on delivery $STATE takes the state that push reported
+  # notify.sh spools here too (src "notify", its channel, no state; 2026-10-05): such a line goes to
+  # its channel's topic, never moves $STATE, and its late row is written by notify_policy.py.
   [ -s "$HC_SPOOL" ] || { rm -f "$HC_SPOOL"; return 0; }
+  exec 9>>"$HC_SPOOL.lock"; flock 9      # notify_policy.py spool appends under the same lock
   local line now keep=() stop=0 resp f
   now=$(date +%s)
   while IFS= read -r line || [ -n "$line" ]; do
@@ -144,18 +148,32 @@ hc_flush(){ # retry the spool oldest first; on delivery $STATE takes the state t
     if [ $stop = 1 ]; then keep+=("$line"); continue; fi
     mapfile -d '' -t f < <(python3 -c 'import json, sys
 d = json.loads(sys.argv[1]); int(d["ts"])
-sys.stdout.write("\0".join(str(d.get(k) or "") for k in ("ts", "title", "tags", "priority", "body", "state")) + "\0")' "$line" 2>/dev/null)
-    if [ ${#f[@]} -ne 6 ]; then
+topic = ""
+if d.get("src") == "notify":
+    topic = json.load(open("config/ntfy.json"))["channels"][d["channel"]]
+sys.stdout.write("\0".join(str(d.get(k) or "") for k in ("ts", "title", "tags", "priority", "body", "state",
+                                                         "src", "channel", "tier", "reason")) + "\0" + topic + "\0")' "$line" 2>/dev/null)
+    if [ ${#f[@]} -ne 11 ]; then
       echo "$(date -Is) spool: dropped an unreadable line: ${line:0:200}"; continue
     fi
     if [ $((now - f[0])) -gt $HC_SPOOL_MAX ]; then
       echo "$(date -Is) spool: dropped undelivered after 24h (first tried $(date -u -d "@${f[0]}" +%FT%TZ)): ${f[1]} — ${f[4]}"
-      hc_record "${f[1]}" "${f[4]}" '' " (dropped from the spool after 24 h undelivered; first tried $(date -u -d "@${f[0]}" +%FT%TZ))"
+      if [ "${f[6]}" = notify ]; then
+        python3 bin/notify_policy.py delivered "${f[7]}" "${f[1]}" "${f[4]}" "${f[8]}" 0 \
+          "${f[9]} (dropped from the spool after 24 h undelivered; first tried $(date -u -d "@${f[0]}" +%FT%TZ))" >/dev/null 2>&1
+      else
+        hc_record "${f[1]}" "${f[4]}" '' " (dropped from the spool after 24 h undelivered; first tried $(date -u -d "@${f[0]}" +%FT%TZ))"
+      fi
       continue
     fi
-    if resp=$(hc_send "${f[1]}" "${f[2]}" "${f[3]}" "${f[4]}"); then
-      printf '%s' "${f[5]}" > "$STATE"
-      hc_record "${f[1]}" "${f[4]}" "$resp" " (delivered late from the spool; first tried $(date -u -d "@${f[0]}" +%FT%TZ))"
+    if resp=$(hc_send "${f[1]}" "${f[2]}" "${f[3]}" "${f[4]}" "${f[10]}"); then
+      if [ "${f[6]}" = notify ]; then
+        python3 bin/notify_policy.py delivered "${f[7]}" "${f[1]}" "${f[4]}" "${f[8]}" 1 \
+          "${f[9]} (delivered late from the spool; first tried $(date -u -d "@${f[0]}" +%FT%TZ))" "$resp" >/dev/null 2>&1
+      else
+        printf '%s' "${f[5]}" > "$STATE"
+        hc_record "${f[1]}" "${f[4]}" "$resp" " (delivered late from the spool; first tried $(date -u -d "@${f[0]}" +%FT%TZ))"
+      fi
       echo "$(date -Is) spool: delivered late (first tried $(date -u -d "@${f[0]}" +%FT%TZ)): ${f[1]} — ${f[4]}"
     else
       stop=1; keep+=("$line")
@@ -166,6 +184,7 @@ sys.stdout.write("\0".join(str(d.get(k) or "") for k in ("ts", "title", "tags", 
   else
     rm -f "$HC_SPOOL"
   fi
+  flock -u 9; exec 9>&-
 }
 hc_prev(){ # what David was last told: the newest spooled state while a backlog stands, else $STATE
   if [ -s "$HC_SPOOL" ] && python3 -c 'import json, sys
@@ -188,6 +207,125 @@ hc_report(){ # NOW, PREV and FAIL set by the caller: push the change; $STATE mov
   fi
   return 0
 }
+
+# >>> UPS power (2026-10-17). NUT reads the CyberPower (`upsc cyberpower`), but upsmon's NOTIFYFLAGs
+# are SYSLOG+WALL, and upsmon runs as user nut, which can neither read config/ntfy.json nor write the
+# notifications ledger, so a power cut reached nobody. This watchdog tells David, through notify.sh:
+#   OB          -> critical "Spark on battery: <charge>%, ~<runtime> min left"
+#   OB + LB     -> critical "shutting down at low battery" (upsmon powers off within seconds of LB,
+#                  so a 15-min run rarely sees it: the OB push carries the runtime left, and the
+#                  dead-box alarm follows the shutdown)
+#   back to OL  -> one critical recovery line: how long, and whether it shut down meanwhile
+#   no reading on UPS_LINK_RUNS runs in a row (Data stale, Driver not connected, 0764:0601 not in
+#                  lsusb) -> actionable, with the fix from ~/INFRASTRUCTURE.md; its return -> one line
+# state/ups.json is what David was told (power, link) beside what the last run read. The told part
+# moves only when notify.sh exits 0: it exits non-zero when curl cannot reach ntfy.sh (the router may
+# be out in the same cut), so the push is retried next run, and a cut that ended before any push got
+# out is still reported when the power comes back. OL+LB (recharging after a cut) is on line, not a
+# shutdown: upsmon acts only on OB+LB. Kept out of FAIL so one event never pushes twice.
+UPS_STATE=${UPS_STATE:-state/ups.json}
+UPS_UPSC=${UPS_UPSC:-upsc}
+UPS_LSUSB=${UPS_LSUSB:-lsusb}
+UPS_NOTIFY=${UPS_NOTIFY:-bin/notify.sh}
+UPS_LINK_RUNS=2
+ups_read(){ # -> "<OL|OB|LB|LINK|OTHER> <charge|-> <runtime s|-> <ups.status, or why there is no reading>"
+  local out rc st ch rt
+  out=$("$UPS_UPSC" cyberpower 2>&1); rc=$?
+  st=$(sed -n 's/^ups\.status: //p' <<<"$out")
+  ch=$(sed -n 's/^battery\.charge: //p' <<<"$out"); rt=$(sed -n 's/^battery\.runtime: //p' <<<"$out")
+  if [ $rc -ne 0 ] || [ -z "$st" ]; then
+    echo "LINK - - $(grep -m1 -i -e error -e stale -e 'not connected' <<<"$out" || echo "upsc exited $rc")"
+  elif ! "$UPS_LSUSB" -d 0764:0601 >/dev/null 2>&1; then
+    echo "LINK - - 0764:0601 missing from lsusb"
+  elif [[ " $st " == *" OB "* && " $st " == *" LB "* ]]; then echo "LB ${ch:--} ${rt:--} $st"
+  elif [[ " $st " == *" OB "* ]]; then echo "OB ${ch:--} ${rt:--} $st"
+  elif [[ " $st " == *" OL "* ]]; then echo "OL ${ch:--} ${rt:--} $st"
+  else echo "OTHER ${ch:--} ${rt:--} $st"
+  fi
+}
+ups_plan(){ # <write 0|1> <now> <boot> <class> <charge> <runtime> <detail...> -> "tier<TAB>title<TAB>message<TAB>state once told"
+  # or nothing. With write=1 the observation (link_bad, ob_since, the reading) goes to $UPS_STATE now.
+  python3 - "$UPS_STATE" "$UPS_LINK_RUNS" "$@" <<'PYEOF'
+import json, sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+path, runs, write, now, boot, cls, ch, rt = sys.argv[1:9]
+detail = " ".join(sys.argv[9:])
+runs, now = int(runs), int(now)
+boot = int(boot) if boot.isdigit() else 0
+try:
+    s = json.load(open(path))
+    s = s if isinstance(s, dict) else {}
+except Exception:
+    s = {}
+def num(x):
+    try: return int(float(x))
+    except Exception: return None
+def et(t): return datetime.fromtimestamp(t, ZoneInfo("America/New_York")).strftime("%-I:%M %p ET")
+charge, runtime = num(ch), num(rt)
+left = f"{charge}%, ~{runtime // 60} min left" if charge is not None and runtime is not None else "charge and runtime not reported"
+power, link = s.get("power", "OL"), s.get("link", "ok")
+bad, since = int(s.get("link_bad") or 0), int(s.get("ob_since") or 0)
+push, told = None, {}
+if cls == "LINK":
+    bad += 1
+    if bad >= runs and link != "lost":
+        push = ["actionable", "UPS data link lost",
+                f"The watchdog has had no UPS reading for {bad} runs ({detail}), so a power cut would not reach you. "
+                "Fix: sudo systemctl reset-failed nut-driver@cyberpower; sudo systemctl start nut-driver@cyberpower "
+                "(if lsusb has no 0764:0601, re-seat the USB-A to C converter first). ~/INFRASTRUCTURE.md, UPS."]
+        told["link"] = "lost"
+else:
+    bad = 0
+    if cls in ("OB", "LB") and not since:
+        since = now
+    if cls == "OB" and power == "OL":
+        push = ["critical", "Spark on battery",
+                f"Spark on battery: {left}. The power is out at the box; upsmon shuts it down at 10% or 5 min left."]
+        told["power"] = "OB"
+    elif cls == "LB" and power != "LB":
+        push = ["critical", "Spark shutting down",
+                f"Spark shutting down at low battery: {left}. upsmon is powering it off now; 'Spark silent for 2h' follows from ntfy.sh."]
+        told["power"] = "LB"
+    elif cls == "OL" and (power != "OL" or since):
+        msg = f"Power back: the Spark is on line again, battery {charge if charge is not None else '?'}%."
+        if since and boot > since:
+            msg += f" On battery from {et(since)}; it shut down on the battery and came back up at {et(boot)}."
+        elif since:
+            msg += f" On battery ~{max(1, (now - since) // 60)} min (from {et(since)})."
+        if power == "OL":
+            msg += " The on-battery push never got out: ntfy.sh was unreachable (the network may have been out too)."
+        push = ["critical", "Spark power back", msg]
+        told.update(power="OL", ob_since=0)
+    if link == "lost":
+        if push:
+            push[2] += " The UPS data link is back too."
+        else:
+            push = ["actionable", "UPS data link back", f"The watchdog reads the UPS again: {detail}, battery {left}."]
+        told["link"] = "ok"
+obs = dict(s, at=now, read=cls, detail=detail, charge=charge, runtime=runtime, link_bad=bad, ob_since=since)
+obs.setdefault("power", "OL"); obs.setdefault("link", "ok")
+if write == "1":
+    with open(path + ".tmp", "w") as f:
+        f.write(json.dumps(obs) + "\n")
+    import os; os.replace(path + ".tmp", path)
+if push:
+    print("\t".join(push + [json.dumps(dict(obs, **told))]))
+PYEOF
+}
+ups_step(){ # <now> <boot>: read the UPS, push what changed, move the told state only on delivery
+  local cls ch rt det tier title msg next
+  read -r cls ch rt det <<<"$(ups_read)"
+  IFS=$'\t' read -r tier title msg next <<<"$(ups_plan 1 "$1" "$2" "$cls" "$ch" "$rt" "$det")"
+  [ -n "$title" ] || return 0
+  echo "$(date -Is) UPS: $title — $msg"
+  if "$UPS_NOTIFY" --tier "$tier" alerts "$title" "$msg"; then
+    printf '%s\n' "$next" > "$UPS_STATE.tmp" && mv "$UPS_STATE.tmp" "$UPS_STATE"
+  else
+    echo "$(date -Is) UPS: push not delivered (notify.sh exited non-zero); retried next run"
+  fi
+}
+# <<< UPS power
 
 if [ "$MODE" = selftest ]; then
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
@@ -274,6 +412,87 @@ STUB
   ok "spool: while a backlog stands a new push queues behind it (order holds), not sent" \
     "$(calls) $(python3 -c 'import json,sys; print(" ".join(json.loads(l)["body"] for l in open(sys.argv[1])))' "$HC_SPOOL")" \
     "1 first second"
+  # UPS power (2026-10-17): fixture upsc output on a stub upsc and lsusb, and a stub notify.sh that
+  # records its argv and exits $NOTIFY_RC. Never the real UPS, never a real push.
+  mkdir -p "$T/ups"; UPS_STATE=$T/ups.json; UPS_UPSC=$T/ups/upsc; UPS_LSUSB=$T/ups/lsusb; UPS_NOTIFY=$T/ups/notify
+  cat > "$UPS_UPSC" <<'STUB'
+#!/bin/bash
+echo "Init SSL without certificate database" >&2
+cat "$(dirname "$0")/fixture"; exit "${UPSC_RC:-0}"
+STUB
+  printf '#!/bin/bash\nexit "${LSUSB_RC:-0}"\n' > "$UPS_LSUSB"
+  cat > "$UPS_NOTIFY" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$(dirname "$0")/pushes"
+exit "${NOTIFY_RC:-0}"
+STUB
+  chmod +x "$UPS_UPSC" "$UPS_LSUSB" "$UPS_NOTIFY"; export UPSC_RC=0 LSUSB_RC=0 NOTIFY_RC=0
+  fx(){ # <ups.status> [charge] [runtime s]: a CP1500AVRLCD3 reading as `upsc cyberpower` prints it
+    printf 'battery.charge: %s\nbattery.charge.low: 10\nbattery.runtime: %s\nbattery.runtime.low: 300\ndevice.model: CP1500AVRLCD3\nups.load: 4\nups.status: %s\n' \
+      "${2:-100}" "${3:-14300}" "$1" > "$T/ups/fixture"; UPSC_RC=0
+  }
+  fxerr(){ printf 'Error: %s\n' "$1" > "$T/ups/fixture"; UPSC_RC=1; }
+  U=$N; BOOT=$((U - 86400))
+  ustep(){ U=$((U + 900)); ups_step "$U" "$BOOT" >>"$L" 2>&1; }
+  pushes(){ cat "$T/ups/pushes" 2>/dev/null | grep -c .; }
+  lastp(){ tail -1 "$T/ups/pushes" 2>/dev/null; }
+  told(){ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["power"], d["link"], d["link_bad"], int(bool(d["ob_since"])))' "$UPS_STATE"; }
+  has(){ grep -c -F -- "$1" <<<"$2"; }
+  fx OL; ok "ups read: OL" "$(ups_read)" "OL 100 14300 OL"
+  fx "OL CHRG" 97; ok "ups read: OL CHRG is on line" "$(ups_read)" "OL 97 14300 OL CHRG"
+  fx "OB DISCHRG" 87 9000; ok "ups read: OB DISCHRG is on battery" "$(ups_read)" "OB 87 9000 OB DISCHRG"
+  fx "OB DISCHRG LB" 9 280; ok "ups read: OB DISCHRG LB is low battery" "$(ups_read)" "LB 9 280 OB DISCHRG LB"
+  fx "OB LB" 9 280; ok "ups read: OB LB side by side is low battery" "$(ups_read | cut -d' ' -f1)" LB
+  fx "FSD OB LB" 9 280; ok "ups read: FSD OB LB (upsmon shutting down) is low battery" "$(ups_read | cut -d' ' -f1)" LB
+  fx "OL CHRG LB" 8; ok "ups read: OL LB (recharging after a cut) is on line, not a shutdown" "$(ups_read | cut -d' ' -f1)" OL
+  fxerr "Data stale"; ok "ups read: Data stale is no reading" "$(ups_read)" "LINK - - Error: Data stale"
+  fxerr "Driver not connected"; ok "ups read: Driver not connected is no reading" "$(ups_read)" "LINK - - Error: Driver not connected"
+  fx OL; LSUSB_RC=1; ok "ups read: 0764:0601 gone from lsusb is no reading, whatever upsc says" "$(ups_read)" "LINK - - 0764:0601 missing from lsusb"
+  LSUSB_RC=0
+  fx OL; ustep
+  ok "ups: first run on line pushes nothing, writes the state" "$(pushes) $(told)" "0 OL ok 0 0"
+  fx "OB DISCHRG" 87 9000; ustep
+  ok "ups: OL -> OB pushes once, critical on alerts, charge and minutes left" \
+    "$(pushes) $(has '--tier critical alerts Spark on battery Spark on battery: 87%, ~150 min left.' "$(lastp)") $(told)" "1 1 OB ok 0 1"
+  ustep; ok "ups: still on battery next run -> nothing more" "$(pushes)" 1
+  fx "OB DISCHRG LB" 9 280; ustep
+  ok "ups: OB -> LB pushes critical 'shutting down at low battery'" \
+    "$(pushes) $(has '--tier critical alerts Spark shutting down Spark shutting down at low battery: 9%, ~4 min left.' "$(lastp)") $(told)" "2 1 LB ok 0 1"
+  BOOT=$((U + 300)); fx "OL CHRG" 12 1200; ustep
+  ok "ups: back on line after a shutdown -> one critical recovery line that says it shut down" \
+    "$(pushes) $(has '--tier critical alerts Spark power back Power back: the Spark is on line again, battery 12%.' "$(lastp)") $(has 'it shut down on the battery and came back up at' "$(lastp)") $(told)" \
+    "3 1 1 OL ok 0 0"
+  ustep; ok "ups: on line again next run -> nothing" "$(pushes)" 3
+  fx "OB DISCHRG" 80 8000; NOTIFY_RC=6; ustep
+  ok "ups: an undelivered on-battery push (notify.sh non-zero) leaves told on OL, the cut remembered" "$(pushes) $(told)" "4 OL ok 0 1"
+  NOTIFY_RC=0; ustep
+  ok "ups: ...and is retried next run, then told" "$(pushes) $(has 'Spark on battery' "$(lastp)") $(told)" "5 1 OB ok 0 1"
+  fx OL; ustep; fx "OB DISCHRG" 95 13000; NOTIFY_RC=6; ustep; NOTIFY_RC=0; fx OL; ustep
+  ok "ups: a cut whose push never got out is still reported when the power returns" \
+    "$(pushes) $(has 'On battery ~15 min' "$(lastp)") $(has 'The on-battery push never got out' "$(lastp)") $(told)" "8 1 1 OL ok 0 0"
+  fxerr "Data stale"; ustep
+  ok "ups: one run with no reading -> nothing yet" "$(pushes) $(told)" "8 OL ok 1 0"
+  ustep
+  ok "ups: two in a row -> actionable, with the reason and the fix" \
+    "$(pushes) $(has '--tier actionable alerts UPS data link lost' "$(lastp)") $(has 'Error: Data stale' "$(lastp)") $(has 'sudo systemctl reset-failed nut-driver@cyberpower; sudo systemctl start nut-driver@cyberpower' "$(lastp)") $(told)" \
+    "9 1 1 1 OL lost 2 0"
+  ustep; ok "ups: a third run with no reading -> nothing more" "$(pushes) $(told)" "9 OL lost 3 0"
+  fx OL; ustep
+  ok "ups: the reading comes back -> one line" "$(pushes) $(has '--tier actionable alerts UPS data link back' "$(lastp)") $(told)" "10 1 OL ok 0 0"
+  LSUSB_RC=1; ustep; ustep
+  ok "ups: 0764:0601 missing from lsusb two runs in a row -> link lost" "$(pushes) $(has '0764:0601 missing from lsusb' "$(lastp)")" "11 1"
+  LSUSB_RC=0; fx "OB DISCHRG" 70 7000; ustep
+  ok "ups: the link returns during a cut -> ONE critical push that says both" \
+    "$(pushes) $(has '--tier critical alerts Spark on battery' "$(lastp)") $(has 'The UPS data link is back too.' "$(lastp)") $(told)" "12 1 1 OB ok 0 1"
+  fxerr "Driver not connected"; ustep
+  ok "ups: no reading during a cut keeps the cut (no push, no false recovery)" "$(pushes) $(told)" "12 OB ok 1 1"
+  fx OL; ustep; ok "ups: ...and the return to line is reported" "$(pushes) $(has 'Spark power back' "$(lastp)")" "13 1"
+  echo 'not json' > "$UPS_STATE"; ustep
+  ok "ups: a corrupt state file reads as empty (no crash, no push)" "$(pushes) $(told)" "13 OL ok 0 0"
+  cp "$UPS_STATE" "$T/ups/before"
+  ok "ups: write=0 (the dry run) says what it would push ..." \
+    "$(ups_plan 0 $((U + 900)) "$BOOT" OB 50 3000 "OB DISCHRG" | cut -f1-2)" "$(printf 'critical\tSpark on battery')"
+  ok "ups: ... and writes nothing" "$(cmp -s "$UPS_STATE" "$T/ups/before" && echo same)" same
   ok "the outage alarm's own checks are still read by the back office (chk lines)" \
     "$(grep -c '^chk [0-9]' "$0" | awk '{print ($1 >= 8)}')" 1
   [ $F -eq 0 ] && echo "ALL PASS" || echo "$F FAILED"
@@ -469,6 +688,15 @@ case $SM_RC in
   3) [ -n "$SM_READ" ] && echo "$(date -Is) disk SMART not read (not a disk failure; retried hourly): $SM" ;;
   *) echo "$(date -Is) smart_check.py exited $SM_RC: $SM" ;;
 esac
+# smartd's own warnings (memo wa-alerts-and-boot): /etc/smartmontools/run.d/20spark, run by root,
+# appends one JSON line per smartd event to $SMARTD_FLAG and never pushes (a root-run notify.sh would
+# write root-owned ledger rows). FAIL disk-smartd while the newest event is under 7 days old and newer
+# than state/smartd.ack; `touch ~/maintenance/state/smartd.ack` acknowledges it once handled.
+SMARTD_FLAG=${SMARTD_FLAG:-/var/lib/smartmontools/spark-smartd.jsonl}
+if [ -s "$SMARTD_FLAG" ] && [ -n "$(find "$SMARTD_FLAG" -mmin -10080 2>/dev/null)" ] \
+   && { [ ! -e state/smartd.ack ] || [ "$SMARTD_FLAG" -nt state/smartd.ack ]; }; then
+  FAIL+=("disk-smartd($(tail -n1 "$SMARTD_FLAG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("failtype") or "?")' 2>/dev/null))")
+fi
 
 # Every declared backup source must be fresh (config/backups.json is the one list —
 # this used to hardcode Stocks, which is why nothing noticed that the poker app's live
@@ -498,6 +726,9 @@ if [ -n "${HEALTHCHECK_DRY:-}" ]; then
   printf 'undelivered alerts spooled: %s (%s; a live run retries them first)\n' \
     "$(cat "$HC_SPOOL" 2>/dev/null | grep -c .)" "$HC_SPOOL"
   printf 'disk SMART: %s\n' "${SM:-not checked}"
+  read -r U_CLS U_CH U_RT U_DET <<<"$(ups_read)"
+  printf 'UPS: %s (battery %s%%, runtime %s s; %s); would push: %s\n' "$U_CLS" "$U_CH" "$U_RT" "$U_DET" \
+    "$(ups_plan 0 "$NOW_S" "$(awk '/^btime/{print $2}' /proc/stat)" "$U_CLS" "$U_CH" "$U_RT" "$U_DET" | cut -f1-3 | sed 's/\t/ · /g' | grep . || echo nothing)"
   if [ "$DM_AT" -gt 0 ]; then
     printf 'dead-box alarm: would %s (armed %s min ago; ntfy delivers it at %s unless re-armed)\n' \
       "$DM_DO" "$(( (NOW_S - DM_AT) / 60 ))" "$(dm_et "$DM_DUE")"
@@ -549,6 +780,9 @@ fi
 
 NOW=$(printf '%s\n' "${FAIL[@]}" | sort)
 hc_report
+
+# UPS power: on battery, low battery, back on line, the data link (functions above, after hc_report).
+ups_step "$NOW_S" "$(awk '/^btime/{print $2}' /proc/stat)"
 
 # Heads-ups: once, when the set changes and is not empty, through notify.sh (tiered and ledgered;
 # the raw POST above is the outage alarm's deliberate exemption). Clearing is silent: a renewal
