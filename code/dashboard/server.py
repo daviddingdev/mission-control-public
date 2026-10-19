@@ -3929,6 +3929,40 @@ def _whois(peer):
     return out
 
 
+_OWNER = None
+
+
+def _tailnet_owner():
+    """(login, own IPs) of the Spark's own tailnet identity, from `tailscale status --self --json`,
+    cached for the process once it answers (2026-10-19, memo wa-injection-boundary slice 6/6)."""
+    global _OWNER
+    if _OWNER is not None:
+        return _OWNER
+    try:
+        j = json.loads(subprocess.run(["tailscale", "status", "--self", "--json"], capture_output=True,
+                                      text=True, timeout=5).stdout or "{}")
+        me = j.get("Self") or {}
+        login = str(((j.get("User") or {}).get(str(me.get("UserID") or "")) or {}).get("LoginName") or "").lower()
+        if login:
+            _OWNER = (login, {str(i).lower() for i in me.get("TailscaleIPs") or []})
+            return _OWNER
+    except Exception:
+        pass
+    return ("", set())
+
+
+def _david_node(peer, who, owner=None):
+    """True only for a tailnet node of the Spark's own owner that is not the Spark itself: never
+    loopback, never the box's own tailnet IPs (any local process can reach the server from there),
+    never a node whois could not name. OBSERVE ONLY: logged beside each answer so a week of rows
+    proves the verdict before tt_decide (fence) acts on it."""
+    login, ips = owner or _tailnet_owner()
+    peer = str(peer or "").lower()
+    if not peer or not login or who.get("loopback") or peer in ips:
+        return False
+    return str(who.get("user") or "").lower() == login
+
+
 def _log_decision_peer(path, body, r):
     try:
         via = (body or {}).get("_via") or {}
@@ -3937,6 +3971,7 @@ def _log_decision_peer(path, body, r):
                "key": str((body or {}).get("key") or "")[:120], "ok": bool((r or {}).get("ok")),
                "peer": peer[:64], "page": bool(via.get("page"))}
         row.update(_whois(peer) if peer else {})
+        row["david_node"] = _david_node(peer, row)
         with open(f"{HOME}/maintenance/state/decision_peers.jsonl", "a") as fh:
             fh.write(json.dumps(row) + "\n")
     except Exception:
@@ -4409,6 +4444,16 @@ def selftest():
         print(("PASS " if cond else "FAIL ") + what)
         if not cond:
             fails.append(what)
+
+    # 0. the answer-peer verdict (observe only, 2026-10-19): only the owner's other nodes count
+    _own = ("owner@example.test", {TNP})
+    _other = str(ipaddress.ip_network("100.64.0.0/10")[23131])
+    ok(_david_node(_other, {"user": "Owner@example.test"}, _own), "david_node: the owner's other node counts")
+    ok(not _david_node(TNP, {"user": "owner@example.test"}, _own), "david_node: the Spark's own IP never counts")
+    ok(not _david_node("127.0.0.1", {"loopback": True}, _own), "david_node: loopback never counts")
+    ok(not _david_node(_other, {"user": "guest@example.test"}, _own), "david_node: another tailnet user does not count")
+    ok(not _david_node(_other, {"whois": "no answer"}, _own), "david_node: an unnamed peer does not count")
+    ok(not _david_node(_other, {"user": "owner@example.test"}, ("", set())), "david_node: no owner known -> false")
 
     # 1. next_run: the day->hour->minute search against the minute walk it replaced, on every
     #    live schedule and the edge cases, from clock points that cross a month end, a leap

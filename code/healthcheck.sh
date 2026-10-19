@@ -657,6 +657,11 @@ G=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null 
 # Wall power from the UPS. It reports in 1% steps of 900W and updates slowly, so it is
 # useless for a short test and fine on a 15-minute cadence — which is exactly what this is.
 UL=$(upsc cyberpower ups.load 2>/dev/null)
+# Numbers only: on 2026-10-17, mid-patch, nvidia-smi printed "Failed to initialize NVML: Driver/library
+# version mismatch" on stdout and two rows of state/thermal.jsonl stopped being JSON (CDO memo 10-18).
+case "$T" in ''|*[!0-9.]*) T= ;; esac
+case "$G" in ''|*[!0-9.]*) G= ;; esac
+case "$UL" in ''|*[!0-9.]*) UL= ;; esac
 [ -n "$T" ] && printf '{"at": %s, "c": %s, "gpu_w": %s, "wall_w": %s}\n' \
   "$(date +%s)" "$T" "${G:-null}" "$([ -n "$UL" ] && echo "$UL * 9" | bc -l | cut -d. -f1 || echo null)" \
   >> state/thermal.jsonl
