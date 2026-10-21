@@ -166,7 +166,9 @@ def _parse_cron(text):
                 continue
             sched, cmd = " ".join(parts[:5]), parts[5]
         log = ""
-        m = re.search(r">>\s*(\S+)", cmd)
+        # the path only: `2>>logs/x.log)` inside a `$(...)` and `>> "logs/x.log"` must not
+        # carry the `)` or the quotes into it (decision:c138b9f9 — a log that existed read as missing)
+        m = re.search(r">>\s*[\"']?([^\s\"';)|&]+)", cmd)
         if m:
             log = m.group(1).replace("$HOME", HOME).replace("~", HOME)
             if not log.startswith("/"):
@@ -1150,6 +1152,13 @@ ARMED_CHECKS = (
      "requires": ("bin/lead.py",),
      "titles": ("lead.py selftest fails — the weekly pick, the deadline or the push safety no longer hold",
                 "the project-lead rules did not run — `lead.py status` failed")},
+    {"id": "you-week", "control": "the Sunday YOU block: David's week, every insight's numbers checked, no names",
+     "layer": "detective", "standard": "—",
+     "check": "`you_week.py selftest` · `evening-digest.py selftest` · rule you-week: the newest Sunday rollup "
+              "carries the block and its memo exists",
+     "requires": ("bin/you_week.py", "bin/evening-digest.py"),
+     "titles": ("you_week.py selftest fails — the YOU block could cite a number the facts do not hold or name a person",
+                "evening-digest.py selftest fails — the 23:00 rollup's lines no longer do what was agreed")},
 )
 
 
@@ -1559,6 +1568,48 @@ def _rollup_held(path=None):
         return None, []
     flags = [r.get("pushed") is not False for r in rows[-14:]]
     return (rows[-1] if rows and rows[-1].get("pushed") is False else None), flags
+
+
+YOU_LIVE = 1792886400                 # 2026-10-25 00:00Z: the first Sunday rollup that carries the YOU block
+
+
+def _you_week_missing(path=None, you_dir=None, now=None):
+    """Rule you-week (2026-10-21): the newest SUNDAY Daily rollup since the YOU block went live, and what
+    is wrong with it: None when it carries the block and its memo exists, else (row, why). A Sunday with no
+    rollup at all is rollup-held's to say, not this rule's."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    now = now or time.time()
+    last = None
+    try:
+        with open(path or NOTIFICATIONS, errors="replace") as fh:
+            for line in fh:
+                if '"Daily rollup"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                t = r.get("time") or 0
+                if (r.get("title") == "Daily rollup" and r.get("channel") == "maintenance" and YOU_LIVE <= t <= now
+                        and time.gmtime(t).tm_wday == 6):
+                    last = r
+    except OSError:
+        return None
+    if not last:
+        return None
+    lines = str(last.get("message") or "").splitlines()
+    if not any(x.startswith("YOU     ") for x in lines):
+        return last, "the Sunday rollup carried no YOU block"
+    bad = next((x for x in lines if x.startswith("YOU     could not build")), None)
+    if bad:
+        return last, bad[8:].strip()
+    d = _dt.datetime.fromtimestamp(last["time"], ZoneInfo("America/New_York")).date()
+    mon = d - _dt.timedelta(days=d.weekday())
+    y, w, _ = mon.isocalendar()
+    if not os.path.exists(os.path.join(you_dir or os.path.join(STATE, "you"), f"{y}-W{w:02d}.md")):
+        return last, f"its memo state/you/{y}-W{w:02d}.md was not written, so the link opens nothing"
+    return None
 
 
 def _queue_starved(f, rows, hours=48):
@@ -3729,6 +3780,33 @@ def audit(c=None):
                  "`python3 ~/maintenance/bin/notify_policy.py selftest`, and look for an in-dev label in "
                  "config/dev.json that matches it.", project="maintenance", fix="human", key="")
 
+    # 26b. you-week (2026-10-21, David's priorities session: "a daily or weekly progress memo, using
+    #      something we've already built"): the Sunday rollup's YOU block (bin/you_week.py) is the only place
+    #      his week is read back to him, so a Sunday rollup without it, or with its could-not-build line, or
+    #      a link to a memo that was never written, is filed the next morning. Plus the two selftests that
+    #      pin it: you_week.py (the facts, the number check on the insights, the privacy rules) and
+    #      evening-digest.py (the block's place in the rollup, a broken module costing one line).
+    _ym = _you_week_missing()
+    if _ym:
+        _finding(f, "you-week", "med", "the Sunday rollup's YOU block is missing or broken",
+                 f"{datetime.fromtimestamp(_ym[0].get('time', 0), timezone.utc):%Y-%m-%d %H:%MZ}: {_ym[1]}. "
+                 "Run `python3 ~/maintenance/bin/you_week.py week --dry` to see what it would say and why it "
+                 "failed; `python3 ~/maintenance/bin/you_week.py week` writes the memo and the row (no push).",
+                 project="maintenance", key="you-week")
+    _ok, _out = _selfcheck(["you_week.py", "selftest"], "ALL PASS")
+    if not _ok:
+        _finding(f, "guardrail-inert", "high",
+                 "you_week.py selftest fails — the YOU block could cite a number the facts do not hold or name a person",
+                 "run `python3 ~/maintenance/bin/you_week.py selftest`; each FAIL line names the case (typed messages, "
+                 "hours, topics, commits, the number check, the scrub, the rollup lines, argv). Its output: " + _out,
+                 project="maintenance")
+    _ok, _out = _selfcheck(["evening-digest.py", "selftest"], "ALL PASS")
+    if not _ok:
+        _finding(f, "guardrail-inert", "high",
+                 "evening-digest.py selftest fails — the 23:00 rollup's lines no longer do what was agreed",
+                 "run `python3 ~/maintenance/bin/evening-digest.py selftest`; each FAIL line names the case. Its output: "
+                 + _out, project="maintenance")
+
     # 27. queue-starved (2026-10-03): a job in the box Claude queue startable for more than 48 h and
     #     never started. `claudeq.py status` showed a Stocks update job "waiting 8078m" and nothing else on the
     #     box would have said so. claudeq.starving() measures from eligibility; the helper above files.
@@ -3760,9 +3838,11 @@ def audit(c=None):
             if _tc.skip(qjob=_qn):
                 continue
             _aid = _tc.agent_for(qjob=_qn)
-            _m = re.match(r"(?:lead|memo) ([A-Za-z0-9_.-]+)[: ]", _qn)
+            # the project a queue name carries, as claudeq.job_channel() reads it: "lead <slug>:",
+            # "memo <slug>:", and the dashboard's "dispatch (<slug>)" (owner-missing repeat 10-20)
+            _m = re.match(r"(?:lead|memo) ([A-Za-z0-9_.-]+)[: ]|dispatch \(([A-Za-z0-9_.-]+)\)", _qn)
             _things.append({"what": "queue job", "name": f"{_qn!r} ({_qk})", "agent": _aid,
-                            "project": (_m.group(1) if _m else None) if not _aid else None})
+                            "project": ((_m.group(1) or _m.group(2)) if _m else None) if not _aid else None})
         _hm = os.path.expanduser("~")
         for _n, _u in sorted(_units.items()):
             if _u.get("UnitFileState") != "enabled":
@@ -5314,6 +5394,13 @@ def selftest():
         print(("PASS " if cond else "FAIL ") + name + (f"  — {info}" if info and not cond else ""))
         ok = ok and bool(cond)
 
+    _pc = _parse_cron('35 16 * * 1-5 cd ~/maintenance && N=$(python3 bin/backoffice.py experiment-next '
+                      '2>>logs/experiment_design.log) && x >> "logs/y_$N.log" 2>&1\n'
+                      '5 8 * * * cd ~/maintenance && python3 bin/a.py >> "logs/a.log" 2>&1')
+    check("cron log path drops a closing paren and quotes",
+          [j["log"] for j in _pc] == [os.path.join(HOME, "maintenance/logs/experiment_design.log"),
+                                      os.path.join(HOME, "maintenance/logs/a.log")], [j["log"] for j in _pc])
+
     with tempfile.TemporaryDirectory() as _tb:
         _bf = os.path.join(_tb, "gpu_backfill.json")
         with open(_bf, "w") as fh:
@@ -5577,6 +5664,33 @@ def selftest():
         check("rollup-held: fires on a held newest rollup, with the 14-day count",
               row and row["time"] == 4 and fl == [False, True, False], (row, fl))
         check("rollup-held: no ledger, nothing to say", _rollup_held(f"{t}/missing.jsonl") == (None, []))
+
+        # you-week (2026-10-21): the newest Sunday rollup since go-live carries the YOU block and its memo
+        sun = YOU_LIVE + 23 * 3600                       # Sun 2026-10-25 23:00Z
+        yd = f"{t}/you"
+        os.makedirs(yd, exist_ok=True)
+        yrow = lambda ts, msg: {"time": ts, "channel": "maintenance", "title": "Daily rollup", "pushed": True, "message": msg}
+        with open(nl, "w") as fh:
+            fh.write(json.dumps(yrow(sun - 7 * 86400, "Sun Oct 18\nWEEK    x")) + "\n")      # before go-live
+            fh.write(json.dumps(yrow(sun + 86400, "Mon Oct 26\nLEADS   x")) + "\n")        # a Monday: not a Sunday
+        check("you-week: nothing before the first Sunday since go-live",
+              _you_week_missing(nl, yd, now=sun + 2 * 86400) is None)
+        with open(nl, "a") as fh:
+            fh.write(json.dumps(yrow(sun, "Sun Oct 25\nWEEK    x\nYOU     6.8 h hands-on\n        Full memo: u")) + "\n")
+        got = _you_week_missing(nl, yd, now=sun + 2 * 86400)
+        check("you-week: a block whose memo was never written is filed",
+              bool(got) and "2026-W43.md was not written" in got[1], got)
+        open(f"{yd}/2026-W43.md", "w").write("# Your week\n")
+        check("you-week: the block and its memo, quiet", _you_week_missing(nl, yd, now=sun + 2 * 86400) is None)
+        with open(nl, "a") as fh:
+            fh.write(json.dumps(yrow(sun + 7 * 86400, "Sun Nov 1\nYOU     could not build your week (ValueError: x)")) + "\n")
+        got = _you_week_missing(nl, yd, now=sun + 8 * 86400)
+        check("you-week: the could-not-build line is filed with its reason",
+              bool(got) and got[1].startswith("could not build your week (ValueError"), got)
+        with open(nl, "a") as fh:
+            fh.write(json.dumps(yrow(sun + 14 * 86400, "Sun Nov 8\nWEEK    x")) + "\n")
+        got = _you_week_missing(nl, yd, now=sun + 15 * 86400)
+        check("you-week: a Sunday rollup with no block is filed", bool(got) and "no YOU block" in got[1], got)
 
         # the two guard hooks' armed-check (2026-10-02): listed for every tool they cover (matchers
         # read as regexes), executable, own selftest passes

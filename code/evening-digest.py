@@ -59,12 +59,23 @@ pilot_until), the second line names every lead project with a 2-4 word outcome. 
 names only a project that needs David, or whose lead missed or failed its run. A project led
 through its own harness (Stocks: its PM) is not lead.py's to judge and is left out.
 
+YOU (2026-10-21, David: "a daily or weekly progress memo, using something we've already built and
+easily accessible. things i did and mostly backwards looking ... it should also provide insights and
+clear stuff accomplished"): on Sundays, under WEEK, his own week from bin/you_week.py: hands-on hours by
+topic against config/goals.json season_plan, what he shipped, people and pipeline, one checked insight,
+and the link to the full memo (state/you/<ISO week>.md in Box › Archive › Reports). At most 6 lines and
+the link, ";" between items (never "·" or "*": it reads as ×), counts and firm names only. Zero Claude
+tokens; the local model writes the insights, a code check drops any with a number the facts do not
+hold, and coded insights stand in when the GPU is busy past 180 s. If it cannot build, the block is one
+line saying so, and back-office rule you-week files it Monday.
+
 A rollup over ntfy's 4,096-byte message limit (ntfy.sh turns it into an attachment) is cut at a
 line, with "… cut" as its last line.
 
     evening-digest.py            build and push
     evening-digest.py --dry-run  print what would be pushed, send nothing (on a weekday it also
-                                 prints the Sunday WEEK lines, marked as Sunday-only)
+                                 prints the Sunday WEEK and YOU lines, marked as Sunday-only; dry
+                                 YOU writes no memo and uses the coded insights, no model)
     evening-digest.py selftest   the ANSWERS line on a throwaway store; sends nothing
   --dry is the same as --dry-run. Any other argument exits 2 with the usage line and sends nothing
   (2026-10-03: until then `--dry`, or any typo, built AND PUSHED the rollup).
@@ -94,7 +105,9 @@ def argv_error(argv):
     return f"unknown argument(s) {' '.join(argv)!r}"
 
 
-def rows(path, since):
+def rows(path, since, until=None):
+    """Ledger rows with since <= time (< until, when given: the rollup's own day, so a selftest's
+    fixture day does not read every row written since)."""
     out = []
     try:
         with open(path, errors="replace") as f:
@@ -103,7 +116,7 @@ def rows(path, since):
                     r = json.loads(line)
                 except Exception:
                     continue
-                if r.get("time", 0) >= since:
+                if r.get("time", 0) >= since and (until is None or r.get("time", 0) < until):
                     out.append(r)
     except FileNotFoundError:
         pass
@@ -189,7 +202,7 @@ def _outside_home(cwd):
     return bool(c) and not any(c == h or c.startswith(h.rstrip("/") + "/") for h in homes)
 
 
-def answers_line(since, path=None):
+def answers_line(since, path=None, until=None):
     """'2 done · 1 back to you — <item>: <result> · …' for the outcomes recorded since `since`
     (the daily check's `decisions.py done`, the janitor's closes, the gate's give-ups), one per
     answer, newest outcome wins; None when there were none."""
@@ -206,7 +219,8 @@ def answers_line(since, path=None):
                 if isinstance(e, dict) and e.get("id") and e.get("by") == "policy":
                     policy.add(e["id"])             # the AUTO line's, never an answer of David's
                 if (isinstance(e, dict) and e.get("id") and e.get("status") in ("done", "failed")
-                        and e.get("by") != "david" and (e.get("at") or 0) >= since):
+                        and e.get("by") != "david" and (e.get("at") or 0) >= since
+                        and (until is None or (e.get("at") or 0) < until)):
                     last.pop(e["id"], None)
                     last[e["id"]] = e
     except OSError:
@@ -224,7 +238,7 @@ def answers_line(since, path=None):
     return f"{head} — " + " · ".join(bits) + (" · …" if len(evs) > 3 else "")
 
 
-def policy_outcomes(since, path=None):
+def policy_outcomes(since, path=None, until=None):
     """The decisions the auto-fix policy made (bin/decisions.py, dashboard/tt_decide.py), newest
     event per decision at or after `since`, oldest first. A decision is the policy's when an event
     of it carries `by: "policy"` (its first one does; follow-ups keep it). Read defensively: a
@@ -249,7 +263,7 @@ def policy_outcomes(since, path=None):
         return []
     out = []
     for did, e in last.items():
-        if did not in pol or (e.get("at") or 0) < since:
+        if did not in pol or (e.get("at") or 0) < since or (until is not None and (e.get("at") or 0) >= until):
             continue
         if e.get("by") == "david" and e.get("status") == "cancelled":
             continue                                # David undid it himself: his, not news
@@ -257,10 +271,10 @@ def policy_outcomes(since, path=None):
     return sorted(out, key=lambda e: e.get("at") or 0)
 
 
-def auto_lines(since, path=None):
+def auto_lines(since, path=None, until=None):
     """'AUTO    2 done for you · 1 back to you' and one line per decision (at most 3): what it was,
     what was done, how to undo it. [] on a day the policy did nothing."""
-    evs = policy_outcomes(since, path)
+    evs = policy_outcomes(since, path, until)
     if not evs:
         return []
 
@@ -553,6 +567,21 @@ def _safe_leads_lines(now):
         return [f"WEEK    could not read the leads (bin/lead.py: {type(e).__name__})"]
 
 
+YOU_FAIL = "YOU     could not build your week"      # back-office rule you-week reads this prefix
+
+
+def _safe_you_lines(now, dry=None):
+    """The Sunday YOU block (bin/you_week.py rollup_lines: builds, and unless dry writes, the week's
+    memo and row). The rollup goes out even if you_week.py will not import: one plain line instead."""
+    try:
+        if f"{MC}/bin" not in sys.path:
+            sys.path.insert(0, f"{MC}/bin")
+        import you_week
+        return you_week.rollup_lines(now, dry=DRY if dry is None else dry)
+    except Exception as e:
+        return [f"{YOU_FAIL} (bin/you_week.py: {type(e).__name__}); the back office files it in the morning"]
+
+
 NTFY_MAX = 3900          # bytes; ntfy.sh turns a message over 4,096 bytes into an attachment
 
 
@@ -569,14 +598,16 @@ def fit(body, limit=NTFY_MAX):
     return out
 
 
-def build(now=None, leads=None, api=None):
-    """`leads`: add the WEEK lines (default: on Sundays, UTC). `api(path)` gives a dashboard
+def build(now=None, leads=None, api=None, you=None):
+    """`leads`: add the WEEK lines (default: on Sundays, UTC). `you`: add the YOU block under them
+    (default: on Sundays; a callable gives the lines, for the selftest). `api(path)` gives a dashboard
     payload (default _api: the running server, else in-process); the selftest passes fixtures."""
     now = now or time.time()
     api = api or _api
     day_start = now - (now % 86400)
-    notes = rows(NOTIF, day_start)
-    ends = [r for r in rows(SESSIONS, day_start)
+    day_end = day_start + 86400
+    notes = rows(NOTIF, day_start, day_end)
+    ends = [r for r in rows(SESSIONS, day_start, day_end)
             if r.get("headless") and r.get("event") == "SessionEnd"
             and r.get("project") != "scratch" and not _outside_home(r.get("cwd"))]
 
@@ -627,14 +658,20 @@ def build(now=None, leads=None, api=None):
              f"AGENTS  {agent_lines[0]}"]
     body += [f"        {l}" for l in agent_lines[1:]]
     body += [f"PAGED   {paged_line}", f"HELD    {held_line}"]
-    body += _safe(lambda: auto_lines(day_start), lambda e: [f"AUTO    could not read the decisions ({type(e).__name__})"])
-    ans = answers_line(day_start)
+    body += _safe(lambda: auto_lines(day_start, until=day_end),
+                  lambda e: [f"AUTO    could not read the decisions ({type(e).__name__})"])
+    ans = answers_line(day_start, until=day_end)
     if ans:
         body.append(f"ANSWERS {ans}")
     body += _safe(lambda: leads_today_lines(api("/api/team"), api("/api/crew"), now),
                   lambda e: [f"LEADS   could not read the team ({e})"])
-    if leads if leads is not None else time.gmtime(now).tm_wday == 6:
+    sunday = time.gmtime(now).tm_wday == 6
+    if leads if leads is not None else sunday:
         body += _safe_leads_lines(now)
+    if callable(you):
+        body += you()
+    elif you if you is not None else sunday:
+        body += _safe_you_lines(now)
     return "\n".join(fit(body)), len(held), len(pushed)
 
 
@@ -815,6 +852,26 @@ def _sto_selftest(check):
     # the whole rollup with fixtures, and with the dashboard unreachable ----------------------
     payloads = {"/api/status": st, "/api/team": team, "/api/crew": crew}
     body = build(now, leads=False, api=lambda p: payloads[p])[0].splitlines()
+    check("build: a weekday has no YOU block", any(x.startswith("YOU") for x in body), False)
+    you = ["YOU     12.3 h hands-on; Pocket Tells 4.1", "        Full memo: http://x/#box/archive/reports/you_2026-W43.md"]
+    real_week = globals()["_safe_leads_lines"]
+    globals()["_safe_leads_lines"] = lambda n: ["WEEK    6 looked after · 3 fixed in place"]
+    try:
+        sb = build(now, leads=True, api=lambda p: payloads[p], you=lambda: you)[0].splitlines()
+    finally:
+        globals()["_safe_leads_lines"] = real_week
+    check("build: the YOU block sits under the WEEK line, last", sb[-3:], ["WEEK    6 looked after · 3 fixed in place"] + you)
+    import types
+    saved = sys.modules.get("you_week")
+    sys.modules["you_week"] = types.SimpleNamespace(rollup_lines=lambda n, dry=False: 1 / 0)
+    try:
+        check("YOU: a broken you_week.py costs one plain line, never the rollup", _safe_you_lines(now, dry=True),
+              [f"{YOU_FAIL} (bin/you_week.py: ZeroDivisionError); the back office files it in the morning"])
+    finally:
+        if saved is None:
+            sys.modules.pop("you_week", None)
+        else:
+            sys.modules["you_week"] = saved
     check("build: DECIDE is the line under the date; LEADS follows the facts",
           (body[1].startswith("DECIDE  3 wait on you"), body[2].startswith("BROKEN"),
            any(x.startswith("LEADS   1 needs you") for x in body)), (True, True, True))
@@ -882,7 +939,7 @@ def main():
         print(digest)
         if time.gmtime(now).tm_wday != 6:
             print("--- Sunday only (not in today's push):")
-            print("\n".join(_safe_leads_lines(now)))
+            print("\n".join(_safe_leads_lines(now) + _safe_you_lines(now, dry=True)))
         return
     subprocess.run([f"{MC}/bin/notify.sh", "--tier", "actionable", "maintenance",
                     "Daily rollup", digest], timeout=30)

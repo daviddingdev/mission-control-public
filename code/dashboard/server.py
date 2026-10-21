@@ -1941,6 +1941,15 @@ def reports():
                             "content": open(p, errors="replace").read()[-40000:]})
     except Exception:
         pass                                   # no page yet, or the desk is down: the MC reports still list
+    # "Your week" (2026-10-21, bin/you_week.py): the Sunday rollup's YOU block links here, so its full memo
+    # (state/you/<ISO week>.md, private, never in git) is listed as you_<ISO week>.md and opens at
+    # #box/archive/reports/you_<week>.md. The one markdown reader on the page; no new page or route.
+    yd = f"{HOME}/maintenance/state/you"
+    for f in (os.listdir(yd) if os.path.isdir(yd) else []):
+        if re.fullmatch(r"\d{4}-W\d{2}\.md", f):
+            p = os.path.join(yd, f)
+            out.append({"file": "you_" + f, "mtime": int(os.stat(p).st_mtime),
+                        "content": open(p, errors="replace").read()[-40000:]})
     return sorted(out, key=lambda r: -r["mtime"])
 
 
