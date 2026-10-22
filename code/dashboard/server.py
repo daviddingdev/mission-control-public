@@ -673,7 +673,9 @@ def schedule_week(jobs=None):
 # ---------- crons ----------
 
 CRON_RE = re.compile(r"^(@\w+|(?:\S+\s+){4}\S+)\s+(.*)$")
-LOG_RE = re.compile(r">>\s*(\S+)")
+# the path only: `2>>logs/x.log)` inside a `$(...)` and `>> "logs/x.log"` must not carry the `)` or
+# the quotes into it (decision:93bae6ab; backoffice.py had the same fix for decision:c138b9f9)
+LOG_RE = re.compile(r">>\s*[\"']?([^\s\"';)|&]+)")
 
 
 @functools.lru_cache(maxsize=65536)
@@ -4463,6 +4465,13 @@ def selftest():
     ok(not _david_node(_other, {"user": "guest@example.test"}, _own), "david_node: another tailnet user does not count")
     ok(not _david_node(_other, {"whois": "no answer"}, _own), "david_node: an unnamed peer does not count")
     ok(not _david_node(_other, {"user": "owner@example.test"}, ("", set())), "david_node: no owner known -> false")
+
+    # 0b. LOG_RE takes the path only (decision:93bae6ab): no `)` from a `$(...)`, no quotes
+    _lr = lambda c: (LOG_RE.search(c) or [None, None])[1]
+    ok(_lr('N=$(x 2>>logs/experiment_design.log) && y >> "logs/y_$N.log" 2>&1') == "logs/experiment_design.log",
+       "LOG_RE: `2>>log)` inside $(...) drops the paren")
+    ok(_lr('cd ~/a && x >> "logs/b.log" 2>&1') == "logs/b.log" and _lr("x >> ~/c.log 2>&1") == "~/c.log",
+       "LOG_RE: quoted and plain paths")
 
     # 1. next_run: the day->hour->minute search against the minute walk it replaced, on every
     #    live schedule and the edge cases, from clock points that cross a month end, a leap

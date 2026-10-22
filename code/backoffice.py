@@ -866,6 +866,10 @@ def census():
     c["diagrams"] = _diagram_state()
     c["handovers"] = _handover_state()
     c["experiments"] = _experiments_state()
+    try:                    # rule spawn-unwrapped, dry count (memo maintenance_lead-work-spawn-unwrapped-check 2/3)
+        c["spawn_outcome"] = _spawn_outcome(_jsonl_rows(os.path.join(STATE, "claude_sessions.jsonl")))
+    except Exception as e:
+        c["spawn_outcome"] = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
     try:
         r = subprocess.run([sys.executable, os.path.join(MC, "bin/models.py"), "check"],
                            capture_output=True, text=True, timeout=30)
@@ -1683,6 +1687,46 @@ def _cli_stale(rows, now_ts=None, days=14, patches=5):
         return None
     return {"headless": ".".join(map(str, head)), "interactive": ".".join(map(str, inter)),
             "behind": behind, "lag_d": lag_d, "why": " and ".join(why)}
+
+
+def _spawn_launcher(r):
+    """Who started a headless session, in one word: the lead, the queue job, the parent session, or
+    the project. The row fields come from claude-session-notify.sh."""
+    if r.get("lead"):
+        return f"lead {r['lead']}"
+    if r.get("job"):
+        return f"job {r['job']}"[:80]
+    if r.get("under"):
+        return "under a session"
+    return f"project {r.get('project') or '?'}"
+
+
+def _spawn_outcome(rows, now_ts=None, days=7):
+    """Rule spawn-unwrapped's core, pure, in DRY-COUNT mode (memo maintenance_lead-work-spawn-unwrapped-check
+    slice 2/3; design proposals/2026-10-16_red-team-the-pretooluse-spawn-guard.md). Counts headless
+    SessionStart rows of the last `days` by their `wrapped` field (the headless token's key was in the
+    CLI's environment): recorded = rows that carry the field at all; unwrapped = wrapped is False, by
+    launcher. Files nothing: slice 3 arms it (high) after 7 days of counts with no legitimate hit."""
+    now_ts = time.time() if now_ts is None else now_ts
+    out = {"days": days, "mode": "dry", "headless": 0, "recorded": 0, "unwrapped": 0, "by_launcher": {},
+           "first_recorded": None}
+    for r in rows or ():
+        t = r.get("time")
+        if r.get("event") != "SessionStart" or r.get("headless") is not True or not isinstance(t, (int, float)):
+            continue
+        if "wrapped" in r and r.get("wrapped") is not None:
+            out["first_recorded"] = min(out["first_recorded"] or t, t)
+        if t < now_ts - days * 86400:
+            continue
+        out["headless"] += 1
+        if r.get("wrapped") is None:
+            continue
+        out["recorded"] += 1
+        if r["wrapped"] is False:
+            out["unwrapped"] += 1
+            k = _spawn_launcher(r)
+            out["by_launcher"][k] = out["by_launcher"].get(k, 0) + 1
+    return out
 
 
 def _cli_stale_finding(f, rows, now_ts=None):
@@ -3415,6 +3459,8 @@ def audit(c=None):
         "Stocks/_engine/dashboard/advised_page.py": "pushes to another person's topic",
         "clientco-db/scripts/ntfy.py":      "project-local helper; reads the same ntfy.json",
         "maintenance/bin/backoffice.py":   "this rule quotes the pattern it looks for",
+        "maintenance/bin/hook-guard-untrusted.py": "its selftest fixture quotes a raw ntfy post "
+                                           "to prove the guard flags it; the hook never pushes",
         "Stocks/_engine/agent/journal/ops/_sandbox/sitecustomize.py":
             "the proof sandbox — it names ntfy.sh to BLOCK every push a proof run attempts",
         "Stocks/_engine/agent/journal/ops/2026-09-12_hunt_proof_sandbox.py":
@@ -3656,6 +3702,19 @@ def audit(c=None):
     _cw = sh([sys.executable, os.path.join(MC, "dashboard", "tt_crew.py"), "check"], timeout=90)
     try:
         for h in json.loads(_cw or "null") or []:
+            if h.get("kind") == "pending-landed":        # memo crew-pending-line: the owner's line landed
+                _finding(f, "crew-pending", "low", h["text"],
+                         "the agent's `pending_line` waited on its owner's cron install; a line it claims "
+                         "is in the crontab now, so the pass removes the key from config/crew.json and "
+                         "commits it by path.", project="maintenance", fix="auto", key="landed:" + h["id"])
+                continue
+            if h.get("kind") == "pending-stale":
+                _finding(f, "crew-pending", "low", h["text"],
+                         "the agent's `pending_line` in config/crew.json waits on another project's cron "
+                         "install. Ask that project's lead (its ops brief, or a memo) whether the line is "
+                         "still coming; mark the agent `on_demand` or remove it if not.",
+                         project="maintenance", fix="human", key="stale:" + h["id"])
+                continue
             _finding(f, "crew-unclaimed", "low", h["text"],
                      "config/crew.json is Mission Control's display layer over the scheduled jobs "
                      "(dashboard/tt_crew.py). Claim the job with a `cmd` substring on the agent whose "
@@ -4355,6 +4414,43 @@ def _new_card(pcfg, name):
     return card
 
 
+def _clear_pending_line(path, aid):
+    """Remove `"pending_line": …` from agent `aid` in config/crew.json as a TEXT edit (the file's hand
+    layout does not round-trip through json.dump), then prove the result parses and differs from the
+    original by exactly that key. -> True when written."""
+    try:
+        txt = open(path).read()
+        before = json.loads(txt)
+    except (OSError, ValueError):
+        return False
+    m = re.search(r'"id":\s*"' + re.escape(aid) + r'"', txt)
+    if not m:
+        return False
+    nxt = re.search(r'"id":\s*"', txt[m.end():])
+    end = m.end() + (nxt.start() if nxt else len(txt) - m.end())
+    pl = re.compile(r'\n[ \t]*"pending_line":\s*"[^"\n]*"(,?)[ \t]*(?=\n)')
+    hit = pl.search(txt, m.end(), end)
+    if not hit:
+        return False
+    new = txt[:hit.start()] + txt[hit.end():]
+    if not hit.group(1):                         # it was the last key: drop the comma before it
+        head = new[:hit.start()].rstrip()
+        if head.endswith(","):
+            new = head[:-1] + new[hit.start():]
+    try:
+        after = json.loads(new)
+    except ValueError:
+        return False
+    for a in before.get("agents", []):
+        if a.get("id") == aid:
+            a.pop("pending_line", None)
+    if after != before:
+        return False
+    with open(path, "w") as fh:
+        fh.write(new)
+    return True
+
+
 def fix(open_findings, dry=False):
     """Repair the drift Mission Control owns. Everything here edits this project's own
     files — never another project's (see the reach rule in CLAUDE.md)."""
@@ -4363,8 +4459,9 @@ def fix(open_findings, dry=False):
     pcfg = load(pcfg_path, {})
     reg_path = os.path.join(MC, "CRON_REGISTRY.md")
     names_path = os.path.join(CONFIG, "job_names.json")
+    crew_path = os.path.join(CONFIG, "crew.json")
     rel = {pcfg_path: "config/projects.json", reg_path: "CRON_REGISTRY.md",
-           names_path: "config/job_names.json"}
+           names_path: "config/job_names.json", crew_path: "config/crew.json"}
     # whatever another session already had open stays theirs to commit
     theirs = dirty_before(set(rel.values()))
 
@@ -4388,6 +4485,12 @@ def fix(open_findings, dry=False):
                 if not dry:
                     _append_registry_row(reg_path, job, script)
                 done.append((f, f"documented {script} in CRON_REGISTRY.md"))
+
+        elif f["kind"] == "crew-pending":
+            m = re.search(r"\(([a-z0-9][a-z0-9_-]*)\): its cron line landed", f["title"])
+            if m and "config/crew.json" not in theirs:
+                if dry or _clear_pending_line(crew_path, m.group(1)):
+                    done.append((f, f"cleared pending_line on {m.group(1)} in crew.json"))
 
         elif f["kind"] == "experiment-landed":
             if not dry and _adopt_experiment(f["title"]):
@@ -4450,7 +4553,7 @@ def fix(open_findings, dry=False):
         for f, _ in done:
             store[f["id"]] = f
         save(FINDINGS, store)
-        _commit([rel[p] for p in (pcfg_path, reg_path, names_path)],
+        _commit([rel[p] for p in (pcfg_path, reg_path, names_path, crew_path)],
                 "Back office: " + "; ".join(w for _, w in done)[:180], skip=theirs)
         if theirs:
             print("  left uncommitted (another session has them open): " + ", ".join(sorted(theirs)))
@@ -5401,6 +5504,31 @@ def selftest():
           [j["log"] for j in _pc] == [os.path.join(HOME, "maintenance/logs/experiment_design.log"),
                                       os.path.join(HOME, "maintenance/logs/a.log")], [j["log"] for j in _pc])
 
+    # crew pending_line (memo maintenance_lead-work-crew-pending-line): the janitor clears the key as a
+    # text edit once the owner's line lands, middle key or last, and touches nothing else
+    with tempfile.TemporaryDirectory() as _tb:
+        _cp = os.path.join(_tb, "crew.json")
+        _ct = ('{\n "_comment": "x",\n "agents": [\n  {\n   "id": "a-mid",\n   "does": "writes",\n'
+               '   "pending_line": "2026-10-22",\n   "cmd": [\n    "a.py"\n   ]\n  },\n  {\n   "id": "b-last",\n'
+               '   "cmd": ["b.py"], "queue": ["b q"],\n   "pending_line": "2026-10-22"\n  },\n'
+               '  {\n   "id": "c-none",\n   "cmd": ["c.py"]\n  }\n ]\n}\n')
+        with open(_cp, "w") as fh:
+            fh.write(_ct)
+        _r1 = _clear_pending_line(_cp, "a-mid")
+        _r2 = _clear_pending_line(_cp, "b-last")
+        _r3 = _clear_pending_line(_cp, "c-none")
+        _after = json.load(open(_cp))
+        _want = json.loads(_ct)
+        for _a in _want["agents"]:
+            _a.pop("pending_line", None)
+        check("crew pending_line: cleared as a text edit, middle key and last key, nothing else",
+              _r1 and _r2 and not _r3 and _after == _want and '"cmd": ["b.py"], "queue": ["b q"]' in open(_cp).read(),
+              (_r1, _r2, _r3, open(_cp).read()))
+        _t = "Sheet maker (sheet-maker): its cron line landed, so pending_line is cleared"
+        _m = re.search(r"\(([a-z0-9][a-z0-9_-]*)\): its cron line landed", _t)
+        check("crew pending_line: the fix reads the agent id from tt_crew's landed text",
+              bool(_m) and _m.group(1) == "sheet-maker")
+
     with tempfile.TemporaryDirectory() as _tb:
         _bf = os.path.join(_tb, "gpu_backfill.json")
         with open(_bf, "w") as fh:
@@ -6317,6 +6445,21 @@ def selftest():
     D, T0 = 86400, 2_000_000_000
     cs = lambda h, i, hf=None, inf=None: ([{"time": hf or T0 - D, "headless": True, "cli_version": h},
                                            {"time": inf or T0 - D, "headless": False, "cli_version": i}])
+    # spawn-unwrapped, dry count (memo spawn-unwrapped-check 2/3): headless starts only, last 7 days, rows
+    # without the field are not counted as unwrapped, and the launcher names the lead / job / parent
+    _so_rows = [{"time": T0 - 3600, "event": "SessionStart", "headless": True, "wrapped": True, "lead": "poker_lead"},
+                {"time": T0 - 3500, "event": "SessionStart", "headless": True, "wrapped": False, "under": "sid-x"},
+                {"time": T0 - 3400, "event": "SessionStart", "headless": True, "wrapped": False, "lead": "hbs_lead"},
+                {"time": T0 - 3300, "event": "SessionEnd", "headless": True, "wrapped": False, "lead": "hbs_lead"},
+                {"time": T0 - 3200, "event": "SessionStart", "headless": False, "wrapped": False},
+                {"time": T0 - 3100, "event": "SessionStart", "headless": True},
+                {"time": T0 - 9 * D, "event": "SessionStart", "headless": True, "wrapped": False, "job": "old"}]
+    _so = _spawn_outcome(_so_rows, T0)
+    check("spawn-unwrapped dry count: headless starts in 7 d, by launcher, no field is not unwrapped",
+          (_so["headless"], _so["recorded"], _so["unwrapped"], _so["by_launcher"], _so["first_recorded"], _so["mode"])
+          == (4, 3, 2, {"under a session": 1, "lead hbs_lead": 1}, T0 - 9 * D, "dry"), _so)
+    check("spawn-unwrapped dry count: nothing recorded yet is all zeros, never raises",
+          _spawn_outcome([{"time": "x"}, {}], T0)["unwrapped"] == 0 and _spawn_outcome(None, T0)["recorded"] == 0)
     r6 = _cli_stale(cs("2.1.280", "2.1.286"), T0)
     check("cli-stale: 6 patches behind fires and names both versions",
           bool(r6) and r6["headless"] == "2.1.280" and r6["interactive"] == "2.1.286" and r6["behind"] == 6, r6)
