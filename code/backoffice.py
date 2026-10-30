@@ -1856,6 +1856,53 @@ def _browser_signin_findings(f, state, sites_cfg, held=None):
                  project="maintenance", key=site)
 
 
+DILIGENCE_KEEP_SINCE = 1793176402     # a99a1fc (2026-10-28): browser.py read keeps a licensed read from here on
+
+
+def _diligence_keep_findings(f, rows, sites_cfg, since=DILIGENCE_KEEP_SINCE, now_ts=None, days=7):
+    """Rule diligence-unkept (memo stocks-diligence-saved-offline-boxwide slice 3/4; David 2026-10-28: "make it a global
+    rule any diligence research gets saved"): a good read of a licensed site (`attended_only` or `keep_reads` in
+    config/browser_sites.json) in state/browser_reads.jsonl, inside the last `days`, with no `kept` row for the same
+    caller, site and url after it. That read lives only in a session transcript. A signed-out page, a bot check, an
+    empty page, a capture or download (they write their own files) and the browser's own probes are not reads to keep.
+    Covers browser.py reads; a Claude-in-Chrome read is kept by bin/hook-keep-diligence.py, which logs nowhere here.
+    -> one med finding for the box, keyed `diligence-unkept`, naming the count and the newest."""
+    cfg = (sites_cfg or {}).get("sites") or {}
+    lic = {k for k, v in cfg.items() if isinstance(v, dict) and (v.get("attended_only") or v.get("keep_reads"))}
+    floor = max(since or 0, (now_ts or time.time()) - days * 86400)
+    open_, failed = {}, 0
+    for r in rows or []:
+        if not isinstance(r, dict) or r.get("site") not in lic:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(r.get("ts")).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            continue
+        k = (r.get("caller"), r.get("site"), r.get("url"))
+        if r.get("kept"):
+            open_.pop(k, None)
+            continue
+        if str(r.get("error") or "").startswith("keep failed"):
+            failed += 1
+            continue
+        if (ts < floor or r.get("error") or r.get("capture") or r.get("download") or r.get("logged_out")
+                or r.get("challenge") or not r.get("chars") or r.get("caller") in ("browser-check", None)
+                or int(r.get("status") or 0) >= 400):
+            continue
+        open_[k] = (ts, r)
+    if not open_:
+        return
+    newest = max(open_.values(), key=lambda x: x[0])[1]
+    sites = sorted({k[1] for k in open_})
+    _finding(f, "diligence-unkept", "med",
+             f"{len(open_)} licensed-site read(s) in 7 days with no kept file",
+             f"{', '.join(sites)}: read through browser.py with no copy in state/browser_library (newest "
+             f"{newest.get('ts')}, caller {newest.get('caller')}: {str(newest.get('url'))[:90]})"
+             + (f"; {failed} keep(s) failed outright" if failed else "")
+             + ". Diligence is saved offline as it is read (David 2026-10-28); see browser._keep_read and "
+             "state/browser_reads.jsonl.", project="maintenance", key="diligence-unkept")
+
+
 def _dash_check_finding(f, d, now_ts=None, days=7):
     """Rule dashboard-check-red (memo wa-attention-kpi-leftovers): serve.sh's post-restart
     check.py run (state/dash_check.json) came back red within `days`. Missing file -> quiet."""
@@ -2670,7 +2717,8 @@ QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe",
                "restore-unproven", "manifest-stale",
                "ledger-order", "weight-drift",  # rules 42-43 (2026-10-05): low, filed, never a push
                "fleet-stop-engaged", "backup-stray",  # rules 44-45: David engaged it / filed, never a push
-               "experiment-no-driver"}  # rule 46: the design memo reaches David as memos do today, no new push
+               "experiment-no-driver",  # rule 46: the design memo reaches David as memos do today, no new push
+               "diligence-unkept"}  # rule 37c (2026-10-30): filed, never a push of its own
 
 
 def _push_worthy(new):
@@ -4051,6 +4099,24 @@ def audit(c=None):
         _finding(f, "browser-signin", "low", "the browser-signin rule could not run",
                  f"{type(e).__name__}: {str(e)[:160]}. It reads state/browser.json and config/browser_sites.json.",
                  project="maintenance", key="browser-signin-unread")
+    # 37c. diligence-unkept (2026-10-30, memo stocks-diligence-saved-offline-boxwide slice 3/4): a licensed-site read
+    #      in browser_reads.jsonl with no kept file after it. Filed, never pushed (QUIET_KINDS).
+    try:
+        _rows = []
+        try:
+            with open(os.path.join(STATE, "browser_reads.jsonl")) as _fh:
+                for _ln in _fh:
+                    try:
+                        _rows.append(json.loads(_ln))
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        _diligence_keep_findings(f, _rows, load(os.path.join(CONFIG, "browser_sites.json"), {}))
+    except Exception as e:
+        _finding(f, "diligence-unkept", "low", "the diligence-unkept rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It reads state/browser_reads.jsonl and config/browser_sites.json.",
+                 project="maintenance", key="diligence-unkept-unread")
     _ok, _out = _selfcheck(["browser.py", "selftest", "--pure"], "PASS")
     if not _ok:
         _finding(f, "guardrail-inert", "med",
@@ -6771,6 +6837,32 @@ def selftest():
         check("browser-signin: a site whose sign-in a lead already parked (open needs-david row) files no second copy; "
               "an answered row holds nothing", _signin_held(_led) == {"vii": "data_desk_lead-needs-you-vii-signin"}
               and [x["key"] for x in fbr] == ["browser-signin:maintenance:wsj"], (_signin_held(_led), fbr))
+        # rule 37c diligence-unkept (memo stocks-diligence-saved-offline-boxwide slice 3/4)
+        _sc = {"sites": {"pitchbook": {"attended_only": True}, "wsj": {}, "hbr": {"keep_reads": True}}}
+        _T = 1793300000
+        _iso = lambda x: datetime.fromtimestamp(x, timezone.utc).isoformat()
+        _rd = lambda **k: dict({"ts": _iso(_T), "caller": "stocks", "site": "pitchbook", "url": "u1", "status": 200,
+                                "chars": 900, "logged_out": False, "challenge": False}, **k)
+        fdk = []
+        _diligence_keep_findings(fdk, [_rd(), {"ts": _iso(_T + 1), "caller": "stocks", "site": "pitchbook", "url": "u1",
+                                              "kept": "state/browser_library/x.md"}], _sc, now_ts=_T + 60)
+        check("diligence-unkept: a licensed read followed by its kept row is quiet", fdk == [], fdk)
+        fdk = []
+        _diligence_keep_findings(fdk, [_rd(), _rd(url="u2", site="hbr", ts=_iso(_T + 5)), _rd(site="wsj", url="u3"),
+                                       _rd(url="u4", logged_out=True), _rd(url="u5", challenge=True), _rd(url="u6", chars=0),
+                                       _rd(url="u7", caller="browser-check"), _rd(url="erp-a", capture=["md"]),
+                                       _rd(url="u9", status=403)], _sc, now_ts=_T + 60)
+        check("diligence-unkept: unkept licensed (attended_only + keep_reads) reads -> ONE med finding counting 2; "
+              "a non-licensed site, signed out, bot check, empty, probe, capture and 4xx do not count",
+              [(x["key"], x["sev"], x["title"].split()[0]) for x in fdk]
+              == [("diligence-unkept:maintenance:diligence-unkept", "med", "2")] and "hbr, pitchbook" in fdk[0]["detail"],
+              fdk)
+        fdk = []
+        _diligence_keep_findings(fdk, [_rd(ts=_iso(DILIGENCE_KEEP_SINCE - 60)), _rd(url="old", ts=_iso(_T - 8 * 86400))],
+                                 _sc, now_ts=_T)
+        check("diligence-unkept: reads before the keep shipped (a99a1fc) or older than 7 days are not counted",
+              fdk == [], fdk)
+        check("diligence-unkept: filed, never pushed (QUIET_KINDS)", "diligence-unkept" in QUIET_KINDS)
         fdc = []
         _dash_check_finding(fdc, {"ok": False, "at": "2026-10-05T08:29:47Z", "rc": 1,
                                   "summary": ["FAIL overview tab", "FAIL - a check :: detail"]}, N)
