@@ -327,6 +327,22 @@ ups_step(){ # <now> <boot>: read the UPS, push what changed, move the told state
 }
 # <<< UPS power
 
+# >>> dashboard hang restart (2026-11-01, memo dashboard-wedged-at-memoryhigh). :8900 sat wedged ~20 h
+# (10-31 → 11-01): the port was up, every request stalled in memory reclaim, and systemd's
+# Restart=always never fired because nothing exited. A hung server is not a dead one, so the probe
+# decides: two runs in a row (≈15-30 min) with chk 8900 failing while the unit is ACTIVE → restart it
+# through its supervisor (serve.sh restart = systemctl --user restart; a dead unit is systemd's own).
+# The count lives in state/dash_hang.count; every restart is a line in logs/healthcheck.log and in
+# dashboard/_server.log. dash_plan PREV FAILED(0|1) ACTIVE(0|1) -> "<action> <new count>".
+DASH_HANG_RUNS=2
+dash_plan(){
+  local prev=${1:-0} failed=$2 active=$3 n
+  [ "$failed" = 1 ] || { echo "ok 0"; return; }
+  n=$((prev + 1))
+  if [ "$n" -ge "$DASH_HANG_RUNS" ] && [ "$active" = 1 ]; then echo "restart 0"; else echo "wait $n"; fi
+}
+# <<< dashboard hang restart
+
 if [ "$MODE" = selftest ]; then
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
   DM_STATE=$T/deadman.json; HC_LEDGER=$T/notifications.jsonl; F=0
@@ -495,6 +511,11 @@ STUB
   ok "ups: ... and writes nothing" "$(cmp -s "$UPS_STATE" "$T/ups/before" && echo same)" same
   ok "the outage alarm's own checks are still read by the back office (chk lines)" \
     "$(grep -c '^chk [0-9]' "$0" | awk '{print ($1 >= 8)}')" 1
+  ok "dash: :8900 answers -> ok, count reset" "$(dash_plan 1 0 1)" "ok 0"
+  ok "dash: first failed probe -> wait 1 (one slow minute is not a hang)" "$(dash_plan 0 1 1)" "wait 1"
+  ok "dash: second failed probe in a row, unit active -> restart, count reset" "$(dash_plan 1 1 1)" "restart 0"
+  ok "dash: failing but the unit is not active -> systemd's, keep counting" "$(dash_plan 1 1 0)" "wait 2"
+  ok "dash: no count file yet -> treated as 0" "$(dash_plan '' 1 1)" "wait 1"
   [ $F -eq 0 ] && echo "ALL PASS" || echo "$F FAILED"
   exit $([ $F -eq 0 ] && echo 0 || echo 1)
 fi
@@ -583,6 +604,28 @@ if systemctl --user is-enabled --quiet maintenance-dashboard 2>/dev/null \
   FAIL+=("always-on-discovery-inert")
 fi
 # <<< always-on user units
+# dashboard hang restart (functions above the selftest): live runs only; --dry writes and restarts nothing
+if [ -z "${HEALTHCHECK_DRY:-}" ] && systemctl --user is-enabled --quiet maintenance-dashboard 2>/dev/null \
+   && ! python3 bin/paused.py port 8900 >/dev/null 2>&1; then
+  _df=0; printf '%s\n' "${FAIL[@]}" | grep -qx 'MissionControl(:8900)' && _df=1
+  _da=0; systemctl --user is-active --quiet maintenance-dashboard && _da=1
+  read -r _dact _dn <<<"$(dash_plan "$(cat state/dash_hang.count 2>/dev/null)" "$_df" "$_da")"
+  echo "$_dn" > state/dash_hang.count
+  # one RSS sample per run, for the leak's growth rate (state/dash_mem.jsonl, last 3000 rows ~ 31 days)
+  _dpid=$(systemctl --user show maintenance-dashboard -p MainPID --value 2>/dev/null)
+  if [ -n "$_dpid" ] && [ "$_dpid" != 0 ]; then
+    _drk=$(awk '/VmRSS/{print $2}' /proc/"$_dpid"/status 2>/dev/null); _dsk=$(awk '/VmSwap/{print $2}' /proc/"$_dpid"/status 2>/dev/null)
+    echo "{\"t\":$(date +%s),\"pid\":$_dpid,\"rss_kb\":${_drk:-null},\"swap_kb\":${_dsk:-null},\"failed\":$_df}" >> state/dash_mem.jsonl
+    [ "$(wc -l < state/dash_mem.jsonl)" -gt 3000 ] && tail -n 3000 state/dash_mem.jsonl > state/dash_mem.jsonl.tmp \
+      && mv -f state/dash_mem.jsonl.tmp state/dash_mem.jsonl
+  fi
+  if [ "$_dact" = restart ]; then
+    _drss=$(awk '/VmRSS/{print $2" kB"}' /proc/"$(systemctl --user show maintenance-dashboard -p MainPID --value)"/status 2>/dev/null)
+    echo "$(date -Is) dashboard hang: :8900 failed ${DASH_HANG_RUNS} probes in a row while active (rss ${_drss:-?}); restarting through systemd" \
+      | tee -a dashboard/_server.log
+    MC_CHECK_TRIGGER="healthcheck hang restart" dashboard/serve.sh restart || echo "$(date -Is) dashboard hang: restart FAILED"
+  fi
+fi
 
 # Headless-Claude auth canary — coded, zero tokens (memo 2026-08-28 from hbs: OAuth refresh
 # died ~08-27 and every `claude -p` job failed silently for a day). The CLI refreshes the

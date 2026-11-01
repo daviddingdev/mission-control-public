@@ -4147,6 +4147,10 @@ def audit(c=None):
 
     # 42. ledger-order (2026-10-05, memo review-ledger-hygiene slice 2): a LEDGER.md row dated newer than
     #     the row above it (the ledger is newest-first; every writer prepends through bin/ledger_rows.py).
+    #     Since 2026-11-01 (memo repeat-ledger-order-maintenance-ledger) the order is restored first: a
+    #     lead hand-inserting a row beside its parent re-opened this 3 times in 30 days, and the fix is
+    #     mechanical. The rule still files whatever the repair could not put back.
+    #     (the repair is ledger_order_repair(), run by _run_pass before audit() when not dry)
     _ledger_order_finding(f, os.path.join(MEMOS, "LEDGER.md"))
 
     # 45. backup-stray (2026-10-05, memo wa-backups-integrity slice 4/4): an undeclared file or folder at the
@@ -5449,7 +5453,24 @@ def run(dry=False):
     return 0
 
 
+def ledger_order_repair(path=None):
+    """Put ~/memos/LEDGER.md back in newest-first order before rule 42 reads it (memo
+    repeat-ledger-order-maintenance-ledger, 2026-11-01). -> printed lines."""
+    import ledger_rows
+    out = []
+    try:
+        for i, d, prev, memo in ledger_rows.reorder(path or os.path.join(MEMOS, "LEDGER.md")):
+            out.append(f"ledger-order: put {d} {memo} back in date order (was line {i}, under a {prev} row)")
+    except Exception as e:
+        out.append(f"ledger-order: repair skipped ({type(e).__name__}: {str(e)[:120]})")
+    for ln in out:
+        print(f"  {ln}")
+    return out
+
+
 def _run_pass(dry=False):
+    if not dry:
+        ledger_order_repair()
     c = census()
     fresh = audit(c)
     # rule 43 (memo wa-cost-attribution slice 3/4): true the weights up once a day, file weight-drift
@@ -7042,6 +7063,13 @@ def selftest():
               len(flo) == 1 and flo[0]["sev"] == "low" and flo[0]["kind"] in QUIET_KINDS
               and flo[0]["key"] == "ledger-order:maintenance:ledger" and "2 row(s)" in flo[0]["detail"]
               and "line 7 (2026-10-05 c, under a 2026-10-01 row)" in flo[0]["detail"], flo)
+        rep = ledger_order_repair(lg)
+        flo2 = []
+        _ledger_order_finding(flo2, lg)
+        check("ledger-order repair: the janitor puts the rows back and the rule is then quiet",
+              len(rep) == 2 and "2026-10-05 c" in rep[0] and flo2 == []
+              and [ln.split("|")[2].strip() for ln in open(lg).read().splitlines()[4:]] == ["c", "b", "e", "d", "a"],
+              (rep, flo2))
         _mm = MEMOS
         try:
             MEMOS = f"{t7}/memos"
