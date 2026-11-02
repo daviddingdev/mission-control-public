@@ -95,6 +95,12 @@ def _secret_values():
                     v = line.strip()
                     if len(v) >= 6:
                         out.append((f"credential from ~/.secrets/{fn}", v))
+                        # a Google app password is stored joined but shown (and pasted) as 4 groups of 4:
+                        # both forms are the credential (bin/keys.py, 2026-11-01)
+                        alt = v.replace(" ", "") if " " in v else (
+                            " ".join(v[i:i + 4] for i in range(0, 16, 4)) if len(v) == 16 and v.isalpha() and v.islower() else "")
+                        if len(alt) >= 6:
+                            out.append((f"credential from ~/.secrets/{fn}", alt))
         except OSError:
             continue
     return out

@@ -1010,7 +1010,7 @@ ARMED_CHECKS = (
     {"id": "claudeq", "control": "claudeq box slot", "layer": "preventive",
      "standard": "§2a.3", "check": "`claudeq.py audit` (C26): every Claude spawn point goes through the slot · "
                                  "`claudeq.py selftest` (the clock, the fit rule, the cron reader and its "
-                                 "weekday guards, starvation)",
+                                 "weekday guards, starvation, the weekly guard: on, and fed a 7-day sample)",
      "requires": ("bin/claudeq.py",),
      "titles": ("a Claude spawn point goes around the box slot",
                 "claudeq selftest fails — the box slot's clock or fit rule no longer does what was agreed")},
@@ -1854,6 +1854,93 @@ def _browser_signin_findings(f, state, sites_cfg, held=None):
                  "https://<host>.<tailnet>.ts.net:8912 (the browser's desktop). If the site is no longer "
                  "wanted, drop it from config/browser_sites.json and the check stops.",
                  project="maintenance", key=site)
+
+
+UPLOADS_DIR = os.path.join(HOME, ".claude", "uploads")
+_UPLOAD_WALK_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", "worktrees"}
+
+
+def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_h=24):
+    """Rule upload-unfiled (memo hbs-file-every-chat-upload, 2026-11-01; David: "any uploaded file into a chat ...
+    should be saved in relevant folders in spark"). A desktop-app upload lands in ~/.claude/uploads/local_<chat>/ and
+    is the only copy until a session files it (a COPY, never a move: the app owns that folder). An upload older than
+    `age_h` with no sha256-identical file under any project folder in `homes` (each project's tree, plus folders kept
+    apart under an NDA, browser.KEEP_NEVER) is unfiled. Size first, so only same-size files are ever hashed; the
+    uploads are never read for anything but their hash, and never listed by content. -> one med finding for the box,
+    keyed `upload-unfiled`, naming the count, the chats and up to 5 file names. Accepted ones are muted by key."""
+    import hashlib
+    now_ts = now_ts or time.time()
+
+    def sha(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for b in iter(lambda: fh.read(1 << 20), b""):
+                h.update(b)
+        return h.hexdigest()
+
+    ups = []                                                   # (chat, path, size)
+    try:
+        chats = sorted(os.listdir(uploads))
+    except OSError:
+        return
+    for chat in chats:
+        d = os.path.join(uploads, chat)
+        if not os.path.isdir(d):
+            continue
+        for r, _ds, fs in os.walk(d):
+            for n in fs:
+                q = os.path.join(r, n)
+                try:
+                    st = os.stat(q)
+                except OSError:
+                    continue
+                if st.st_size and now_ts - st.st_mtime >= age_h * 3600:
+                    ups.append((chat, q, st.st_size))
+    if not ups:
+        return
+    sizes = {u[2] for u in ups}
+    cands = {}                                                 # size -> [path]
+    for h in homes:
+        for r, ds, fs in os.walk(h):
+            ds[:] = [x for x in ds if x not in _UPLOAD_WALK_SKIP]
+            for n in fs:
+                q = os.path.join(r, n)
+                try:
+                    sz = os.stat(q).st_size
+                except OSError:
+                    continue
+                if sz in sizes:
+                    cands.setdefault(sz, []).append(q)
+    seen, unfiled = {}, []
+    for chat, q, sz in ups:
+        try:
+            hu = sha(q)
+        except OSError:
+            continue
+        hit = False
+        for c in cands.get(sz, ()):
+            if c not in seen:
+                try:
+                    seen[c] = sha(c)
+                except OSError:
+                    seen[c] = None
+            if seen[c] == hu:
+                hit = True
+                break
+        if not hit:
+            unfiled.append((chat, q))
+    if not unfiled:
+        return
+    chats_ = sorted({c for c, _ in unfiled})
+    names = ", ".join(os.path.basename(q) for _, q in unfiled[:5]) + (" …" if len(unfiled) > 5 else "")
+    _finding(f, "upload-unfiled", "med",
+             f"{len(unfiled)} chat upload(s) older than {age_h} h not filed into any project",
+             f"{len(unfiled)} file(s) in ~/.claude/uploads from {len(chats_)} chat(s) ({', '.join(c[:14] for c in chats_[:6])}) "
+             f"have no sha256-identical copy in any project folder: {names}. Copy each (never move: the app owns the "
+             "folder) into its owning project's declared data root under a dated name and declare it in that "
+             "project's catalog.json; an NDA'd file goes only to its own folder. Find the chat's folder by grepping "
+             "~/.claude/projects/*/*.jsonl for `uploads/<chat>` (a hint, not the owner). A file not worth keeping: "
+             "mute this key with the reason.", project="maintenance", key="upload-unfiled")
 
 
 DILIGENCE_KEEP_SINCE = 1793176402     # a99a1fc (2026-10-28): browser.py read keeps a licensed read from here on
@@ -2718,7 +2805,8 @@ QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe",
                "ledger-order", "weight-drift",  # rules 42-43 (2026-10-05): low, filed, never a push
                "fleet-stop-engaged", "backup-stray",  # rules 44-45: David engaged it / filed, never a push
                "experiment-no-driver",  # rule 46: the design memo reaches David as memos do today, no new push
-               "diligence-unkept"}  # rule 37c (2026-10-30): filed, never a push of its own
+               "diligence-unkept",  # rule 37c (2026-10-30): filed, never a push of its own
+               "upload-unfiled"}  # rule 37d (2026-11-02): filed, never a push of its own
 
 
 def _push_worthy(new):
@@ -3057,62 +3145,13 @@ def audit(c=None):
                      "(PROJECT_STANDARDS §2); move it to the quiet window, or mute if "
                      "David pinned it here", job.get("project", ""))
 
-    # 14b. the USAGE-WINDOW band (Stocks CLAUDE.md, David 2026-08-31; memo usage-window-cron-moves
-    #      2026-09-01): the 14:05 UTC trade session shares a rolling 5-hour usage limit with
-    #      everything that started after 09:05, and it died on that limit on 08-31 behind the
-    #      morning cluster. So no Claude-weighted cron may START in 09:05-14:04 Mon-Fri. The one
-    #      authorized exception (the Monday 10:45 board) is muted by id, which is the record.
-    def _mins_of(sched):
-        parts = sched.split()
-        if len(parts) != 5:
-            return set()
-        mins = set()
-        for piece in parts[0].split(","):
-            piece = piece.split("/")[0]
-            if piece == "*":
-                return set(range(60))
-            if "-" in piece:
-                a, b = piece.split("-")
-                mins |= set(range(int(a), int(b) + 1))
-            elif piece.isdigit():
-                mins.add(int(piece))
-        return mins
-
-    def _weekday_possible(sched):
-        parts = sched.split()
-        if len(parts) != 5:
-            return False
-        dow = parts[4]
-        if dow == "*":
-            return True                       # incl. day-of-month jobs — the 1st lands on weekdays too
-        days = set()
-        for piece in dow.split(","):
-            piece = piece.split("/")[0]
-            if "-" in piece:
-                a, b = piece.split("-")
-                days |= set(range(int(a), int(b) + 1))
-            elif piece.isdigit():
-                days.add(int(piece))
-        return bool(days & {1, 2, 3, 4, 5})
-
-    BAND_LO, BAND_HI = 9 * 60 + 5, 14 * 60 + 5          # [09:05, 14:05) — 14:05 IS the trade session
-    for job in c["crons"]:
-        if ("triggers.py" in job["cmd"] or "loop.py trade" in job["cmd"]
-                or _declared_zero(job["cmd"])):
-            continue
-        is_claude = "claude -p" in job["cmd"] or "claude-headless" in job["cmd"] or any(
-            _spawns_claude(_script_path(job, s)) for s in job["scripts"]
-            if s.endswith(".py") and _script_path(job, s))
-        if not is_claude or not _weekday_possible(job["sched"]):
-            continue
-        starts = {h * 60 + m for h in _hours_of(job["sched"]) for m in _mins_of(job["sched"])}
-        if any(BAND_LO <= t < BAND_HI for t in starts):
-            _finding(f, "usage-window", "med",
-                     f"Claude cron in the usage-window band: {job['sched']} {job['scripts'][0] if job.get('scripts') else ''}".strip(),
-                     f"{job['cmd'][:110]} — 09:05-14:05 UTC Mon-Fri is the 5h window the 14:05 "
-                     "BrokerB PM session draws on (it died on the shared limit 2026-08-31); "
-                     "start it before 09:00 or after 15:00, or mute here if David authorized it",
-                     job.get("project", ""))
+    # 14b. the USAGE-WINDOW band (09:05-14:05 UTC Mon-Fri, the 14:05 trade session's 5-hour lookback;
+    #      David 2026-08-31) is RETIRED 2026-11-01 with the window itself (David: "my 5 hour window is
+    #      now removed so we just have weekly limits"). Non-urgent Claude work now belongs in the
+    #      04:00-12:00Z overnight batch; schedule-check.py warns, at creation, on a non-pinned weekday
+    #      Claude start in peak 13:00-19:00Z, and claudeq's weekly guard holds non-urgent grants near
+    #      the 7-day limit. The window doctrine lives there now; this pass no longer files
+    #      `usage-window`.
 
     # A user-scope MCP server rides into every session on the box, and every session
     # re-pays it on every step (the 2026-08-19 BrokerB lesson: ~8M tokens/session of
@@ -3242,7 +3281,8 @@ def audit(c=None):
         _finding(f, "guardrail-inert", "high",
                  "claudeq selftest fails — the box slot's clock or fit rule no longer does what was agreed",
                  "run `python3 ~/maintenance/bin/claudeq.py selftest`; each FAIL line names the case (the "
-                 "evening block, the trade-session band, a reservation read from the crontab, the 5h budget). "
+                 "evening block, a reservation read from the crontab, the weekly guard — and its live armed "
+                 "checks: on in the loaded config, and state/window.jsonl still carrying a 7-day sample). "
                  "Until it passes, the queue can start a Claude session where it must not, or never start "
                  "one. Its output: " + _out)
     _ok, _out = _selfcheck(["models.py", "check"])
@@ -4117,6 +4157,22 @@ def audit(c=None):
         _finding(f, "diligence-unkept", "low", "the diligence-unkept rule could not run",
                  f"{type(e).__name__}: {str(e)[:160]}. It reads state/browser_reads.jsonl and config/browser_sites.json.",
                  project="maintenance", key="diligence-unkept-unread")
+    # 37d. upload-unfiled (2026-11-02, memo hbs-file-every-chat-upload): a chat upload with no filed copy after 24 h.
+    try:
+        _cat = load(os.path.join(STATE, "catalog.json"), {})
+        _homes = sorted({os.path.join(HOME, v.get("dir")) for v in ((_cat.get("projects") or {}).values())
+                         if isinstance(v, dict) and v.get("dir")})
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import browser as _browser
+            _homes += [os.path.join(HOME, x) for x in sorted(getattr(_browser, "KEEP_NEVER", ()) or ())]
+        except Exception:
+            _homes += [os.path.join(HOME, "bidart")]
+        _upload_unfiled_findings(f, homes=[h for h in _homes if os.path.isdir(h)])
+    except Exception as e:
+        _finding(f, "upload-unfiled", "low", "the upload-unfiled rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It reads ~/.claude/uploads and every project folder.",
+                 project="maintenance", key="upload-unfiled-unread")
     _ok, _out = _selfcheck(["browser.py", "selftest", "--pure"], "PASS")
     if not _ok:
         _finding(f, "guardrail-inert", "med",
@@ -4797,7 +4853,7 @@ def experiment_driver(dry=False, now_ts=None, mc=None, state_dir=None, spawn=Non
         skips = states.count("skipped")
         if skips >= EXP_DRIVE_SKIPS_MAX:
             _finding(f, "experiment-no-driver", "low", f"'{name}' design job refused by the Claude queue {skips} times",
-                     "claudeq.py run SKIPPED it every pass (5h budget or the clock); the driver keeps trying daily",
+                     "claudeq.py run SKIPPED it every pass (the weekly guard, or the clock); the driver keeps trying daily",
                      "maintenance", key=f"exp-skips:{slug}")
         if budget <= 0:
             lines.append(f"experiment driver: '{name}' waits ({age:.0f}d old; "
@@ -6884,6 +6940,30 @@ def selftest():
         check("diligence-unkept: reads before the keep shipped (a99a1fc) or older than 7 days are not counted",
               fdk == [], fdk)
         check("diligence-unkept: filed, never pushed (QUIET_KINDS)", "diligence-unkept" in QUIET_KINDS)
+        # rule 37d upload-unfiled (memo hbs-file-every-chat-upload)
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as _td:
+            _up, _pa, _pb = (os.path.join(_td, x) for x in ("uploads/local_c1", "projA/docs", "projB"))
+            for _d in (_up, _pa, _pb):
+                os.makedirs(_d)
+            _w = lambda pth, b, age: (open(pth, "wb").write(b), os.utime(pth, (_T - age, _T - age)))
+            _w(os.path.join(_up, "filed.pdf"), b"same bytes", 30 * 3600)
+            _w(os.path.join(_pa, "2026-11-01_filed.pdf"), b"same bytes", 3600)          # filed under a new name
+            _w(os.path.join(_up, "lost.pdf"), b"not filed!", 30 * 3600)
+            _w(os.path.join(_pb, "decoy.pdf"), b"other byte", 3600)                     # same size, other bytes
+            _w(os.path.join(_up, "fresh.pdf"), b"just now", 3600)                       # under 24 h: not yet due
+            fup = []
+            _upload_unfiled_findings(fup, uploads=os.path.join(_td, "uploads"), homes=[os.path.join(_td, "projA"),
+                                     _pb], now_ts=_T)
+            check("upload-unfiled: an upload filed under a new name is quiet; a same-size decoy is not a copy; "
+                  "one under 24 h waits -> ONE med finding naming lost.pdf only",
+                  [(x["key"], x["sev"], x["title"].split()[0]) for x in fup]
+                  == [("upload-unfiled:maintenance:upload-unfiled", "med", "1")] and "lost.pdf" in fup[0]["detail"]
+                  and "filed.pdf" not in fup[0]["detail"].replace("lost.pdf", ""), fup)
+            fup = []
+            _upload_unfiled_findings(fup, uploads=os.path.join(_td, "nope"), homes=[], now_ts=_T)
+            check("upload-unfiled: no uploads folder is quiet", fup == [], fup)
+        check("upload-unfiled: filed, never pushed (QUIET_KINDS)", "upload-unfiled" in QUIET_KINDS)
         fdc = []
         _dash_check_finding(fdc, {"ok": False, "at": "2026-10-05T08:29:47Z", "rc": 1,
                                   "summary": ["FAIL overview tab", "FAIL - a check :: detail"]}, N)
@@ -7213,7 +7293,7 @@ def selftest():
               "(a finding instead)", "stale-poker-corpus" not in spawned[-1][1]
               and any(x["kind"] == "experiment-no-driver" and "Stale poker corpus" in x["title"] for x in _f), _f)
         with open(spawned[1][1], "a") as _fh:
-            _fh.write("claudeq run: SKIPPED frontier design: second-stale-item — 5h budget\n")
+            _fh.write("claudeq run: SKIPPED frontier design: second-stale-item — weekly guard: 7-day usage 90% >= 85%\n")
         n = len(spawned)
         _l, _f = ED(ts=T + 3 * 86400)
         check("experiment-no-driver: a run the queue SKIPPED never started; it is retried, inside the cap",
@@ -7239,7 +7319,7 @@ def selftest():
               and os.path.exists(f"{_ex}/state/experiment_design/stale-poker-corpus.md"), (_s0, _s1, _att))
         _s2, _ = EN(ts=T + 86400)
         with open(f"{_ex}/logs/experiment_design_second-stale-item.log", "a") as _fh:
-            _fh.write("claudeq run: SKIPPED frontier design: second-stale-item — 5h budget\n")
+            _fh.write("claudeq run: SKIPPED frontier design: second-stale-item — weekly guard: 7-day usage 90% >= 85%\n")
         _s3, _ = EN(ts=T + 2 * 86400)
         check("experiment-next: a pid-less try is never repeated; one the queue SKIPPED is picked again",
               _s2 == "second-stale-item" and _s3 == "second-stale-item", (_s2, _s3))

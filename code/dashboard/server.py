@@ -4126,6 +4126,10 @@ class H(BaseHTTPRequestHandler):
         elif path.split("?")[0] == "/api/ask":
             code, r = ask_get(path)
             self._json(r, code=code)
+        elif path.split("?")[0] == "/api/keys":
+            # Box › Keys (2026-11-01): what the box asks David for and what it holds — names, dates and
+            # how to get each, NEVER a value or a length (bin/keys.py listing())
+            self._json({"keys": _bin_mod("keys").listing(), "asof": int(time.time())})
         elif path.startswith("/api/memos"):
             self._json(memos())
         elif path.startswith("/api/catalog/origin"):
@@ -4324,6 +4328,22 @@ class H(BaseHTTPRequestHandler):
 
     def _post(self):
         path = self.path.split("?")[0]
+        if path == "/api/keys":
+            # David hands the box a key (2026-11-01, "we need a way i can give you passwords/access"):
+            # {name, value} or {name, fields}. bin/keys.py validates and writes ~/.secrets/<file> 0600;
+            # the reply carries a message and the key's check line, never the value. A refusal is a 400.
+            d = self._body()
+            K = _bin_mod("keys")
+            try:
+                d = d if isinstance(d, dict) else {}
+                r = K.put(str(d.get("name") or ""), value=d.get("value"),
+                          fields=d.get("fields") if isinstance(d.get("fields"), dict) else None, via=self._via(),
+                          new=bool(d.get("new")))
+                code = 200
+            except K.KeyError_ as x:
+                r, code = {"ok": False, "msg": str(x)}, 400
+            self._json(r, code=code)
+            return
         if path == "/api/ask":
             code, r = ask_post(self._body())
             if r.get("ok"):
