@@ -1010,7 +1010,9 @@ ARMED_CHECKS = (
     {"id": "claudeq", "control": "claudeq box slot", "layer": "preventive",
      "standard": "§2a.3", "check": "`claudeq.py audit` (C26): every Claude spawn point goes through the slot · "
                                  "`claudeq.py selftest` (the clock, the fit rule, the cron reader and its "
-                                 "weekday guards, starvation, the weekly guard: on, and fed a 7-day sample)",
+                                 "weekday guards, starvation, the weekly guard: on, and fed a 7-day sample, held at every grant: "
+                                 "`fits()`, `take()`, `wait_and_take()`, `slot()`; a click filed "
+                                 "`ignore_windows` never held)",
      "requires": ("bin/claudeq.py",),
      "titles": ("a Claude spawn point goes around the box slot",
                 "claudeq selftest fails — the box slot's clock or fit rule no longer does what was agreed")},
@@ -1024,6 +1026,11 @@ ARMED_CHECKS = (
      "standard": "§6", "check": "listed under hooks.SessionStart · executable",
      "requires": ("bin/hook-memo-inbox.py",),
      "titles": ("the memo-inbox SessionStart hook is not armed",)},
+    {"id": "upload-filing", "control": "UserPromptSubmit upload-filing hook", "layer": "preventive",
+     "standard": "§7", "check": "once listed under hooks.UserPromptSubmit: executable · "
+                                 "`hook-upload-file.py selftest` (the filing line; rule upload-unfiled is the backstop)",
+     "requires": ("bin/hook-upload-file.py",),
+     "titles": ("the upload-filing hook is wired but not armed",)},
     {"id": "schedule-check", "control": "PreToolUse schedule-check hook", "layer": "preventive",
      "standard": "§2a", "check": "listed under hooks.PreToolUse · executable · `schedule-check.py selftest` "
                                  "(the job classifier) · `schedule-check.py --audit` runs",
@@ -3423,6 +3430,31 @@ def audit(c=None):
                      "bin/hook-memo-inbox.py must be listed under hooks.SessionStart in "
                      "~/.claude/settings.json and be executable; without it sessions only see "
                      "their memos if they happen to read the sentence in CLAUDE.md")
+    except Exception:
+        pass
+
+    # The upload-filing hook (2026-11-03, memo hbs-file-every-chat-upload): a file David uploads
+    # into a chat is filed by the chat that has the context. Wiring it is a settings.json change
+    # (the fence, David's), so this checks only once it is listed: listed and broken is the
+    # guardrail-inert case. Not listed yet = the parked question, not a finding; rule 37d
+    # `upload-unfiled` stays the backstop either way.
+    try:
+        _st = load(os.path.expanduser("~/.claude/settings.json"), {}) or {}
+        _ups = [h.get("command", "") for grp in (_st.get("hooks", {}).get("UserPromptSubmit") or [])
+                for h in grp.get("hooks", [])]
+        _hook = os.path.join(MC, "bin", "hook-upload-file.py")
+        if any("hook-upload-file" in c for c in _ups):
+            _ok = os.access(_hook, os.X_OK)
+            if _ok:
+                _r = subprocess.run([sys.executable, "-B", _hook, "selftest"], capture_output=True,
+                                    text=True, timeout=30)
+                _ok = _r.returncode == 0
+            if not _ok:
+                _finding(f, "guardrail-inert", "med",
+                         "the upload-filing hook is wired but not armed",
+                         "bin/hook-upload-file.py is listed under hooks.UserPromptSubmit but is not "
+                         "executable or its selftest fails, so a chat upload gets no filing line; "
+                         "run `python3 bin/hook-upload-file.py selftest`")
     except Exception:
         pass
 
