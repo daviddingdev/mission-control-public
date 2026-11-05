@@ -1610,15 +1610,24 @@ def _you_week_missing(path=None, you_dir=None, now=None):
     if not last:
         return None
     lines = str(last.get("message") or "").splitlines()
-    if not any(x.startswith("YOU     ") for x in lines):
-        return last, "the Sunday rollup carried no YOU block"
-    bad = next((x for x in lines if x.startswith("YOU     could not build")), None)
-    if bad:
-        return last, bad[8:].strip()
     d = _dt.datetime.fromtimestamp(last["time"], ZoneInfo("America/New_York")).date()
     mon = d - _dt.timedelta(days=d.weekday())
     y, w, _ = mon.isocalendar()
-    if not os.path.exists(os.path.join(you_dir or os.path.join(STATE, "you"), f"{y}-W{w:02d}.md")):
+    memo = os.path.join(you_dir or os.path.join(STATE, "you"), f"{y}-W{w:02d}.md")
+    # A week REBUILT after its rollup (the fix's `you_week.py week`, which writes the memo the rollup
+    # links to) answers a broken block: the next Sunday is the first that can carry it again. Without
+    # this the finding stayed open from the fix to the next Sunday and the auto-fix policy read it as a
+    # recurrence within 14 days (root-cause memo you-week, 2026-11-05: fixed cb46a0d + W44 rebuilt 11-03).
+    try:
+        rebuilt = os.path.getmtime(memo) > float(last["time"]) + 60
+    except OSError:
+        rebuilt = False
+    if not any(x.startswith("YOU     ") for x in lines):
+        return None if rebuilt else (last, "the Sunday rollup carried no YOU block")
+    bad = next((x for x in lines if x.startswith("YOU     could not build")), None)
+    if bad:
+        return None if rebuilt else (last, bad[8:].strip())
+    if not os.path.exists(memo):
         return last, f"its memo state/you/{y}-W{w:02d}.md was not written, so the link opens nothing"
     return None
 
@@ -5990,6 +5999,15 @@ def selftest():
         got = _you_week_missing(nl, yd, now=sun + 8 * 86400)
         check("you-week: the could-not-build line is filed with its reason",
               bool(got) and got[1].startswith("could not build your week (ValueError"), got)
+        # 2026-11-05 (root-cause memo you-week): the week rebuilt AFTER its rollup answers it; a memo
+        # written before the rollup does not
+        open(f"{yd}/2026-W44.md", "w").write("# Your week\n")
+        os.utime(f"{yd}/2026-W44.md", (sun + 7 * 86400 - 3600,) * 2)
+        check("you-week: a memo older than the broken rollup does not answer it",
+              bool(_you_week_missing(nl, yd, now=sun + 8 * 86400)))
+        os.utime(f"{yd}/2026-W44.md", (sun + 9 * 86400,) * 2)
+        check("you-week: the week rebuilt after the broken rollup closes it until the next Sunday",
+              _you_week_missing(nl, yd, now=sun + 10 * 86400) is None)
         with open(nl, "a") as fh:
             fh.write(json.dumps(yrow(sun + 14 * 86400, "Sun Nov 8\nWEEK    x")) + "\n")
         got = _you_week_missing(nl, yd, now=sun + 15 * 86400)
