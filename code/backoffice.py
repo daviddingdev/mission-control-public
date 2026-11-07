@@ -1132,6 +1132,13 @@ ARMED_CHECKS = (
      "requires": ("bin/healthcheck.sh",),
      "titles": ("the dead-box alarm's selftest fails — a dead box might never page",
                 "the dead-box alarm is not armed — {}")},
+    {"id": "drive-feed", "control": "the Spark's Drive pages: never-list scan + render/verdict gate before anything reaches Drive",
+     "layer": "preventive", "standard": "—",
+     "check": "`drive_feed.py selftest` (fixtures, fake Google) · `drive_feed.armed_why()`: the nightly render ran "
+              "within 36 h with its scan, and once connected the push ran and ended clean",
+     "requires": ("bin/drive_feed.py",),
+     "titles": ("the Drive feed's selftest fails — a page could reach Drive unscanned",
+                "the Drive feed is not armed — {}")},
     {"id": "sentinel", "control": "sentinel page recheck", "layer": "detective",
      "standard": "—", "check": "`sentinel.py selftest`", "requires": ("bin/sentinel.py",),
      "titles": ("sentinel selftest fails — it can page on a job that already recovered",)},
@@ -4097,6 +4104,29 @@ def audit(c=None):
                  "last arm is 55+ min old and fails its own run (dead-box-alarm-unarmed) at 75. Check "
                  "~/maintenance/logs/healthcheck.log and `bash ~/maintenance/bin/healthcheck.sh --dry`.",
                  project="maintenance", key="deadman-unarmed")
+
+    # 31b. the Spark's Drive pages (2026-11-07, memo maintenance-spark-drive-feed slice 4/5): the never-list scan
+    #      and the render/verdict gate are what stand between the box and David's Drive. The selftest proves
+    #      them on fixtures and a fake Google; `armed_why()` proves the nightly render ran with its scan and,
+    #      once Drive is connected, that the push ran and ended clean.
+    _df = sh([sys.executable, "-B", os.path.join(MC, "bin", "drive_feed.py"), "selftest"], timeout=60) or ""
+    if not re.search(r"^ALL PASS$", _df, re.M):
+        _finding(f, "guardrail-inert", "high", "the Drive feed's selftest fails — a page could reach Drive unscanned",
+                 "run `python3 ~/maintenance/bin/drive_feed.py selftest` (fixtures and a fake Google: nothing is "
+                 "sent). It pins the never-list scan, the coded checks, the keep-last-good banner and the push gate. "
+                 "Output: " + " | ".join(l for l in _df.splitlines() if l.startswith("FAIL"))[-300:],
+                 project="maintenance", key="drive-feed-selftest")
+    try:
+        import drive_feed as _dfm
+        _dfw = _dfm.armed_why()
+    except Exception as e:  # noqa: BLE001
+        _dfw = f"drive_feed.armed_why() raised {type(e).__name__}"
+    if _dfw:
+        _finding(f, "guardrail-inert", "high", f"the Drive feed is not armed — {_dfw}",
+                 "The 10:07Z line renders the Spark's pages for Claude Duet, scans them, runs the check agent and "
+                 "pushes only what passed. Read ~/maintenance/logs/drive_feed.log and state/drive_feed/render.json "
+                 "+ push.json; `python3 ~/maintenance/bin/drive_feed.py armed` says the same in one line.",
+                 project="maintenance", key="drive-feed-unarmed")
 
     # 32. cli-stale (2026-10-04, memo wa-cli-currency ask 3): the headless CLI pin lagging David's
     #     interactive sessions. Low and quiet (QUIET_KINDS); the core is _cli_stale(), pure.
