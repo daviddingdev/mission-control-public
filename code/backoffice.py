@@ -866,8 +866,9 @@ def census():
     c["diagrams"] = _diagram_state()
     c["handovers"] = _handover_state()
     c["experiments"] = _experiments_state()
-    try:                    # rule spawn-unwrapped, dry count (memo maintenance_lead-work-spawn-unwrapped-check 2/3)
-        c["spawn_outcome"] = _spawn_outcome(_jsonl_rows(os.path.join(STATE, "claude_sessions.jsonl")))
+    try:                    # rule spawn-unwrapped, the 7-day count (memo maintenance_lead-work-spawn-unwrapped-check 2/3, armed 3/3)
+        c["spawn_outcome"] = dict(_spawn_outcome(_jsonl_rows(os.path.join(STATE, "claude_sessions.jsonl"))),
+                                  mode="armed")    # the 7-day count; the rule itself files on 2 days (32b)
     except Exception as e:
         c["spawn_outcome"] = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
     try:
@@ -1750,6 +1751,28 @@ def _spawn_outcome(rows, now_ts=None, days=7):
             k = _spawn_launcher(r)
             out["by_launcher"][k] = out["by_launcher"].get(k, 0) + 1
     return out
+
+
+def _spawn_unwrapped_finding(f, rows, now_ts=None, days=2):
+    """Rule spawn-unwrapped, ARMED 2026-11-09 (memo maintenance_lead-work-spawn-unwrapped-check slice 3/3):
+    7 days of dry counts (11-02 07:52Z to 11-09) held 0 hits from lead.py, the dashboard dispatch and the
+    RC daemon; the only 4 were 0-1 s strays under the 11-02 daily check's guarded apply. One high finding
+    when a headless session in the last `days` (2: a missed pass still sees it) started WITHOUT the
+    headless token in its environment, i.e. on the shared rotating credential (the 08-27 outage path).
+    Filed, never a push of its own (QUIET_KINDS). -> the count dict (mode "armed")."""
+    o = _spawn_outcome(rows, now_ts, days=days)
+    o["mode"] = "armed"
+    if o["unwrapped"]:
+        who = ", ".join(f"{k} x{v}" for k, v in sorted(o["by_launcher"].items()))
+        _finding(f, "spawn-unwrapped", "high",
+                 f"{o['unwrapped']} headless Claude session(s) started without the headless token ({who})",
+                 f"In the last {days} days {o['unwrapped']} of {o['recorded']} recorded headless starts ran with no "
+                 "CLAUDE_CODE_OAUTH_TOKEN in their environment: a bare `claude` that fell back to the shared rotating "
+                 "credential (box rule 2; the 08-27 outage path). state/claude_sessions.jsonl rows with "
+                 "\"wrapped\": false name the launcher (lead, job) or the parent session (`under`). Launch through "
+                 "~/maintenance/bin/claude-headless inside `claudeq.py run`.",
+                 project="maintenance", key="spawn-unwrapped")
+    return o
 
 
 def _cli_stale_finding(f, rows, now_ts=None):
@@ -2829,7 +2852,8 @@ QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe",
                "fleet-stop-engaged", "backup-stray",  # rules 44-45: David engaged it / filed, never a push
                "experiment-no-driver",  # rule 46: the design memo reaches David as memos do today, no new push
                "diligence-unkept",  # rule 37c (2026-10-30): filed, never a push of its own
-               "upload-unfiled"}  # rule 37d (2026-11-02): filed, never a push of its own
+               "upload-unfiled",  # rule 37d (2026-11-02): filed, never a push of its own
+               "spawn-unwrapped"}  # rule 32b (armed 2026-11-09): high, filed, never a push of its own
 
 
 def _push_worthy(new):
@@ -4136,6 +4160,15 @@ def audit(c=None):
         _finding(f, "cli-stale", "low", "the cli-stale rule could not read the session ledger",
                  f"{type(e).__name__}: {str(e)[:160]}. state/claude_sessions.jsonl is what it reads.",
                  project="maintenance", key="cli-stale-unread")
+
+    # 32b. spawn-unwrapped (armed 2026-11-09, memo maintenance_lead-work-spawn-unwrapped-check 3/3): a headless
+    #      session that started without the headless token. High, filed, never a push (QUIET_KINDS).
+    try:
+        _spawn_unwrapped_finding(f, _jsonl_rows(os.path.join(STATE, "claude_sessions.jsonl")))
+    except Exception as e:
+        _finding(f, "spawn-unwrapped", "high", "the spawn-unwrapped rule could not read the session ledger",
+                 f"{type(e).__name__}: {str(e)[:160]}. state/claude_sessions.jsonl is what it reads.",
+                 project="maintenance", key="spawn-unwrapped-unread")
 
     # 33. backup-tamper (2026-10-04, memo wa-backups-integrity ask 3): a recorded archive whose size (or,
     #     under 200 MB, sha256) is not what backup.py recorded, or that vanished inside its keep window.
@@ -6683,6 +6716,15 @@ def selftest():
           == (4, 3, 2, {"under a session": 1, "lead hbs_lead": 1}, T0 - 9 * D, "dry"), _so)
     check("spawn-unwrapped dry count: nothing recorded yet is all zeros, never raises",
           _spawn_outcome([{"time": "x"}, {}], T0)["unwrapped"] == 0 and _spawn_outcome(None, T0)["recorded"] == 0)
+    fs = []
+    _so2 = _spawn_unwrapped_finding(fs, _so_rows, T0)
+    check("spawn-unwrapped armed: one high finding keyed spawn-unwrapped, names the launchers, quiet (never pushed)",
+          len(fs) == 1 and fs[0]["sev"] == "high" and fs[0]["key"] == "spawn-unwrapped:maintenance:spawn-unwrapped"
+          and "lead hbs_lead x1" in fs[0]["title"] and _so2["mode"] == "armed" and _push_worthy(fs) == [], fs)
+    fs0 = []
+    _spawn_unwrapped_finding(fs0, [r for r in _so_rows if r.get("wrapped") is not False]
+                             + [{"time": T0 - 3 * D, "event": "SessionStart", "headless": True, "wrapped": False}], T0)
+    check("spawn-unwrapped armed: only wrapped starts, or an unwrapped one older than 2 days, files nothing", fs0 == [], fs0)
     r6 = _cli_stale(cs("2.1.280", "2.1.286"), T0)
     check("cli-stale: 6 patches behind fires and names both versions",
           bool(r6) and r6["headless"] == "2.1.280" and r6["interactive"] == "2.1.286" and r6["behind"] == 6, r6)
