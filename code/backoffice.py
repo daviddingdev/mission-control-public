@@ -1133,6 +1133,13 @@ ARMED_CHECKS = (
      "requires": ("bin/healthcheck.sh",),
      "titles": ("the dead-box alarm's selftest fails — a dead box might never page",
                 "the dead-box alarm is not armed — {}")},
+    {"id": "funnel-watch", "control": "Tailscale Funnel watch (healthcheck: any AllowFunnel entry fails and is turned off)",
+     "layer": "detective", "standard": "box rule 5",
+     "check": "`healthcheck.sh selftest` funnel fixtures (a stub tailscale: an entry fires and is turned off, the serve "
+              "front put back) · state/funnel.json looked in the last hour",
+     "requires": ("bin/healthcheck.sh",),
+     "titles": ("the Funnel watch's selftest fails — a dashboard put on the internet might go unseen",
+                "the Funnel watch is not running — {}")},
     {"id": "drive-feed", "control": "the Spark's Drive pages: never-list scan + render/verdict gate before anything reaches Drive",
      "layer": "preventive", "standard": "—",
      "check": "`drive_feed.py selftest` (fixtures, fake Google) · `drive_feed.armed_why()`: the nightly render ran "
@@ -1544,6 +1551,22 @@ def _auto_fix_selftests(run=None):
             bad.append((name, f"exit {rc}" + (": " + " | ".join(fails)[-200:] if fails else
                                                "" if rc else ": " + out.strip()[-200:])))
     return bad
+
+
+FUNNEL_STALE_S = 3600        # healthcheck.sh runs every 15 min: four missed looks
+
+
+def _funnel_why(path=None, now=None):
+    """'' when healthcheck.sh's Funnel watch looked in the last hour (state/funnel.json `at`), else why not."""
+    path = path or os.path.join(MC, "state", "funnel.json")
+    now = now or time.time()
+    try:
+        at = int(json.load(open(path)).get("at") or 0)
+    except Exception:
+        return "state/funnel.json is missing or unreadable"
+    if now - at > FUNNEL_STALE_S:
+        return f"its last look was {int(now - at) // 60} min ago"
+    return ""
 
 
 def _deadman_why(path=None, now=None):
@@ -4128,6 +4151,21 @@ def audit(c=None):
                  "last arm is 55+ min old and fails its own run (dead-box-alarm-unarmed) at 75. Check "
                  "~/maintenance/logs/healthcheck.log and `bash ~/maintenance/bin/healthcheck.sh --dry`.",
                  project="maintenance", key="deadman-unarmed")
+    # 31a. the Tailscale Funnel watch (2026-11-10, memo maintenance-funnel-watch): healthcheck.sh reads
+    #      `tailscale funnel status` every 15 min, fails on any AllowFunnel entry and turns it off. Its
+    #      fixtures run inside the same selftest; state/funnel.json proves the live look.
+    _ff = [l for l in _hs.splitlines() if l.startswith("FAIL funnel")]
+    if _ff:
+        _finding(f, "guardrail-inert", "high", "the Funnel watch's selftest fails — a dashboard put on the internet might go unseen",
+                 "run `bash ~/maintenance/bin/healthcheck.sh selftest` (a stub tailscale: nothing is changed). Output: "
+                 + " | ".join(_ff)[-300:], project="maintenance", key="funnel-watch-selftest")
+    _fw = _funnel_why()
+    if _fw:
+        _finding(f, "guardrail-inert", "high", f"the Funnel watch is not running — {_fw}",
+                 "healthcheck.sh writes state/funnel.json on every live run (every 15 min). Without it nothing "
+                 "notices a `tailscale funnel` that puts :8900 or :8787 on the internet. Check "
+                 "~/maintenance/logs/healthcheck.log and `bash ~/maintenance/bin/healthcheck.sh --dry`.",
+                 project="maintenance", key="funnel-watch-unarmed")
 
     # 31b. the Spark's Drive pages (2026-11-07, memo maintenance-spark-drive-feed slice 4/5): the never-list scan
     #      and the render/verdict gate are what stand between the box and David's Drive. The selftest proves

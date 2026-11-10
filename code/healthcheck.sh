@@ -343,6 +343,64 @@ dash_plan(){
 }
 # <<< dashboard hang restart
 
+# >>> Tailscale Funnel watch (2026-11-10, memo maintenance-funnel-watch). The tailnet grants this node
+# the Funnel capability (443, 8443, 10000) and prefs OperatorUser lets any user process change
+# serve/funnel without sudo, so one `tailscale funnel` would put a dashboard on the internet, and
+# Mission Control and Stocks trust what arrives from the box. No connector is approved, so AllowFunnel
+# must be empty. Any entry, top-level or in a foreground session, is a FAIL (the outage push, on state
+# change), and a live run turns each top-level one off (`tailscale funnel --https=<port> off`; the old
+# `funnel <port> off` form errors on 1.104.5) and then puts back that port's tailnet-only serve front
+# from the snapshot, so the phone app's :443 survives. Every run writes state/funnel.json (the
+# back office's armed-check: older than an hour = the watch is not running).
+# FUNNEL_APPROVED: "host:port ..." a connector David approved may keep. None today.
+TS_BIN=${TS_BIN:-tailscale}
+FUNNEL_APPROVED=${FUNNEL_APPROVED:-}
+FUNNEL_STATE=${FUNNEL_STATE:-state/funnel.json}
+funnel_open(){ # <serve status json file> -> one "<where> <host:port>" per open, unapproved Funnel entry
+  python3 - "$1" "$FUNNEL_APPROVED" <<'PYF'
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: print("unreadable -"); sys.exit(0)
+ok = set(sys.argv[2].split())
+def entries(c):
+    return sorted(k for k, v in ((c or {}).get("AllowFunnel") or {}).items() if v and k not in ok)
+for k in entries(d): print("top", k)
+for sid, c in sorted((d.get("Foreground") or {}).items()):
+    for k in entries(c): print("fg:" + sid, k)
+PYF
+}
+funnel_proxy(){ # <serve status json file> <host:port> -> the "/" handler's Proxy target, or nothing
+  python3 -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+print((((d.get("Web") or {}).get(sys.argv[2]) or {}).get("Handlers") or {}).get("/", {}).get("Proxy") or "")' "$1" "$2" 2>/dev/null
+}
+funnel_close(){ # <serve status json file> <host:port>: Funnel off on that port, then its tailnet serve front back
+  local port=${2##*:} proxy
+  proxy=$(funnel_proxy "$1" "$2")
+  "$TS_BIN" funnel --https="$port" off || return 1
+  [ -z "$proxy" ] || "$TS_BIN" serve --bg --https="$port" "$proxy" || return 1
+}
+funnel_watch(){ # <write 0|1>: read, report, close (write=1), state file; prints the FAIL name or nothing
+  local snap open where hp closed=() left=() rc
+  snap=$(mktemp); "$TS_BIN" funnel status --json > "$snap" 2>/dev/null; rc=$?
+  open=$([ $rc -eq 0 ] && funnel_open "$snap" || echo "unreadable -")
+  if [ "$open" = "unreadable -" ]; then
+    echo "$(date -Is) funnel watch: could not read \`tailscale funnel status --json\` (rc $rc); nothing decided" >&2
+  else
+    while read -r where hp; do
+      [ -n "$hp" ] || continue
+      if [ "$1" = 1 ] && [ "$where" = top ] && funnel_close "$snap" "$hp" >&2; then closed+=("$hp")
+      else left+=("$hp"); fi
+    done <<<"$open"
+    [ "$1" = 1 ] && printf '{"at": %s, "open": "%s", "closed": "%s", "left": "%s"}\n' "$(date +%s)" \
+      "$(tr '\n' ' ' <<<"$open" | sed 's/ *$//')" "${closed[*]}" "${left[*]}" > "$FUNNEL_STATE"
+    [ ${#closed[@]} -gt 0 ] && echo "tailscale-funnel-was-open(${closed[*]},turned-off)"
+    [ ${#left[@]} -gt 0 ] && echo "tailscale-funnel-OPEN(${left[*]})"
+  fi
+  rm -f "$snap"
+}
+# <<< Tailscale Funnel watch
+
 if [ "$MODE" = selftest ]; then
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
   DM_STATE=$T/deadman.json; HC_LEDGER=$T/notifications.jsonl; F=0
@@ -516,6 +574,27 @@ STUB
   ok "dash: second failed probe in a row, unit active -> restart, count reset" "$(dash_plan 1 1 1)" "restart 0"
   ok "dash: failing but the unit is not active -> systemd's, keep counting" "$(dash_plan 1 1 0)" "wait 2"
   ok "dash: no count file yet -> treated as 0" "$(dash_plan '' 1 1)" "wait 1"
+  # Funnel watch: a stub tailscale that prints a fixture and records every call
+  mkdir -p "$T/ts"; TS_BIN=$T/ts/tailscale; FUNNEL_STATE=$T/funnel.json
+  printf '#!/bin/bash\necho "$*" >> %s/ts/calls\n[ "$1 $2" = "funnel status" ] && cat %s/ts/status.json\nexit 0\n' "$T" "$T" > "$TS_BIN"; chmod +x "$TS_BIN"
+  H=<host>.<tailnet>.ts.net
+  echo '{"TCP":{"443":{"HTTPS":true}},"Web":{"'$H':443":{"Handlers":{"/":{"Proxy":"http://<host-ip>:8088"}}}}}' > "$T/ts/status.json"
+  ok "funnel: today's config (serve fronts, no AllowFunnel) -> no FAIL, nothing turned off" \
+    "$(funnel_watch 1)|$(grep -c ' off' "$T/ts/calls")" "|0"
+  ok "funnel: ...and the state file says it looked" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["open"])' "$FUNNEL_STATE")" ""
+  echo '{"TCP":{"443":{"HTTPS":true}},"Web":{"'$H':443":{"Handlers":{"/":{"Proxy":"http://<host-ip>:8088"}}}},"AllowFunnel":{"'$H':443":true}}' > "$T/ts/status.json"
+  : > "$T/ts/calls"
+  ok "funnel: an AllowFunnel entry fires a FAIL and is turned off" "$(funnel_watch 1)" "tailscale-funnel-was-open($H:443,turned-off)"
+  ok "funnel: ...with the 1.104 form, then the tailnet serve front put back" \
+    "$(grep -v status "$T/ts/calls" | tr '\n' ';')" "funnel --https=443 off;serve --bg --https=443 http://<host-ip>:8088;"
+  : > "$T/ts/calls"
+  ok "funnel: the dry run reports it OPEN and turns nothing off" "$(funnel_watch 0)|$(grep -vc status "$T/ts/calls")" "tailscale-funnel-OPEN($H:443)|0"
+  ok "funnel: an approved connector's entry is left alone" "$(FUNNEL_APPROVED="$H:443" funnel_watch 0)" ""
+  echo '{"Foreground":{"abc":{"AllowFunnel":{"'$H':8443":true}}}}' > "$T/ts/status.json"; : > "$T/ts/calls"
+  ok "funnel: a foreground session's funnel fires too (left open: its process owns it)" \
+    "$(funnel_watch 1)|$(grep -vc status "$T/ts/calls")" "tailscale-funnel-OPEN($H:8443)|0"
+  echo 'not json' > "$T/ts/status.json"
+  ok "funnel: an unreadable status decides nothing (no FAIL)" "$(funnel_watch 1 2>/dev/null)" ""
   [ $F -eq 0 ] && echo "ALL PASS" || echo "$F FAILED"
   exit $([ $F -eq 0 ] && echo 0 || echo 1)
 fi
@@ -604,6 +683,9 @@ if systemctl --user is-enabled --quiet maintenance-dashboard 2>/dev/null \
   FAIL+=("always-on-discovery-inert")
 fi
 # <<< always-on user units
+# Tailscale Funnel watch (functions above the selftest): --dry reports and turns nothing off
+_fw=1; [ -n "${HEALTHCHECK_DRY:-}" ] && _fw=0
+while read -r _fn; do [ -n "$_fn" ] && FAIL+=("$_fn"); done < <(funnel_watch "$_fw")
 # dashboard hang restart (functions above the selftest): live runs only; --dry writes and restarts nothing
 if [ -z "${HEALTHCHECK_DRY:-}" ] && systemctl --user is-enabled --quiet maintenance-dashboard 2>/dev/null \
    && ! python3 bin/paused.py port 8900 >/dev/null 2>&1; then
