@@ -1160,7 +1160,16 @@ def _selftest_drill(tmp):
         and "FAIL" in open(rep).read(),
         "drill: one row per source, report, exit 1 on a fail", f"rc {rc}, {len(rows)} rows")
     chk(not os.listdir(DRILL_TMPDIR), "drill: no temp dir left behind after all cases")
+    chk(_cmd_of([]) is None and _cmd_of(["run"]) == "run",
+        "argv: a bare `backup.py` is usage (exit 2), never the live run; `run` stays explicit")
     return bad
+
+
+def _cmd_of(args):
+    """The subcommand, or None when there is none. A bare `backup.py` used to mean `run`: on
+    2026-11-12 a lead session probing for its modes rewrote that day's archives (all verified ok
+    after). Cron names `run` explicitly, so nothing needs the default."""
+    return args[0] if args else None
 
 
 if __name__ == "__main__":
@@ -1170,7 +1179,10 @@ if __name__ == "__main__":
     USAGE = ("usage: backup.py run [source] | paths [source] | verify [source] "
              "| drill [source] [--dry|--dry-run] | check | list | selftest")
     args = sys.argv[1:]
-    cmd = args[0] if args else "run"
+    cmd = _cmd_of(args)
+    if cmd is None:     # no subcommand: usage, never the live run (2026-11-12, see _cmd_of)
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)
     rest = args[1:]
     # An unknown argument exits 2 and never runs the live job (MC CLAUDE.md, 2026-10-03):
     # `run --dry` used to be read as a source name, ran nothing, then the stale check could push.

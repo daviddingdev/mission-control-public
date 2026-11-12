@@ -1704,20 +1704,27 @@ def _ver(v):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
-def _cli_stale(rows, now_ts=None, days=14, patches=5):
+def _cli_stale(rows, now_ts=None, days=14, patches=5, pin_days=10):
     """Rule cli-stale's core, pure (memo wa-cli-currency ask 3). `rows` are state/claude_sessions.jsonl
     records ({time, headless, cli_version}). Compares the newest headless cli_version seen in the last
     `days` with the newest interactive one in the same window. -> None when headless keeps up, else
     {headless, interactive, behind, lag_d, why}: `behind` is the patch gap (same major.minor; a newer
     minor/major counts as behind by `patches`), `lag_d` the days between the two versions' first
-    sighting anywhere in the log. Fires on behind >= patches or lag_d > days."""
+    sighting anywhere in the log. Fires on behind >= patches or lag_d > days, and only once the headless pin
+    has not moved for more than `pin_days` (2026-11-12): since the upgrade policy went live (cli-update.py
+    policy --run, 2026-10-24) the pin moves on its own, a week behind David's builds at most (3 days staged,
+    then the Friday frontier-scan canary, then the 11:10 promote), so a gap inside that cycle is the design
+    and the finding means the policy has stalled. `pin_d` is the days since the first headless session on
+    the pinned version."""
     now_ts = time.time() if now_ts is None else now_ts
-    first, head, inter = {}, None, None
+    first, first_h, head, inter = {}, {}, None, None
     for r in rows or ():
         v, t = _ver(r.get("cli_version")), r.get("time")
         if not v or not isinstance(t, (int, float)):
             continue
         first[v] = min(first.get(v, t), t)
+        if r.get("headless") is True:
+            first_h[v] = min(first_h.get(v, t), t)
         if t < now_ts - days * 86400:
             continue
         if r.get("headless") is True:
@@ -1726,6 +1733,9 @@ def _cli_stale(rows, now_ts=None, days=14, patches=5):
             inter = max(inter or v, v)
     if not head or not inter or head >= inter:
         return None
+    pin_d = round((now_ts - first_h[head]) / 86400, 1)
+    if pin_d <= pin_days:
+        return None
     behind = inter[2] - head[2] if inter[:2] == head[:2] else patches
     lag_d = round((first[inter] - first[head]) / 86400, 1)
     why = [w for w, hit in ((f"{behind} patch versions behind", behind >= patches),
@@ -1733,7 +1743,7 @@ def _cli_stale(rows, now_ts=None, days=14, patches=5):
     if not why:
         return None
     return {"headless": ".".join(map(str, head)), "interactive": ".".join(map(str, inter)),
-            "behind": behind, "lag_d": lag_d, "why": " and ".join(why)}
+            "behind": behind, "lag_d": lag_d, "pin_d": pin_d, "why": " and ".join(why)}
 
 
 def _spawn_launcher(r):
@@ -1804,10 +1814,10 @@ def _cli_stale_finding(f, rows, now_ts=None):
         _finding(f, "cli-stale", "low",
                  f"headless Claude runs an older CLI than David's sessions ({r['headless']} vs {r['interactive']})",
                  f"In the last 14 days the newest headless session ran Claude Code {r['headless']} and the newest "
-                 f"interactive one {r['interactive']}: the headless pin is {r['why']}. Headless jobs miss the fixes "
-                 "David's sessions already have. `python3 ~/maintenance/bin/cli-update.py status` shows the pin and "
-                 "the canary; the canary override (moving the headless pin without a passing canary) is parked "
-                 "with David.", project="maintenance", key="cli-stale")
+                 f"interactive one {r['interactive']}: the headless pin is {r['why']}, and it has not moved in "
+                 f"{r['pin_d']} days, so the upgrade policy has stalled (it promotes a build 3+ days old after a green "
+                 "Friday canary). `python3 ~/maintenance/bin/cli-update.py status`, `canary --dry` and "
+                 "logs/cli_update.log say where it stopped.", project="maintenance", key="cli-stale")
     return r
 
 
@@ -1927,16 +1937,71 @@ def _browser_signin_findings(f, state, sites_cfg, held=None):
 
 UPLOADS_DIR = os.path.join(HOME, ".claude", "uploads")
 _UPLOAD_WALK_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", "worktrees"}
+CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 
 
-def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_h=24):
+def _upload_chat_owner(chat, projects=CLAUDE_PROJECTS, since_ts=None, home=HOME):
+    """The top-level folder ("Stocks", "hbs", "bidart") of the session that FIRST quoted `uploads/<chat>` in its
+    transcript, or None (no transcript names it, or the session sat at ~ itself). Later sessions quote the path too
+    (the 11-05 root-cause row did, from ~/maintenance), so the earliest line wins, not the first file found. Only
+    transcripts touched since an hour before the upload are read, and grep narrows them to the ones that name the
+    chat before any line is parsed (7 GB of transcripts, 2026-11-12: ~1.5 s for the oldest current upload)."""
+    needle = f"uploads/{chat}"
+    files = []
+    for r, _ds, fs in os.walk(projects):
+        for n in fs:
+            if n.endswith(".jsonl"):
+                q = os.path.join(r, n)
+                try:
+                    if since_ts is None or os.stat(q).st_mtime >= since_ts - 3600:
+                        files.append(q)
+                except OSError:
+                    continue
+    hits = []
+    for i in range(0, len(files), 200):
+        try:
+            hits += subprocess.run(["grep", "-lF", "--", needle, *files[i:i + 200]], capture_output=True,
+                                   text=True, timeout=120).stdout.splitlines()
+        except (OSError, subprocess.SubprocessError):
+            hits += files[i:i + 200]                     # no grep: the parse below still decides
+    nb, best = needle.encode(), None
+    for q in hits:
+        try:
+            with open(q, "rb") as fh:
+                for ln in fh:
+                    if nb not in ln:
+                        continue
+                    try:
+                        e = json.loads(ln)
+                    except ValueError:
+                        continue
+                    cwd, ts = e.get("cwd") if isinstance(e, dict) else None, str((e or {}).get("timestamp") or "")
+                    if cwd:
+                        if best is None or ts < best[0]:
+                            best = (ts, cwd)
+                        break
+        except OSError:
+            continue
+    if not best:
+        return None
+    rel = os.path.relpath(os.path.realpath(best[1]), os.path.realpath(home))
+    return None if rel in (".", "") or rel.startswith("..") else rel.split(os.sep)[0]
+
+
+def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_h=24, keep_never=(),
+                             projects=CLAUDE_PROJECTS, home=HOME):
     """Rule upload-unfiled (memo hbs-file-every-chat-upload, 2026-11-01; David: "any uploaded file into a chat ...
     should be saved in relevant folders in spark"). A desktop-app upload lands in ~/.claude/uploads/local_<chat>/ and
     is the only copy until a session files it (a COPY, never a move: the app owns that folder). An upload older than
     `age_h` with no sha256-identical file under any project folder in `homes` (each project's tree, plus folders kept
     apart under an NDA, browser.KEEP_NEVER) is unfiled. Size first, so only same-size files are ever hashed; the
     uploads are never read for anything but their hash, and never listed by content. -> one med finding for the box,
-    keyed `upload-unfiled`, naming the count, the chats and up to 5 file names. Accepted ones are muted by key."""
+    keyed `upload-unfiled`, naming the count, the chats and up to 5 file names. Accepted ones are muted by key.
+    Only an upload someone can act on counts (memo maintenance_lead-work-upload-rule-holds, 2026-11-12): each is
+    walked to the project of the session that first quoted it (_upload_chat_owner), and one from a Stocks session
+    (held while Stocks is frozen, like every Stocks repeat) or from a folder kept apart under an NDA (`keep_never`:
+    only its own session files it) is HELD: named in the detail's `held:` clause, never counted. Nothing but held
+    files -> no finding. An actionable one says where it goes ("-> hbs")."""
     import hashlib
     now_ts = now_ts or time.time()
 
@@ -2000,15 +2065,39 @@ def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_
             unfiled.append((chat, q))
     if not unfiled:
         return
+    kn = {str(x).lower() for x in keep_never or ()}
+    owners, act, held_s, held_n = {}, [], [], 0
+    for chat, q in unfiled:
+        if chat not in owners:
+            try:
+                owners[chat] = _upload_chat_owner(chat, projects=projects, home=home,
+                                                  since_ts=min(os.stat(x).st_mtime for c, x in unfiled if c == chat))
+            except OSError:
+                owners[chat] = None
+        o = owners[chat]
+        if o and o.lower() in kn:
+            held_n += 1
+        elif o and o.lower() == "stocks":
+            held_s.append(os.path.basename(q))
+        else:
+            act.append((chat, q, o))
+    held = "; ".join(x for x in (f"{len(held_s)} from a Stocks session, held while Stocks is frozen ({', '.join(held_s[:3])})"
+                                 if held_s else "", f"{held_n} from a folder kept apart under an NDA, which only its own "
+                                 "session files" if held_n else "") if x)
+    held = f" held: {held}." if held else ""
+    if not act:
+        return
+    unfiled = [(c, q) for c, q, _ in act]
     chats_ = sorted({c for c, _ in unfiled})
-    names = ", ".join(os.path.basename(q) for _, q in unfiled[:5]) + (" …" if len(unfiled) > 5 else "")
+    names = ", ".join(os.path.basename(q) + (f" (-> {o})" if o else " (owner unknown)") for _, q, o in act[:5]) \
+        + (" …" if len(act) > 5 else "")
     _finding(f, "upload-unfiled", "med",
              f"{len(unfiled)} chat upload(s) older than {age_h} h not filed into any project",
              f"{len(unfiled)} file(s) in ~/.claude/uploads from {len(chats_)} chat(s) ({', '.join(c[:14] for c in chats_[:6])}) "
-             f"have no sha256-identical copy in any project folder: {names}. Copy each (never move: the app owns the "
+             f"have no sha256-identical copy in any project folder: {names}.{held} Copy each (never move: the app owns the "
              "folder) into its owning project's declared data root under a dated name and declare it in that "
-             "project's catalog.json; an NDA'd file goes only to its own folder. Find the chat's folder by grepping "
-             "~/.claude/projects/*/*.jsonl for `uploads/<chat>` (a hint, not the owner). A file not worth keeping: "
+             "project's catalog.json; an NDA'd file goes only to its own folder. The arrow names the project of the "
+             "session that first quoted the chat (a hint: a file goes where its content belongs). A file not worth keeping: "
              "mute this key with the reason.", project="maintenance", key="upload-unfiled")
 
 
@@ -4307,10 +4396,11 @@ def audit(c=None):
         try:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import browser as _browser
-            _homes += [os.path.join(HOME, x) for x in sorted(getattr(_browser, "KEEP_NEVER", ()) or ())]
+            _kn = sorted(getattr(_browser, "KEEP_NEVER", ()) or ())
         except Exception:
-            _homes += [os.path.join(HOME, "bidart")]
-        _upload_unfiled_findings(f, homes=[h for h in _homes if os.path.isdir(h)])
+            _kn = ["bidart"]
+        _homes += [os.path.join(HOME, x) for x in _kn]
+        _upload_unfiled_findings(f, homes=[h for h in _homes if os.path.isdir(h)], keep_never=_kn)
     except Exception as e:
         _finding(f, "upload-unfiled", "low", "the upload-unfiled rule could not run",
                  f"{type(e).__name__}: {str(e)[:160]}. It reads ~/.claude/uploads and every project folder.",
@@ -6763,12 +6853,15 @@ def selftest():
     _spawn_unwrapped_finding(fs0, [r for r in _so_rows if r.get("wrapped") is not False]
                              + [{"time": T0 - 3 * D, "event": "SessionStart", "headless": True, "wrapped": False}], T0)
     check("spawn-unwrapped armed: only wrapped starts, or an unwrapped one older than 2 days, files nothing", fs0 == [], fs0)
-    r6 = _cli_stale(cs("2.1.280", "2.1.286"), T0)
+    r6 = _cli_stale([{"time": T0 - 20 * D, "headless": True, "cli_version": "2.1.280"}] + cs("2.1.280", "2.1.286"), T0)
     check("cli-stale: 6 patches behind fires and names both versions",
           bool(r6) and r6["headless"] == "2.1.280" and r6["interactive"] == "2.1.286" and r6["behind"] == 6, r6)
     check("cli-stale: 4 patches behind with close first sightings is quiet; headless ahead or equal is quiet",
           _cli_stale(cs("2.1.282", "2.1.286"), T0) is None and _cli_stale(cs("2.1.286", "2.1.286"), T0) is None
           and _cli_stale(cs("2.1.290", "2.1.286"), T0) is None, _cli_stale(cs("2.1.282", "2.1.286"), T0))
+    check("cli-stale: 12 patches behind is quiet while the pin moved in the last 10 days (the policy's cycle)",
+          _cli_stale([{"time": T0 - 30 * D, "headless": False, "cli_version": "2.1.309"}]
+                     + cs("2.1.309", "2.1.321", hf=T0 - 6 * D), T0) is None)
     old_first = [{"time": T0 - 40 * D, "headless": True, "cli_version": "2.1.282"}]
     r_lag = _cli_stale(old_first + cs("2.1.282", "2.1.284", inf=T0 - 2 * D), T0)
     check("cli-stale: 2 patches behind fires when the headless version was first seen >14d before the interactive one",
@@ -6776,12 +6869,14 @@ def selftest():
     check("cli-stale: rows older than 14 days do not count; no interactive row is quiet; a newer minor counts as behind",
           _cli_stale(cs("2.1.280", "2.1.286", hf=T0 - 20 * D, inf=T0 - 20 * D), T0) is None
           and _cli_stale(cs("2.1.280", "x"), T0) is None
-          and (_cli_stale(cs("2.1.299", "2.2.0"), T0) or {}).get("behind") == 5)
+          and (_cli_stale([{"time": T0 - 20 * D, "headless": True, "cli_version": "2.1.299"}]
+                          + cs("2.1.299", "2.2.0"), T0) or {}).get("behind") == 5)
     fc = []
-    _cli_stale_finding(fc, cs("2.1.280", "2.1.286"), T0)
-    check("cli-stale: one low finding keyed cli-stale, quiet (never pushed), detail names cli-update.py status and the parked canary",
+    _cli_stale_finding(fc, [{"time": T0 - 20 * D, "headless": True, "cli_version": "2.1.280"}]
+                       + cs("2.1.280", "2.1.286"), T0)
+    check("cli-stale: one low finding keyed cli-stale, quiet (never pushed), detail names cli-update.py status and the stalled policy",
           len(fc) == 1 and fc[0]["sev"] == "low" and fc[0]["key"] == "cli-stale:maintenance:cli-stale"
-          and "cli-update.py status" in fc[0]["detail"] and "parked" in fc[0]["detail"]
+          and "cli-update.py status" in fc[0]["detail"] and "stalled" in fc[0]["detail"]
           and _push_worthy(fc) == [], fc)
 
     # backup-tamper (2026-10-04): a recorded archive that changed size or hash, or vanished in its keep window
@@ -7114,15 +7209,53 @@ def selftest():
             _w(os.path.join(_up, "fresh.pdf"), b"just now", 3600)                       # under 24 h: not yet due
             fup = []
             _upload_unfiled_findings(fup, uploads=os.path.join(_td, "uploads"), homes=[os.path.join(_td, "projA"),
-                                     _pb], now_ts=_T)
+                                     _pb], now_ts=_T, projects=os.path.join(_td, "cproj"), home=_td)
             check("upload-unfiled: an upload filed under a new name is quiet; a same-size decoy is not a copy; "
                   "one under 24 h waits -> ONE med finding naming lost.pdf only",
                   [(x["key"], x["sev"], x["title"].split()[0]) for x in fup]
                   == [("upload-unfiled:maintenance:upload-unfiled", "med", "1")] and "lost.pdf" in fup[0]["detail"]
                   and "filed.pdf" not in fup[0]["detail"].replace("lost.pdf", ""), fup)
             fup = []
-            _upload_unfiled_findings(fup, uploads=os.path.join(_td, "nope"), homes=[], now_ts=_T)
+            _upload_unfiled_findings(fup, uploads=os.path.join(_td, "nope"), homes=[], now_ts=_T,
+                                     projects=os.path.join(_td, "cproj"), home=_td)
             check("upload-unfiled: no uploads folder is quiet", fup == [], fup)
+            # the holds (memo maintenance_lead-work-upload-rule-holds): each chat walked to the session that FIRST quoted it
+            _u2, _cp = os.path.join(_td, "up2"), os.path.join(_td, "cproj")
+            for _c, _n in (("local_s", "statement.xlsx"), ("local_n", "nda_list.pdf"), ("local_h", "case.pdf")):
+                os.makedirs(os.path.join(_u2, _c))
+                _w(os.path.join(_u2, _c, _n), _c.encode() * 3, 30 * 3600)
+
+            def _tx(slug, name, rows):
+                os.makedirs(os.path.join(_cp, slug), exist_ok=True)
+                pth = os.path.join(_cp, slug, name)
+                with open(pth, "w") as fh:
+                    fh.write("".join(json.dumps(r) + "\n" for r in rows))
+                os.utime(pth, (_T - 3600, _T - 3600))
+            _tx("-x-Stocks", "a.jsonl", [{"type": "summary"}, {"timestamp": "2026-10-26T14:02:00Z", "cwd": os.path.join(_td, "Stocks"),
+                                                                "message": "read uploads/local_s/statement.xlsx"}])
+            _tx("-x-maintenance", "b.jsonl", [{"timestamp": "2026-11-05T09:00:00Z", "cwd": os.path.join(_td, "maintenance"),
+                                               "message": "root cause: uploads/local_s and uploads/local_n were never filed"}])
+            _tx("-x-bidart", "c.jsonl", [{"timestamp": "2026-11-03T02:19:00Z", "cwd": os.path.join(_td, "bidart"),
+                                          "message": "uploads/local_n/nda_list.pdf"}])
+            _tx("-x-hbs--claude-worktrees-w", "d.jsonl", [{"timestamp": "2026-11-04T10:00:00Z",
+                                                          "cwd": os.path.join(_td, "hbs", ".claude", "worktrees", "w"),
+                                                          "message": "uploads/local_h/case.pdf"}])
+            check("upload-unfiled: a chat's owner is the session that FIRST quoted it (Stocks, not the later maintenance "
+                  "root-cause session); a worktree maps to its project; no transcript -> None",
+                  [_upload_chat_owner(c, projects=_cp, home=_td) for c in ("local_s", "local_n", "local_h", "local_z")]
+                  == ["Stocks", "bidart", "hbs", None])
+            fup = []
+            _upload_unfiled_findings(fup, uploads=_u2, homes=[], now_ts=_T, keep_never=["bidart"], projects=_cp, home=_td)
+            _dt = fup[0]["detail"] if fup else ""
+            check("upload-unfiled: a Stocks session's upload and an NDA folder's are HELD (named in `held:`, never counted); "
+                  "the hbs one counts and says where it goes; the NDA file is never named",
+                  [x["title"].split()[0] for x in fup] == ["1"] and "case.pdf (-> hbs)" in _dt
+                  and "held: 1 from a Stocks session, held while Stocks is frozen (statement.xlsx); 1 from a folder kept "
+                      "apart under an NDA" in _dt and "nda_list" not in _dt, fup)
+            os.remove(os.path.join(_u2, "local_h", "case.pdf"))
+            fup = []
+            _upload_unfiled_findings(fup, uploads=_u2, homes=[], now_ts=_T, keep_never=["bidart"], projects=_cp, home=_td)
+            check("upload-unfiled: nothing but held uploads -> no finding (the rule closes)", fup == [], fup)
         check("upload-unfiled: filed, never pushed (QUIET_KINDS)", "upload-unfiled" in QUIET_KINDS)
         fdc = []
         _dash_check_finding(fdc, {"ok": False, "at": "2026-10-05T08:29:47Z", "rc": 1,
