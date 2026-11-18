@@ -144,6 +144,42 @@ def expand(name, spec):
     return src, sorted(found), missing
 
 
+def src_newest(src, paths):
+    """Newest mtime of any file under the archived paths (0 when none). What a `frozen` source
+    (memo hbs-columbia-archive-backup, 2026-11-18) is judged by: archive it again only when
+    something in it changed since the newest archive, so a finished 2.6 GB folder is not
+    re-tarred into identical copies every night."""
+    newest_m = 0.0
+    for p in paths:
+        fp = os.path.join(src, p)
+        try:
+            if os.path.isfile(fp):
+                newest_m = max(newest_m, os.path.getmtime(fp))
+                continue
+        except OSError:
+            continue
+        for dp, _dn, fns in os.walk(fp):
+            for fn in fns:
+                try:
+                    newest_m = max(newest_m, os.lstat(os.path.join(dp, fn)).st_mtime)
+                except OSError:
+                    pass
+    return newest_m
+
+
+def frozen_current(name, spec):
+    """For a `frozen` source: (True, archive) when its newest archive already holds every change
+    (no file under its paths is newer than it), else (False, archive-or-None). Always False for a
+    source that is not frozen."""
+    if not spec.get("frozen"):
+        return False, None
+    n = newest(name)
+    if not n:
+        return False, None
+    src, paths, _m = expand(name, spec)
+    return src_newest(src, paths) <= os.path.getmtime(n), n
+
+
 def _du(path):
     if os.path.isfile(path) or os.path.islink(path):
         return os.path.getsize(path) if os.path.isfile(path) else 0
@@ -273,9 +309,14 @@ def write_one(name, spec):
     src, paths, _missing = expand(name, spec)
     if not paths:
         return False, f"{name}: none of the declared paths exist"
+    current, prev = frozen_current(name, spec)
+    if current:
+        return True, (f"{name}: frozen, unchanged since {os.path.basename(prev)} — "
+                      f"not archived again")
     d = dest_dir(name)
     os.makedirs(d, exist_ok=True)
     out = os.path.join(d, f"{name.lower()}_{datetime.now(timezone.utc):%Y-%m-%d}.tar.gz")
+    started = time.time()
     r = subprocess.run(["tar", "czf", out, "-C", src] + paths,
                        capture_output=True, text=True, timeout=1800)
     if r.returncode != 0 or not os.path.exists(out):
@@ -313,6 +354,10 @@ def write_one(name, spec):
     except (OSError, tarfile.TarError, ValueError) as e:
         return False, (f"{name}: archive kept but checksum NOT recorded, nothing pruned — "
                        f"{type(e).__name__}: {str(e)[:100]}")
+    if spec.get("frozen"):
+        # Date a frozen archive by when tar STARTED, so a file changed while tar ran reads as
+        # newer than the archive and is archived again next night instead of being skipped.
+        os.utime(out, (started, started))
     keep = int(spec.get("keep_days", 30))
     olds = sorted(archives(d), key=os.path.getmtime, reverse=True)   # archives only, never sidecars
     for f in olds[keep:]:
@@ -366,6 +411,10 @@ def check(quiet=False):
         n = newest(name)
         a = age_h(n)
         limit = spec.get("max_gap_h", 30)
+        if n and frozen_current(name, spec)[0]:
+            if not quiet:                 # a frozen source is fresh while nothing in it changed
+                print(f"  ok    {name}: frozen, unchanged since its {a}h-old archive")
+            continue
         if n is None or a > limit:
             stale.append((name, a if a is not None else -1))
             if not quiet:
@@ -1020,6 +1069,33 @@ def _selftest_body(tmp, src_dir):
     _write_atomic(out + ".sha256", f"{sha256_file(out)}  {os.path.basename(out)}\n")
     rc, txt = quiet_verify()
     chk(rc == 1 and "from the ledger record" in txt, "…even with the sidecar rewritten (ledger wins)")
+
+    # ---- `frozen` (memo hbs-columbia-archive-backup, 2026-11-18) ----
+    fz = os.path.join(tmp, "frozenproj")
+    os.makedirs(os.path.join(fz, "arch"))
+    open(os.path.join(fz, "arch", "a.txt"), "w").write("old")
+    past = time.time() - 5 * 86400
+    os.utime(os.path.join(fz, "arch", "a.txt"), (past, past))
+    fspec = {"src": fz, "paths": ["arch"], "keep_days": 2, "frozen": True, "max_gap_h": 30}
+    ok, msg = write_one("frozenproj", fspec)
+    first = newest("frozenproj")
+    chk(ok and first is not None and "unchanged" not in msg, "frozen: the first archive is written", msg[-40:])
+    later = time.time() - 3 * 86400               # pretend it was written 3 days ago
+    for f in [first] + [first + sfx for sfx in SIDECARS if os.path.exists(first + sfx)]:
+        os.utime(f, (later, later))
+    ok, msg = write_one("frozenproj", fspec)
+    chk(ok and "unchanged" in msg and archives(dest_dir("frozenproj")) == [first],
+        "frozen + unchanged: no second archive", msg[-50:])
+    chk(frozen_current("frozenproj", fspec)[0] and age_h(first) > 30,
+        "frozen + unchanged: fresh although 72 h old")
+    chk(not frozen_current("frozenproj", {k: v for k, v in fspec.items() if k != "frozen"})[0],
+        "…and a source that is not frozen never is")
+    open(os.path.join(fz, "arch", "DIGEST.md"), "w").write("new")
+    chk(not frozen_current("frozenproj", fspec)[0], "frozen + a new file: no longer current")
+    os.unlink(first)                              # same-day name: let the rewrite land fresh
+    ok, msg = write_one("frozenproj", fspec)
+    chk(ok and "unchanged" not in msg and newest("frozenproj") is not None,
+        "frozen + a new file: archived again", msg[-40:])
     return bad
 
 

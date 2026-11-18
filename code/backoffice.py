@@ -1908,6 +1908,43 @@ def _signin_held(ledger_text):
     return held
 
 
+def _browser_alive_findings(f, rec, now=None):
+    """Rule 37e browser-wedged (memo spark-browser-wedged-unnoticed, 2026-11-18). `rec` is
+    state/browser_alive.json, written every 15 min by healthcheck.sh's `browser.py alive --heal`, which
+    restarts a wedged Chrome itself. What reaches the janitor is what that heal could not do:
+      * high `browser-wedged`: new tabs still do not answer after its restart (or the 3-a-day cap);
+      * med `browser-reads-timing-out`: the tab probe passes, yet the newest 3+ reads in a row timed out;
+      * med `browser-alive-silent`: no record, or none in 2 h — the probe itself stopped (inert).
+    Filed, never a push of its own (QUIET_KINDS)."""
+    now = time.time() if now is None else now
+    if not isinstance(rec, dict) or not rec.get("checked_at"):
+        _finding(f, "browser-wedged", "med", "the Spark browser's tab probe has no record",
+                 "state/browser_alive.json is missing, so nothing proves new tabs still open. healthcheck.sh runs "
+                 "`browser.py alive --heal` every 15 min; run `python3 bin/browser.py alive --dry` and read "
+                 "logs/browser_alive.log.", project="maintenance", key="browser-alive-silent")
+        return
+    age_h = (now - (_iso_ts(rec.get("checked_at")) or 0)) / 3600
+    if age_h > 2:
+        _finding(f, "browser-wedged", "med", "the Spark browser's tab probe has been silent for over 2 hours",
+                 f"state/browser_alive.json was last written {rec.get('checked_at')} ({age_h:.0f} h ago). healthcheck.sh "
+                 "runs `browser.py alive --heal` every 15 min unless port 9222 is paused; read logs/browser_alive.log "
+                 "and logs/healthcheck.log.", project="maintenance", key="browser-alive-silent")
+        return
+    if not rec.get("ok") and str(rec.get("verdict", "")).startswith("wedged"):
+        _finding(f, "browser-wedged", "high", "the Spark browser is wedged: new tabs do not answer, and a restart did not cure it",
+                 f"Failing since {rec.get('failing_since')}; verdict {rec.get('verdict')}; {str(rec.get('detail'))[:240]}. "
+                 "Every browser.py read, capture and download fails until it is fixed. Look at "
+                 "`journalctl --user -u maintenance-browser -n 100` and the profile's disk use; "
+                 "`systemctl --user restart maintenance-browser-display maintenance-browser` restarts the screen too.",
+                 project="maintenance", key="browser-wedged")
+    elif rec.get("ok") and int(rec.get("read_error_streak") or 0) >= 3:
+        _finding(f, "browser-wedged", "med",
+                 f"{rec['read_error_streak']} Spark browser reads in a row timed out while new tabs still open",
+                 "The tab probe passes, so Chrome answers, yet the newest reads in state/browser_reads.jsonl all ended "
+                 "'no answer in Ns'. Look at which sites and callers; a heavy page or a site that hangs the renderer "
+                 "is the likely cause.", project="maintenance", key="browser-reads-timing-out")
+
+
 def _browser_signin_findings(f, state, sites_cfg, held=None):
     """Rule browser-signin (memo browser-signin-needs-attention ask 1): a site the Spark browser was
     signed in to once (`signed_in_once`) that `browser.py daily` now reads as logged_out or
@@ -2965,6 +3002,7 @@ QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe",
                "experiment-no-driver",  # rule 46: the design memo reaches David as memos do today, no new push
                "diligence-unkept",  # rule 37c (2026-10-30): filed, never a push of its own
                "upload-unfiled",  # rule 37d (2026-11-02): filed, never a push of its own
+               "browser-wedged",  # rule 37e (2026-11-18): filed, never a push of its own
                "spawn-unwrapped"}  # rule 32b (armed 2026-11-09): high, filed, never a push of its own
 
 
@@ -4370,6 +4408,14 @@ def audit(c=None):
         _finding(f, "browser-signin", "low", "the browser-signin rule could not run",
                  f"{type(e).__name__}: {str(e)[:160]}. It reads state/browser.json and config/browser_sites.json.",
                  project="maintenance", key="browser-signin-unread")
+    # 37e. browser-wedged (2026-11-18, memo spark-browser-wedged-unnoticed): what healthcheck's
+    #      `browser.py alive --heal` could not cure, or the probe gone silent. Filed, never pushed (QUIET_KINDS).
+    try:
+        _browser_alive_findings(f, load(os.path.join(STATE, "browser_alive.json"), None))
+    except Exception as e:
+        _finding(f, "browser-wedged", "low", "the browser-wedged rule could not run",
+                 f"{type(e).__name__}: {str(e)[:160]}. It reads state/browser_alive.json.",
+                 project="maintenance", key="browser-wedged-unread")
     # 37c. diligence-unkept (2026-10-30, memo stocks-diligence-saved-offline-boxwide slice 3/4): a licensed-site read
     #      in browser_reads.jsonl with no kept file after it. Filed, never pushed (QUIET_KINDS).
     try:
@@ -7156,6 +7202,23 @@ def selftest():
                                                            ("browser-signin:maintenance:wsj", "med")]
               and any(x["title"] == "the Spark browser is signed out of Canvas (HBS)" for x in fbr)
               and any(x["title"].endswith("signed out of wsj") for x in fbr), [(x["key"], x["title"]) for x in fbr])
+        # 37e browser-wedged (2026-11-18): what the 15-min heal could not cure, or the probe gone quiet
+        _iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds")
+        fw = []
+        _browser_alive_findings(fw, {"checked_at": _iso(N - 600), "ok": True, "verdict": "healed"}, now=N)
+        _browser_alive_findings(fw, {"checked_at": _iso(N - 600), "ok": True, "verdict": "ok", "read_error_streak": 2}, now=N)
+        check("browser-wedged: healed, ok, or 2 timed-out reads -> nothing", fw == [], fw)
+        _browser_alive_findings(fw, {"checked_at": _iso(N - 600), "ok": False, "verdict": "wedged-after-restart",
+                                     "failing_since": _iso(N - 3600), "detail": "Page.enable: no answer in 20s"}, now=N)
+        _browser_alive_findings(fw, {"checked_at": _iso(N - 600), "ok": True, "verdict": "ok", "read_error_streak": 4}, now=N)
+        _browser_alive_findings(fw, {"checked_at": _iso(N - 3 * 3600), "ok": True, "verdict": "ok"}, now=N)
+        _browser_alive_findings(fw, None, now=N)
+        check("browser-wedged: uncured wedge high; read streak, silent probe and no record med; all quiet",
+              [(x["key"], x["sev"]) for x in fw] == [("browser-wedged:maintenance:browser-wedged", "high"),
+                                                     ("browser-wedged:maintenance:browser-reads-timing-out", "med"),
+                                                     ("browser-wedged:maintenance:browser-alive-silent", "med"),
+                                                     ("browser-wedged:maintenance:browser-alive-silent", "med")]
+              and "browser-wedged" in QUIET_KINDS, [(x["key"], x["sev"]) for x in fw])
         fbr = []
         _browser_signin_findings(fbr, {"sites": {"onefinnet": {"state": "logged_out", "signed_in_once": False}}}, {})
         _browser_signin_findings(fbr, {}, {})

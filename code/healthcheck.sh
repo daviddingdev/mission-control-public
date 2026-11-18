@@ -645,6 +645,15 @@ chkts 8911 HBSCaseworkHTTPS
 chk 9222 SparkBrowser
 chk 6080 SparkBrowserView
 chkts 8912 SparkBrowserHTTPS
+# A WEDGED Chrome still answers /json/version, so chk 9222 stays green (11-17 10:51Z -> 11-18 02:18Z: every
+# read timed out on Page.enable for ~15 h while every unit read active). `browser.py alive` opens a real tab;
+# two failed looks with DevTools up = wedged, and --heal restarts maintenance-browser (never twice in 30 min,
+# 3 a day) and looks again. Never in FAIL and never a push: a wedge the restart did not cure is the janitor's
+# finding (rule browser-wedged, from state/browser_alive.json). Memo spark-browser-wedged-unnoticed, 2026-11-18.
+if ! python3 bin/paused.py port 9222 >/dev/null 2>&1; then
+  if [ -n "${HEALTHCHECK_DRY:-}" ]; then timeout 300 python3 bin/browser.py alive --dry || true
+  else timeout 300 python3 bin/browser.py alive --heal >> logs/browser_alive.log 2>&1 || true; fi
+fi
 chk 8790 JustinDesk localhost 403
 chk 19999 Netdata
 curl -sf -m 5 -o /dev/null "http://127.0.0.1:11434/api/tags" || FAIL+=("ollama(:11434)")   # local AI is production now (sentinel/digest/scoring depend on it)
