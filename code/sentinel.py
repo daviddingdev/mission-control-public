@@ -406,7 +406,14 @@ def main():
         subprocess.run([f"{HOME}/maintenance/bin/notify.sh", "alerts",
                         "Sentinel (local model)", msg], timeout=30)
         print(f"{time.strftime('%F %T')} ALERT: {msg}")
-    elif not back:
+    if fresh or back:
+        # The run's own verdict goes last (2026-11-19, decision:03bc420d): an ALERT or RECOVERED
+        # line relays OTHER jobs' failures, and as the log's last line it read as the sentinel
+        # failing ("Anomaly sentinel failed" on Needs attention). Same rule as the janitor's
+        # `pass done:` line. A crash still ends the log with its traceback.
+        print(f"{time.strftime('%F %T')} done: {len(fresh)} paged, {len(back)} recovered "
+              f"({len(issues)} known/cooldown{f', {len(dropped)} page(s) dropped' if dropped else ''})")
+    else:
         print(f"{time.strftime('%F %T')} clear ({len(issues)} known/cooldown"
               f"{f', {len(dropped)} page(s) dropped' if dropped else ''})")
 
@@ -474,8 +481,9 @@ def _selftest(target=None):
             t.PAGED_STATE = os.path.join(tmp, f"paged{n}.json")
             t.NOTIFY_LOG = os.path.join(tmp, "no-notifications.jsonl")
             sys.argv = ["sentinel.py"]
+            out = io.StringIO()
             try:
-                with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stdout(out):
                     t.main()
             finally:
                 sys.argv = argv
@@ -484,9 +492,12 @@ def _selftest(target=None):
             paged = any("alerts" in c for c in calls)
             held = any("--tier" in c and "digest" in c for c in calls)
             stamped = key in json.load(open(os.path.join(tmp, f"sentinel{n}.json")))
-            good = paged == want_page and stamped == want_page and held == want_held
+            # the log's last line is the run's own verdict, never a relayed ALERT (decision:03bc420d)
+            last = ([l for l in out.getvalue().splitlines() if l.strip()] or [""])[-1]
+            own = bool(re.match(r"^\S+ \S+ (done: \d+ paged|clear \()", last))
+            good = paged == want_page and stamped == want_page and held == want_held and own
             print(f"{'PASS' if good else 'FAIL'}  {name}: paged={paged} held={held} "
-                  f"cooldown={stamped} (want paged={want_page})")
+                  f"cooldown={stamped} last-line-own-verdict={own} (want paged={want_page})")
             bad += [] if good else [name]
         bad += _selftest_dedupe(t, tmp, saved)
     for label, a, want in (("argv: the cron line, --dry, --dry-run and selftest are the modes",

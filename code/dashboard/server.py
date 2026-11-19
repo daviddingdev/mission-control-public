@@ -1078,7 +1078,7 @@ KNOWN_PORTS = {
     8910: ("HBS casework dashboard", "hbs"), 8790: ("Justin desk — advised book paper mode", "Stocks"),
     19999: ("Netdata monitoring", "system"), 445: ("Samba", "system"), 139: ("Samba NetBIOS", "system"), 631: ("CUPS printing", "system"),
     3493: ("NUT / UPS daemon", "system"), 4317: ("OpenTelemetry", "system"),
-    8125: ("StatsD (netdata)", "system"), 51820: ("WireGuard (tailscale)", "system"),
+    8125: ("StatsD (netdata)", "system"), 19938: ("netdata internal listener (2.12, loopback)", "system"), 51820: ("WireGuard (tailscale)", "system"),
     53: ("DNS", "system"), 11434: ("ollama — local AI models", "Mission Control"),
     11000: ("NVIDIA DGX Dashboard (vendor)", "system"),
     8090: ("Poker App Store build (pokerapp.service)", "poker-appstore"),

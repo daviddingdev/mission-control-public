@@ -347,20 +347,57 @@ def _listening_ports():
     return sorted(out)
 
 
-def _port_owners():
-    """{port: {pid, cwd, cmd, started, all_ifaces}} for the listening sockets this user owns (`ss -tlnp`
-    shows the pid of our own processes without sudo). What turns "port 8911 is listening" into "an
-    hbs worktree's test dashboard has listened on every interface since 09-21" — and names the
-    project, so the finding reaches its inbox instead of waiting on Mission Control's list."""
+def _ss_owner_lines(text):
+    """`ss -ltnpe` text -> {port: {pid?, uid?, unit?, all_ifaces}}. Pure, so the selftest pins it.
+    `users:((...pid=N...))` shows only for this user's own processes; `uid:` and `cgroup:` (from -e)
+    show for every socket, so a listener run as another user (netdata, uid 982, port 19938: five
+    days "unidentified", 2026-11-19) still names its systemd unit."""
     out = {}
-    for line in (sh(["ss", "-tlnp"]) or "").splitlines()[1:]:
-        m = re.search(r"\s(\S+):(\d+)\s", line)
-        pm = re.search(r"pid=(\d+)", line)
-        if not m or not pm:
+    for line in (text or "").splitlines():
+        if not line.startswith("LISTEN"):
             continue
-        port, pid = int(m.group(2)), int(pm.group(1))
-        o = out.setdefault(port, {"pid": pid, "all_ifaces": False})
+        m = re.search(r"\s(\S+):(\d+)\s", line)
+        if not m:
+            continue
+        port = int(m.group(2))
+        o = out.setdefault(port, {"all_ifaces": False})
         o["all_ifaces"] = o["all_ifaces"] or m.group(1) in ("0.0.0.0", "*", "[::]")
+        pm = re.search(r"pid=(\d+)", line)
+        if pm and "pid" not in o:
+            o["pid"] = int(pm.group(1))
+        um = re.search(r"\buid:(\d+)", line)
+        if um and "uid" not in o:
+            o["uid"] = int(um.group(1))
+        cm = re.search(r"\bcgroup:(\S+)", line)
+        if cm and "unit" not in o:
+            leaf = [x for x in cm.group(1).split("/") if x]
+            units = [x for x in leaf if x.endswith((".service", ".scope", ".socket"))]
+            if units:
+                o["unit"] = units[-1]
+    return out
+
+
+def _port_who(o):
+    """Rule 5's owner phrase: the process when we can see it, else the systemd unit ss names."""
+    if o.get("cmd") and o.get("cwd"):
+        return (f"{o['cmd']} (pid {o['pid']}, in {o['cwd'].replace(HOME, '~')}"
+                + (f", running since {dt_from(o['started'])[:10]}" if o.get("started") else "") + ")")
+    if o.get("unit"):
+        return f"listened on by {o['unit']}" + (f" (uid {o['uid']})" if o.get("uid") is not None else "")
+    return ""
+
+
+def _port_owners():
+    """{port: {pid, cwd, cmd, started, all_ifaces, uid, unit}} for every listening socket. `ss -ltnpe`
+    shows the pid of our own processes without sudo, and the uid and cgroup unit of everyone's. What
+    turns "port 8911 is listening" into "an hbs worktree's test dashboard has listened on every
+    interface since 09-21" — and names the project, so the finding reaches its inbox instead of
+    waiting on Mission Control's list. A port another user holds keeps its unit (2026-11-19)."""
+    out = _ss_owner_lines(sh(["ss", "-ltnpe"]) or "")
+    for port, o in out.items():
+        pid = o.get("pid")
+        if not pid:
+            continue
         try:
             o["cwd"] = os.readlink(f"/proc/{pid}/cwd")
             o["cmd"] = " ".join(open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace")
@@ -576,7 +613,16 @@ def _experiments_state():
                         item["evidence"] = row.strip()[:400]
                         out["landed"].append(item)
                         break
+            # already parked as David's question (a `needs-david [<class>]` row citing the design
+            # memo): the ledger and his lead's home carry it, so it is not a second "stalled" item
+            # (2026-11-19: the broker-guard onFailure memo sat 33 d as a duplicate of its [guard] row)
             if item["memo"] and item not in out["landed"]:
+                stem = re.sub(r"^\d{4}-\d{2}-\d{2}_", "",
+                              os.path.basename(item["memo"]).replace(".md", ""))
+                if stem and any(stem in row and re.search(r"needs-david \[[a-z-]+\]", row)
+                                for row in ledger.splitlines()):
+                    item["parked"] = True
+                    continue
                 age = (time.time() - (st.get("started") or time.time())) / 86400
                 out["memo_waiting"].append({**item, "days": round(age, 1)})
     except Exception as e:
@@ -2082,12 +2128,13 @@ def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_
                     continue
                 if sz in sizes:
                     cands.setdefault(sz, []).append(q)
-    seen, unfiled = {}, []
+    seen, unfiled, up_sha = {}, [], {}
     for chat, q, sz in ups:
         try:
             hu = sha(q)
         except OSError:
             continue
+        up_sha[q] = hu
         hit = False
         for c in cands.get(sz, ()):
             if c not in seen:
@@ -2103,24 +2150,38 @@ def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_
     if not unfiled:
         return
     kn = {str(x).lower() for x in keep_never or ()}
-    owners, act, held_s, held_n = {}, [], [], 0
-    for chat, q in unfiled:
+    by_sha = {}                                                # sha -> {chat}: every aged upload, filed or not
+    for chat, q, _sz in ups:
+        if q in up_sha:
+            by_sha.setdefault(up_sha[q], set()).add(chat)
+    owners, act, held_s, held_n, held_t = {}, [], [], 0, 0
+
+    def owner(chat):
         if chat not in owners:
             try:
                 owners[chat] = _upload_chat_owner(chat, projects=projects, home=home,
-                                                  since_ts=min(os.stat(x).st_mtime for c, x in unfiled if c == chat))
-            except OSError:
+                                                  since_ts=min(os.stat(x).st_mtime for c, x, _ in ups if c == chat))
+            except (OSError, ValueError):
                 owners[chat] = None
-        o = owners[chat]
+        return owners[chat]
+    for chat, q in unfiled:
+        o = owner(chat)
         if o and o.lower() in kn:
             held_n += 1
         elif o and o.lower() == "stocks":
             held_s.append(os.path.basename(q))
+        elif kn and any((owner(t) or "").lower() in kn for t in sorted(by_sha.get(up_sha.get(q), ()) - {chat})):
+            # a byte-identical copy was uploaded to a chat under an NDA folder (memo
+            # maintenance_lead-work-upload-nda-twin, 2026-11-19: IMG_2493/95/96 routed "-> hbs" while their twins
+            # sat in an NDA chat). Never routed, never named: only the NDA folder's own session files it.
+            held_t += 1
         else:
             act.append((chat, q, o))
     held = "; ".join(x for x in (f"{len(held_s)} from a Stocks session, held while Stocks is frozen ({', '.join(held_s[:3])})"
                                  if held_s else "", f"{held_n} from a folder kept apart under an NDA, which only its own "
-                                 "session files" if held_n else "") if x)
+                                 "session files" if held_n else "",
+                                 f"{held_t} byte-identical to an upload in an NDA folder's chat, never routed elsewhere"
+                                 if held_t else "") if x)
     held = f" held: {held}." if held else ""
     if not act:
         return
@@ -2879,7 +2940,7 @@ EXPECTED_GITHUB = os.path.join(CONFIG, "expected_github.json")
 POSTURE = os.path.join(STATE, "posture.json")
 POSTURE_GH_EVERY_S = 3600
 POSTURE_EPHEMERAL = 30000          # a listener at or above this with no pid of ours is someone else's ephemeral
-PORT_IGNORE = {53, 631, 5355, 11000, 19999, 3493, 4317, 8125, 22, 41641, 5353}   # rule 5's quiet list
+PORT_IGNORE = {53, 631, 5355, 11000, 19999, 19938, 3493, 4317, 8125, 22, 41641, 5353}   # rule 5's quiet list
 
 
 def _rule5_reports(port, d):
@@ -3129,9 +3190,7 @@ def audit(c=None):
             proj = _project_of((o.get("cwd") or "") + "/") if o.get("cwd") else ""
             if proj in ("maintenance", "home"):
                 proj = ""
-            who = (f"{o['cmd']} (pid {o['pid']}, in {o['cwd'].replace(HOME, '~')}"
-                   + (f", running since {dt_from(o['started'])[:10]}" if o.get("started") else "") + ")"
-                   if o.get("cmd") and o.get("cwd") else "")
+            who = _port_who(o)
             wide = bool(o.get("all_ifaces"))
             _finding(f, "port-undeclared", "high" if wide and proj else "med",
                      f"port {port} is listening but undeclared",
@@ -7175,6 +7234,21 @@ def selftest():
         check("posture: a gh failure is a note, never a finding",
               bad["repos"] is None and bad["keys"] is None and len(bad["notes"]) == 2
               and _posture(bad, exp, [], []) == [], bad)
+        own = _ss_owner_lines(
+            "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+            "LISTEN 0 4096 127.0.0.1:19938 0.0.0.0:* uid:982 ino:37603 sk:1001 cgroup:/system.slice/netdata.service <->\n"
+            "LISTEN 0 5 0.0.0.0:8900 0.0.0.0:* users:((\"python3\",pid=4242,fd=3)) uid:1000 ino:9 sk:2 "
+            "cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/maintenance-dashboard.service <->\n"
+            "LISTEN 0 5 [::]:8900 [::]:* users:((\"python3\",pid=4242,fd=4)) uid:1000 ino:10 sk:3 <->\n")
+        check("ports: an ss -e line without users: still names its unit and uid (netdata 19938)",
+              own.get(19938) == {"all_ifaces": False, "uid": 982, "unit": "netdata.service"}, own.get(19938))
+        check("ports: a line with users: keeps its pid, the user unit, and every-interface from either line",
+              own.get(8900) == {"all_ifaces": True, "pid": 4242, "uid": 1000,
+                                "unit": "maintenance-dashboard.service"}, own.get(8900))
+        check("ports: rule 5 names a unit when the pid is not visible, and the process when it is",
+              _port_who(own[19938]) == "listened on by netdata.service (uid 982)"
+              and _port_who({"pid": 1, "cmd": "x", "cwd": HOME + "/hbs"}) == "x (pid 1, in ~/hbs)"
+              and _port_who({}) == "", _port_who(own[19938]))
         check("posture: rule 5's predicate (the shared quiet list, below 1024 and ephemeral skipped)",
               _rule5_reports(9555, {"known_ports": [], "infra_ports": []})
               and not _rule5_reports(22, {}) and not _rule5_reports(40000, {})
@@ -7319,6 +7393,18 @@ def selftest():
             fup = []
             _upload_unfiled_findings(fup, uploads=_u2, homes=[], now_ts=_T, keep_never=["bidart"], projects=_cp, home=_td)
             check("upload-unfiled: nothing but held uploads -> no finding (the rule closes)", fup == [], fup)
+            for _c, _n, _b in (("local_t", "IMG_9001.HEIC", b"local_n" * 3), ("local_t", "note.pdf", b"twin-free")):
+                os.makedirs(os.path.join(_u2, _c), exist_ok=True)
+                _w(os.path.join(_u2, _c, _n), _b, 30 * 3600)
+            _tx("-x-hbs", "e.jsonl", [{"timestamp": "2026-11-06T10:00:00Z", "cwd": os.path.join(_td, "hbs"),
+                                       "message": "uploads/local_t/IMG_9001.HEIC"}])
+            fup = []
+            _upload_unfiled_findings(fup, uploads=_u2, homes=[], now_ts=_T, keep_never=["bidart"], projects=_cp, home=_td)
+            _dt = fup[0]["detail"] if fup else ""
+            check("upload-unfiled: a file whose sha256 also sits in an NDA-folder chat is held, not routed (the hbs chat's "
+                  "twin is never named); its twin-free neighbour still counts -> hbs",
+                  [x["title"].split()[0] for x in fup] == ["1"] and "note.pdf (-> hbs)" in _dt
+                  and "1 byte-identical to an upload in an NDA folder's chat" in _dt and "IMG_9001" not in _dt, fup)
         check("upload-unfiled: filed, never pushed (QUIET_KINDS)", "upload-unfiled" in QUIET_KINDS)
         fdc = []
         _dash_check_finding(fdc, {"ok": False, "at": "2026-10-05T08:29:47Z", "rc": 1,
