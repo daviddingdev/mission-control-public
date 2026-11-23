@@ -17,7 +17,7 @@ sys.path.insert(0, f"{HOME}/maintenance/dashboard")
 from localllm import ask
 import server
 
-REPOS = ["Stocks", "clientco-db", "poker", "maintenance"]
+REPOS = ["Stocks", "clientco-db", "poker-appstore", "maintenance"]   # poker retired 2026-11-22 -> Pocket Tells
 
 
 def tail(path, n=120):

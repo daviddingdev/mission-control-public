@@ -646,8 +646,8 @@ def _diagram_state():
         cfg = load(os.path.join(CONFIG, "public_repos.json"), {})
         for name, spec in cfg.get("projects", {}).items():
             src = os.path.join(MC, "public", spec["repo"])
-            if not os.path.isdir(src):
-                continue
+            if not os.path.isdir(src) or not os.path.isdir(os.path.join(HOME, name)):
+                continue        # a retired project (poker, 2026-11-22) has no tree to check its diagrams against
             # everything the project actually contains, by basename
             real = set()
             for base, dirs, files in os.walk(os.path.join(HOME, name)):
@@ -1193,6 +1193,10 @@ ARMED_CHECKS = (
      "requires": ("bin/drive_feed.py",),
      "titles": ("the Drive feed's selftest fails — a page could reach Drive unscanned",
                 "the Drive feed is not armed — {}")},
+    {"id": "pt-budget-guard", "control": "Pocket Tells ad budget cap", "layer": "preventive", "standard": "—",
+     "check": "`budget_guard.js --armed` (poker-appstore)",
+     "requires": (),
+     "titles": ("the Pocket Tells ad budget guard is not armed — {}",)},
     {"id": "sentinel", "control": "sentinel page recheck", "layer": "detective",
      "standard": "—", "check": "`sentinel.py selftest`", "requires": ("bin/sentinel.py",),
      "titles": ("sentinel selftest fails — it can page on a job that already recovered",)},
@@ -1446,6 +1450,9 @@ def _owner_findings(f, things, status_rows, agents):
             continue
         r = on_disk.get(slug)
         name = (r or {}).get("dir") or slug
+        if r is None and slug and os.path.isdir(os.path.join(HOME, "archive", slug)) \
+                and all(t.get("what") == "queue job" for t in ts):
+            continue        # a retired project's past queue runs (poker, 2026-11-22): history that ages out of the 30-day window
         if r is None and slug != "maintenance":
             _finding(f, "owner-missing", "med", f"{len(ts)} automated thing(s) belong to '{slug}', which is no project on disk",
                      "Single-threaded owner (HOME.md box rule 10): a thing's project must be a top-level project "
@@ -2072,7 +2079,7 @@ def _upload_chat_owner(chat, projects=CLAUDE_PROJECTS, since_ts=None, home=HOME)
 
 
 def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_h=24, keep_never=(),
-                             projects=CLAUDE_PROJECTS, home=HOME):
+                             projects=CLAUDE_PROJECTS, home=HOME, on_keys=()):
     """Rule upload-unfiled (memo hbs-file-every-chat-upload, 2026-11-01; David: "any uploaded file into a chat ...
     should be saved in relevant folders in spark"). A desktop-app upload lands in ~/.claude/uploads/local_<chat>/ and
     is the only copy until a session files it (a COPY, never a move: the app owns that folder). An upload older than
@@ -2084,7 +2091,9 @@ def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_
     walked to the project of the session that first quoted it (_upload_chat_owner), and one from a Stocks session
     (held while Stocks is frozen, like every Stocks repeat) or from a folder kept apart under an NDA (`keep_never`:
     only its own session files it) is HELD: named in the detail's `held:` clause, never counted. Nothing but held
-    files -> no finding. An actionable one says where it goes ("-> hbs")."""
+    files -> no finding. An actionable one says where it goes ("-> hbs"). A credential upload whose value went to
+    Box › Keys is filed there (`on_keys`: the sha256s `keys.py note-upload` logged; memo
+    maintenance-upload-rule-credential-files, 2026-11-22): a secret never gets copied into a project tree."""
     import hashlib
     now_ts = now_ts or time.time()
 
@@ -2135,7 +2144,7 @@ def _upload_unfiled_findings(f, uploads=UPLOADS_DIR, homes=(), now_ts=None, age_
         except OSError:
             continue
         up_sha[q] = hu
-        hit = False
+        hit = hu in on_keys
         for c in cands.get(sz, ()):
             if c not in seen:
                 try:
@@ -4376,6 +4385,27 @@ def audit(c=None):
                  "+ push.json; `python3 ~/maintenance/bin/drive_feed.py armed` says the same in one line.",
                  project="maintenance", key="drive-feed-unarmed")
 
+    # 31c. the Pocket Tells ad budget guard (2026-11-23, memo poker-appstore-growth-lead-budget-guard ask 2; David
+    #      2026-11-22: poker_appstore_lead spends on ads inside a monthly cap). The lead runs `--armed` nightly; this
+    #      finds a dead guard on a night it does not. Exit 1 = NOT ARMED (one line per failing check); a missing
+    #      script or node is said plainly, never silently passed.
+    _pbg = os.path.join(HOME, "poker-appstore", "marketing", "ops", "budget_guard.js")
+    if os.path.exists(_pbg):
+        try:
+            _pr = subprocess.run(["node", _pbg, "--armed"], capture_output=True, text=True, timeout=60)
+            _pw = "" if _pr.returncode == 0 else ("; ".join(l.strip() for l in _pr.stdout.splitlines()
+                                                           if l.startswith(("FAIL", "fail", "NOT", "no "))) or
+                                                f"exit {_pr.returncode}")[:240]
+        except (OSError, subprocess.TimeoutExpired) as e:
+            _pw = f"`budget_guard.js --armed` could not run ({type(e).__name__})"
+        if _pw:
+            _finding(f, "guardrail-inert", "high", f"the Pocket Tells ad budget guard is not armed — {_pw}",
+                     "poker_appstore_lead spends on Meta ads inside the monthly cap in marketing/ops/budget.json; the "
+                     "04:05Z `budget_guard.js --live` measures spend and pauses every campaign at 100%. Run "
+                     "`node ~/poker-appstore/marketing/ops/budget_guard.js --armed` (no network, writes nothing) for "
+                     "the failing checks. The guard is poker-appstore's: the fix goes to its lead.",
+                     project="poker-appstore", key="pt-budget-guard-unarmed")
+
     # 32. cli-stale (2026-10-04, memo wa-cli-currency ask 3): the headless CLI pin lagging David's
     #     interactive sessions. Low and quiet (QUIET_KINDS); the core is _cli_stale(), pure.
     try:
@@ -4505,7 +4535,12 @@ def audit(c=None):
         except Exception:
             _kn = ["bidart"]
         _homes += [os.path.join(HOME, x) for x in _kn]
-        _upload_unfiled_findings(f, homes=[h for h in _homes if os.path.isdir(h)], keep_never=_kn)
+        try:
+            import keys as _keys
+            _onk = _keys.uploads_on_keys()
+        except Exception:
+            _onk = set()
+        _upload_unfiled_findings(f, homes=[h for h in _homes if os.path.isdir(h)], keep_never=_kn, on_keys=_onk)
     except Exception as e:
         _finding(f, "upload-unfiled", "low", "the upload-unfiled rule could not run",
                  f"{type(e).__name__}: {str(e)[:160]}. It reads ~/.claude/uploads and every project folder.",
@@ -7352,6 +7387,13 @@ def selftest():
                   [(x["key"], x["sev"], x["title"].split()[0]) for x in fup]
                   == [("upload-unfiled:maintenance:upload-unfiled", "med", "1")] and "lost.pdf" in fup[0]["detail"]
                   and "filed.pdf" not in fup[0]["detail"].replace("lost.pdf", ""), fup)
+            import hashlib as _hl
+            fup = []
+            _upload_unfiled_findings(fup, uploads=os.path.join(_td, "uploads"), homes=[os.path.join(_td, "projA"),
+                                     _pb], now_ts=_T, projects=os.path.join(_td, "cproj"), home=_td,
+                                     on_keys={_hl.sha256(b"not filed!").hexdigest()})
+            check("upload-unfiled: a credential upload noted on Box › Keys (keys.py note-upload) is filed -> no finding "
+                  "(memo maintenance-upload-rule-credential-files)", fup == [], fup)
             fup = []
             _upload_unfiled_findings(fup, uploads=os.path.join(_td, "nope"), homes=[], now_ts=_T,
                                      projects=os.path.join(_td, "cproj"), home=_td)

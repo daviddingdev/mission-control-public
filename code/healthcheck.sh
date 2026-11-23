@@ -350,7 +350,7 @@ dash_plan(){
 # must be empty. Any entry, top-level or in a foreground session, is a FAIL (the outage push, on state
 # change), and a live run turns each top-level one off (`tailscale funnel --https=<port> off`; the old
 # `funnel <port> off` form errors on 1.104.5) and then puts back that port's tailnet-only serve front
-# from the snapshot, so the phone app's :443 survives. Every run writes state/funnel.json (the
+# from the snapshot, so each tailnet HTTPS front survives. Every run writes state/funnel.json (the
 # back office's armed-check: older than an hour = the watch is not running).
 # FUNNEL_APPROVED: "host:port ..." a connector David approved may keep. None today.
 TS_BIN=${TS_BIN:-tailscale}
@@ -629,8 +629,8 @@ chkts(){
 # FamilyVault(:5000) archived 2026-08-08
 chk 8000 ClientCoWiki
 chk 8001 ClientCoApp                # the clientco app, its front door since 10-03 (memo clientco-app-8001)
-chk 8088 Pokerlog <host-ip>   # pokerlog binds the tailscale IP, not localhost
-chkts 443 PokerlogHTTPS            # its tailscale serve front — the phone app's own URL
+# Pokerlog(:8088) + its :443 serve front retired 2026-11-22 with ~/poker (David: "we don't need a
+# poker project, pocket tells is priority"; restart notes in ~/archive/CLAUDE.md)
 # :8090 is the App Store build (pokerapp.service) and :8443 its own HTTPS origin — always-on, how
 # David opens that build on his phone (memo from poker-appstore, 2026-10-02). Same IP binding.
 chk 8090 PokerAppStore <host-ip>
@@ -662,7 +662,6 @@ curl -sf -m 5 -o /dev/null "http://127.0.0.1:11434/api/tags" || FAIL+=("ollama(:
 # an empty report tomorrow. Exit 2 = unservable (alert); exit 1 = running on a fallback (don't).
 python3 bin/models.py check >/dev/null 2>&1; [ $? -ge 2 ] && FAIL+=("local-model-role-unservable")
 
-systemctl --user is-active --quiet pokerlog 2>/dev/null || FAIL+=("pokerlog.service")
 # >>> always-on user units (2026-10-01; one block for :8900 since 2026-09-28). cron = jobs that
 # finish; anything always up is a systemd user unit whose source lives in its project repo and is
 # installed with `systemctl --user link` (PROJECT_STANDARDS §4). Every ENABLED user unit whose
@@ -671,7 +670,7 @@ systemctl --user is-active --quiet pokerlog 2>/dev/null || FAIL+=("pokerlog.serv
 # pool with Ollama and the Stocks model jobs — so `infinity` (an edit or a drop-in that lost the
 # line) is loud. Disabled = its owner rolled back to cron on purpose: stands down. Labels:
 # `<unit>.service` (not active), `<unit>-uncapped`. A unit copied into ~/.config instead of linked
-# is NOT seen (pokerlog's own line above stays). The chk probes above stay: systemd only sees a
+# is NOT seen. The chk probes above stay: systemd only sees a
 # process that exits; a hung one needs the probe. Discovery is itself a guardrail: if it misses
 # maintenance-dashboard while that unit is enabled, it is inert and says so.
 UNITS_SEEN=()
@@ -846,9 +845,19 @@ python3 bin/backup.py check >/dev/null 2>&1 || FAIL+=("backup-stale")
 # Cloudflare with a 2-second ceiling: at ≥1 MB/s the transfer completes in time; below
 # that (the wlP9s9 link fell to 28 KB/s for 19 days from 09-03 unnoticed) it times out.
 # DNS + TLS setup on a good link costs well under the 2-second budget.
-curl -sf -m 2 -o /dev/null \
-  "https://speed.cloudflare.com/__down?bytes=1000000" 2>/dev/null \
-  || FAIL+=("download-slow(<1MB/s)")
+# Two slow probes in a row (30 min) before it fails (2026-11-22): a single slow probe that passed on
+# the next run came and went all week, and each come-and-go re-sent the whole DOWN list while
+# remote-control-auth stood (38 "Spark health" pushes 11-15..22). A link that is really slow (the
+# 19-day case above) still fails on its second run. The count is state/download_slow.count, the same
+# pattern as state/dash_hang.count; --dry reads it and writes nothing.
+DS_RUNS=2
+if curl -sf -m 2 -o /dev/null "https://speed.cloudflare.com/__down?bytes=1000000" 2>/dev/null; then
+  _dsn=0
+else
+  _dsn=$(cat state/download_slow.count 2>/dev/null); _dsn=${_dsn//[^0-9]/}; _dsn=$(( ${_dsn:-0} + 1 ))
+fi
+[ -n "${HEALTHCHECK_DRY:-}" ] || echo "$_dsn" > state/download_slow.count
+[ "$_dsn" -ge "$DS_RUNS" ] && FAIL+=("download-slow(<1MB/s)")
 
 # The dead-box alarm: what to do this run (header). A dry run only says.
 NOW_S=$(date +%s)

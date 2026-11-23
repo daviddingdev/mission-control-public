@@ -1071,9 +1071,9 @@ def cron_jobs():
 # ---------- ports ----------
 
 KNOWN_PORTS = {
-    22: ("SSH", "system"), 443: ("tailscale serve HTTPS → poker app", "poker"),
+    22: ("SSH", "system"),
     8000: ("clientco wiki (static build from 10-07)", "clientco-db"), 8001: ("clientco app: numbers, lead desk, raw books", "clientco-db"),
-    8088: ("Poker app (pokerlog.service, tailscale HTTPS)", "poker"),
+    # 443 (tailscale serve → poker app) and 8088 (pokerlog.service) retired 2026-11-22 with ~/poker
     8787: ("Stocks dashboard", "Stocks"), 8900: ("Mission Control (this)", "Mission Control"),
     8910: ("HBS casework dashboard", "hbs"), 8790: ("Justin desk — advised book paper mode", "Stocks"),
     19999: ("Netdata monitoring", "system"), 445: ("Samba", "system"), 139: ("Samba NetBIOS", "system"), 631: ("CUPS printing", "system"),
@@ -3638,6 +3638,10 @@ TT_ROUTES = {
     "/api/team":      ("tt_team", "team"),          # one seat per project lead, ?id= its sheet (2026-10-03)
     "/api/work":      ("tt_work", "work"),          # the team's work: planned → in progress → done (2026-10-04)
     "/api/report":    ("tt_report", "report"),      # the one-page report: moving? your time? talking? (2026-10-05)
+    # the simplified front page (home.html, 2026-11-22): Duet's pages + inbox, who said what, the leads' train
+    "/api/duet":      ("tt_home", "duet"),
+    "/api/comms":     ("tt_home", "comms"),
+    "/api/train":     ("tt_home", "train"),
 }
 # v2.5: tt_crew.stamp() puts `agent` + `agent_name` on every run these feeds carry — one namer for
 # the desk, the crew, Recent runs and "Last used by"
@@ -4206,7 +4210,7 @@ class H(BaseHTTPRequestHandler):
                            cache="public, max-age=604800, immutable")
             else:
                 self._send(404, b"not found", "text/plain")
-        elif path in ("/", "/index.html") or re.match(r"^/next(/[\w-]+)?/?$", path):
+        elif path in ("/", "/index.html", "/classic", "/classic/") or re.match(r"^/next(/[\w-]+)?/?$", path):
             # Stamp the page with the build it was served from. A tab left open across a
             # deploy keeps polling happily — the header clock stays live — while its
             # JavaScript is hours old, and the first symptom is a panel that quietly does
@@ -4216,8 +4220,12 @@ class H(BaseHTTPRequestHandler):
             # `no-cache` + ETag: the browser keeps the page but asks every time, so an edit to
             # index.html (edited live) is served on the very next load and an unchanged page
             # is a 304 with no body.
+            # 2026-11-22 (David: "simplify heavily"): `/` is home.html, the four-view page (Agents, Duet,
+            # Messages, Schedule); the full page it replaced as the front door stays at /classic (and
+            # /index.html) for the deep tools: catalog, box health, janitor, guardrails, keys, usage.
             m = re.match(r"^/next(?:/([\w-]+))?/?$", path)
             p = (os.path.join(BASE, "next", (m.group(1) or "index") + ".html") if m
+                 else os.path.join(BASE, "home.html") if path == "/"
                  else os.path.join(BASE, "index.html"))
             if not os.path.exists(p):
                 self._send(404, b"not found", "text/plain")
