@@ -41,6 +41,8 @@ STATE=state/health.state
 mkdir -p state
 FAIL=()
 WARN=()    # heads-ups, not outages: pushed once through notify.sh (end of file), never "DOWN"
+SOFT=()    # needs a look, never paged (2026-11-25): the hourly Duet `Spark — status` page reads $SOFT_STATE
+SOFT_STATE=state/health.soft
 
 # >>> dead-box alarm (see the header). Functions first, so `selftest` runs them on a stub.
 DM_STATE=${DM_STATE:-state/deadman.json}   # {"at": last good arm, "due": when ntfy delivers it}
@@ -327,6 +329,45 @@ ups_step(){ # <now> <boot>: read the UPS, push what changed, move the told state
 }
 # <<< UPS power
 
+# >>> UPS battery health (2026-11-25, David at the box: "Yes, add both"). A sealed lead-acid battery ages on
+# float charge even if it never runs the box (3-5 years), and the UPS says so only as `RB` (replace battery) in
+# ups.status or a self-test that ends "warning", "error" or "Aborted". ups_read files both under OL, and before 11-25 no
+# self-test had ever run, so a dead battery would have shown itself only by the box going dark in an outage.
+# - Needs a look, never a page (SOFT, the Duet status page): the box still runs on the wall.
+# - Every UPS_TEST_EVERY (90 d), in the 05:00-11:59Z quiet batch, on line, charged to 100% and not charging:
+#   one quick test (~30 s on battery) through the `selftest` NUT user, whose only grant is
+#   test.battery.start.quick (/etc/nut/upsd.users; password ~/.secrets/nut_selftest, 0600). The next run reads
+#   its result from ups.test.result.
+# - No test on record for UPS_TEST_STALE (120 d) is itself a SOFT item: the armed-check (if the login breaks,
+#   the page says so instead of the tests silently stopping).
+UPS_UPSCMD=${UPS_UPSCMD:-upscmd}
+UPS_TEST_STATE=${UPS_TEST_STATE:-state/ups_selftest.json}
+UPS_TEST_PW=${UPS_TEST_PW:-$HOME/.secrets/nut_selftest}
+UPS_TEST_EVERY=$((90 * 86400)); UPS_TEST_STALE=$((120 * 86400))
+ups_battery(){ # <write 0|1> <now> <UTC hour>: SOFT items on stdout, one per line; starts the test when due (write=1)
+  local out st tr ch last
+  out=$("$UPS_UPSC" cyberpower 2>/dev/null) || return 0
+  st=$(sed -n 's/^ups\.status: //p' <<<"$out"); tr=$(sed -n 's/^ups\.test\.result: //p' <<<"$out")
+  ch=$(sed -n 's/^battery\.charge: //p' <<<"$out")
+  [ -n "$st" ] || return 0
+  last=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("at") or 0))' "$UPS_TEST_STATE" 2>/dev/null)
+  last=${last:-0}
+  if [[ " $st " == *" RB "* ]]; then echo "ups-battery(replace)"
+  elif grep -qiE 'warning|error|fail|abort' <<<"$tr"; then echo "ups-battery(self-test: ${tr// /-})"
+  elif [ $(( $2 - last )) -gt $UPS_TEST_STALE ]; then echo "ups-battery(no self-test in 120 d)"
+  fi
+  [ "$1" = 1 ] || return 0
+  [ $(( $2 - last )) -gt $UPS_TEST_EVERY ] || return 0
+  [ "$3" -ge 5 ] && [ "$3" -le 11 ] && [ "$st" = OL ] && [ "${ch:-0}" = 100 ] || return 0
+  if [ -r "$UPS_TEST_PW" ] && "$UPS_UPSCMD" -u selftest -p "$(cat "$UPS_TEST_PW")" cyberpower test.battery.start.quick >/dev/null 2>&1; then
+    printf '{"at": %s, "by": "healthcheck (quarterly)"}\n' "$2" > "$UPS_TEST_STATE.tmp" && mv "$UPS_TEST_STATE.tmp" "$UPS_TEST_STATE"
+    echo "$(date -Is) UPS: quarterly battery quick test started; the next run reads ups.test.result" >&2
+  else
+    echo "$(date -Is) UPS: quarterly battery test NOT started (the selftest login failed); retried next run" >&2
+  fi
+}
+# <<< UPS battery health
+
 # >>> dashboard hang restart (2026-11-01, memo dashboard-wedged-at-memoryhigh). :8900 sat wedged ~20 h
 # (10-31 → 11-01): the port was up, every request stalled in memory reclaim, and systemd's
 # Restart=always never fired because nothing exited. A hung server is not a dead one, so the probe
@@ -595,6 +636,37 @@ STUB
     "$(funnel_watch 1)|$(grep -vc status "$T/ts/calls")" "tailscale-funnel-OPEN($H:8443)|0"
   echo 'not json' > "$T/ts/status.json"
   ok "funnel: an unreadable status decides nothing (no FAIL)" "$(funnel_watch 1 2>/dev/null)" ""
+  # UPS battery health (2026-11-25): the same stub upsc, a stub upscmd that records its argv and exits
+  # $UPSCMD_RC, a scratch state file and password. Never the real UPS.
+  UPS_UPSCMD=$T/ups/upscmd; UPS_TEST_STATE=$T/ups_selftest.json; UPS_TEST_PW=$T/ups/pw; echo pw > "$UPS_TEST_PW"
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$(dirname "$0")/cmds"\nexit "${UPSCMD_RC:-0}"\n' > "$UPS_UPSCMD"
+  chmod +x "$UPS_UPSCMD"; export UPSCMD_RC=0
+  fxb(){ printf 'battery.charge: %s\nups.status: %s\nups.test.result: %s\n' "$2" "$1" "$3" > "$T/ups/fixture"; UPSC_RC=0; }
+  cmds(){ cat "$T/ups/cmds" 2>/dev/null | grep -c .; }
+  B=$N; printf '{"at": %s}\n' $((B - 10 * 86400)) > "$UPS_TEST_STATE"
+  fxb OL 100 "Done and passed"
+  ok "battery: passed 10 days ago -> nothing to say, no test" "$(ups_battery 1 $B 7 2>/dev/null)|$(cmds)" "|0"
+  fxb "OL RB" 100 "Done and passed"
+  ok "battery: RB in ups.status -> replace" "$(ups_battery 0 $B 7)" "ups-battery(replace)"
+  fxb OL 100 "Done and warning"
+  ok "battery: a self-test that ended in a warning -> needs a look" "$(ups_battery 0 $B 7)" "ups-battery(self-test: Done-and-warning)"
+  fxb OL 100 "Done and error"; ok "battery: NUT's 'Done and error' (the test failed) -> needs a look" "$(ups_battery 0 $B 7)" "ups-battery(self-test: Done-and-error)"
+  fxb OL 100 "Aborted"; ok "battery: an aborted test -> needs a look" "$(ups_battery 0 $B 7)" "ups-battery(self-test: Aborted)"
+  fxb OL 100 "In progress"; ok "battery: a test in progress is not a finding" "$(ups_battery 0 $B 7)" ""
+  rm -f "$UPS_TEST_STATE"; fxb OL 100 "No test initiated"
+  ok "battery: no test on record -> says so (the armed-check)" "$(ups_battery 0 $B 7)" "ups-battery(no self-test in 120 d)"
+  ok "battery: due, but a dry run starts nothing" "$(ups_battery 0 $B 7 >/dev/null; cmds)" 0
+  ok "battery: due, but 14Z is outside the quiet batch" "$(ups_battery 1 $B 14 >/dev/null 2>&1; cmds)" 0
+  fxb "OL CHRG" 97 "No test initiated"
+  ok "battery: due, but charging -> waits" "$(ups_battery 1 $B 7 >/dev/null 2>&1; cmds)" 0
+  fxb OL 100 "No test initiated"; UPSCMD_RC=1
+  ok "battery: the login fails -> no state written, tried again next run" \
+    "$(ups_battery 1 $B 7 >/dev/null 2>&1; cmds; [ -f "$UPS_TEST_STATE" ] && echo written || echo none)" "$(printf '1\nnone')"
+  UPSCMD_RC=0
+  ok "battery: due, 07Z, on line at 100% -> one quick test as the selftest user, state written" \
+    "$(ups_battery 1 $B 7 >/dev/null 2>&1; tail -1 "$T/ups/cmds"; python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["at"])' "$UPS_TEST_STATE")" \
+    "$(printf -- '-u selftest -p pw cyberpower test.battery.start.quick\n%s' $B)"
+  ok "battery: the next run inside 90 days starts nothing more" "$(ups_battery 1 $((B + 900)) 7 2>/dev/null; cmds)" 2
   [ $F -eq 0 ] && echo "ALL PASS" || echo "$F FAILED"
   exit $([ $F -eq 0 ] && echo 0 || echo 1)
 fi
@@ -777,7 +849,7 @@ PYEOF
 # expiry within 72 h = a WARN, pushed once.
 RCA=$(python3 bin/claude-relogin.py check-login 2>/dev/null)
 case "$RCA" in
-  dead:*) FAIL+=("remote-control-auth(needs sign-in)") ;;
+  dead:*) SOFT+=("remote-control-auth(needs sign-in)") ;;
   warn:*) WARN+=("${RCA#warn: }") ;;
 esac
 
@@ -857,7 +929,11 @@ else
   _dsn=$(cat state/download_slow.count 2>/dev/null); _dsn=${_dsn//[^0-9]/}; _dsn=$(( ${_dsn:-0} + 1 ))
 fi
 [ -n "${HEALTHCHECK_DRY:-}" ] || echo "$_dsn" > state/download_slow.count
-[ "$_dsn" -ge "$DS_RUNS" ] && FAIL+=("download-slow(<1MB/s)")
+[ "$_dsn" -ge "$DS_RUNS" ] && SOFT+=("download-slow(<1MB/s)")
+
+# UPS battery health (functions above the selftest): --dry reports and starts no test
+_uw=1; [ -n "${HEALTHCHECK_DRY:-}" ] && _uw=0
+while read -r _ub; do [ -n "$_ub" ] && SOFT+=("$_ub"); done < <(ups_battery "$_uw" "$(date +%s)" "$(date -u +%-H)")
 
 # The dead-box alarm: what to do this run (header). A dry run only says.
 NOW_S=$(date +%s)
@@ -869,6 +945,7 @@ DM_DO=$(dm_plan "$NOW_S" "$DM_AT" "$DM_DUE")
 # against the live box without paging David.
 if [ -n "${HEALTHCHECK_DRY:-}" ]; then
   printf 'FAIL: %s\n' "${FAIL[*]:-none}"
+  printf 'SOFT (status page, never paged): %s\n' "${SOFT[*]:-none}"
   printf 'WARN: %s\n' "${WARN[*]:-none}"
   printf 'remote-control-auth: %s\n' "${RCA:-no answer from check-login}"
   printf 'undelivered alerts spooled: %s (%s; a live run retries them first)\n' \
@@ -915,8 +992,8 @@ if printf '%s\n' "${FAIL[@]}" | grep -q "claude-cli-auth" && \
 # The phone's sign-in takes the same flow in login mode: `claude auth login --claudeai`, verified
 # by `claude auth status`, then the RC host restarted. One state machine and one paste box, so
 # never two flows from one run.
-elif printf '%s\n' "${FAIL[@]}" | grep -q "remote-control-auth" && \
-   ! grep -q "remote-control-auth" <<<"$PREV"; then
+elif printf '%s\n' "${SOFT[@]}" | grep -q "remote-control-auth" && \
+   ! grep -q "remote-control-auth" "$SOFT_STATE" 2>/dev/null; then
   python3 bin/claude-relogin.py start --login >> logs/relogin.log 2>&1 &
 fi
 
@@ -928,6 +1005,14 @@ fi
 
 NOW=$(printf '%s\n' "${FAIL[@]}" | sort)
 hc_report
+
+# Needs a look, never an outage (2026-11-25, David: "Yes, collapse to that"): the phone's Remote Control
+# sign-in and a slow download go on the hourly `Spark — status` page (drive_feed reads this file) and not in a
+# "Spark health DOWN" page: all 83 of those in the 30 days to 11-25 were these two, flapping. The re-auth flow
+# above still starts when the sign-in newly goes (compared with this file, before it is rewritten here).
+_SNOW=$(printf '%s\n' "${SOFT[@]}" | sed '/^$/d' | sort)
+[ "$_SNOW" != "$(cat "$SOFT_STATE" 2>/dev/null)" ] && echo "$(date -Is) needs a look (status page, not paged): ${SOFT[*]:-cleared}"
+printf '%s' "$_SNOW" > "$SOFT_STATE"
 
 # UPS power: on battery, low battery, back on line, the data link (functions above, after hc_report).
 ups_step "$NOW_S" "$(awk '/^btime/{print $2}' /proc/stat)"

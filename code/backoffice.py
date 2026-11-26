@@ -3068,6 +3068,7 @@ QUIET_KINDS = {"queue-starved", "cli-stale", "argv-unsafe",
                "browser-signin", "dashboard-check-red", "push-undelivered", "guard-deny",
                "restore-unproven", "manifest-stale",
                "ledger-order", "weight-drift",  # rules 42-43 (2026-10-05): low, filed, never a push
+               "needs-david-orphan",  # rule 47 (2026-11-26): low, filed, never a push
                "fleet-stop-engaged", "backup-stray",  # rules 44-45: David engaged it / filed, never a push
                "experiment-no-driver",  # rule 46: the design memo reaches David as memos do today, no new push
                "diligence-unkept",  # rule 37c (2026-10-30): filed, never a push of its own
@@ -4581,6 +4582,10 @@ def audit(c=None):
     #     (the repair is ledger_order_repair(), run by _run_pass before audit() when not dry)
     _ledger_order_finding(f, os.path.join(MEMOS, "LEDGER.md"))
 
+    # 47. needs-david-orphan (2026-11-26, memo maintenance_lead-work-messaging-stale-guards slice 1): a row waiting on
+    #     David whose memo is only in processed/. needs_david_orphan_repair() moves it back in _run_pass (not dry).
+    _needs_david_orphan_finding(f)
+
     # 45. backup-stray (2026-10-05, memo wa-backups-integrity slice 4/4): an undeclared file or folder at the
     #     top two levels of ~/backups, newer than the baseline. Stat only.
     try:
@@ -5896,9 +5901,88 @@ def ledger_order_repair(path=None):
     return out
 
 
+# Rule 47 needs-david-orphan (memo maintenance_lead-work-messaging-stale-guards slice 1, 2026-11-26): a LEDGER row still
+# waiting on David (`needs-david [...]`, its current row) whose memo file sits only in processed/. The memo pass never
+# brings it back and the lead never sees it again (3 found in processed/ on 2026-11-25: answer-peer-guard,
+# broker-hook-failclosed, funnel-node-attr). The janitor moves it back with mv -n before audit() and files what it did.
+_ORPHAN_MOVED = []
+
+
+def _needs_david_orphans(memos=None):
+    """[(memo, target slug, processed file name)] for each orphaned needs-david row. The ledger is newest-first, so the
+    first row per memo is its current status. A row targeted at Stocks is held (Stocks is closed), not brought back."""
+    memos = memos or MEMOS
+    try:
+        lines = open(os.path.join(memos, "LEDGER.md"), errors="replace").read().splitlines()
+        processed = os.listdir(os.path.join(memos, "processed"))
+    except OSError:
+        return []
+    inbox_names = set()
+    for root, _dirs, files in os.walk(os.path.join(memos, "inbox")):
+        inbox_names.update(files)
+    seen, out = set(), []
+    for line in lines:
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 7 or not re.match(r"\d{4}-\d{2}-\d{2}$", cells[1]) or not cells[2]:
+            continue
+        memo = cells[2]
+        if memo in seen:
+            continue
+        seen.add(memo)
+        if not re.match(r"\**needs-david \[[a-z-]+\]", cells[5]):
+            continue
+        tgt = (cells[4].split(",")[0].strip().lower() or "").split(" ")[0]
+        if tgt == "stocks" or not tgt:
+            continue
+        pat = re.compile(r"^\d{4}-\d{2}-\d{2}_" + re.escape(memo) + r"(_[a-z0-9-]+)?\.md$")
+        if any(pat.match(n) for n in inbox_names):
+            continue
+        hits = sorted(n for n in processed if pat.match(n))
+        if hits:
+            out.append((memo, tgt, hits[-1]))
+    return out
+
+
+def needs_david_orphan_repair(memos=None):
+    """mv -n each orphaned needs-david memo from processed/ back to inbox/<target>/ (its `<date>_<memo>.md` name).
+    -> printed lines; the moves are kept in _ORPHAN_MOVED for rule 47's finding."""
+    memos = memos or MEMOS
+    out = []
+    for memo, tgt, name in _needs_david_orphans(memos):
+        dest_dir = os.path.join(memos, "inbox", tgt)
+        dest = os.path.join(dest_dir, name[:11] + memo + ".md")          # <date>_<memo>.md, any _suffix dropped
+        if not os.path.isdir(dest_dir) or os.path.exists(dest):
+            continue
+        r = subprocess.run(["mv", "-n", os.path.join(memos, "processed", name), dest], capture_output=True)
+        if r.returncode == 0 and os.path.exists(dest):
+            _ORPHAN_MOVED.append((memo, tgt))
+            out.append(f"needs-david-orphan: {memo} was in processed/ while its row waits on David: back in inbox/{tgt}/")
+    for ln in out:
+        print(f"  {ln}")
+    return out
+
+
+def _needs_david_orphan_finding(f, memos=None, moved=None):
+    """Rule 47: ONE low finding naming what the repair moved back and what it could not (still orphaned)."""
+    moved = list(_ORPHAN_MOVED if moved is None else moved)
+    left = _needs_david_orphans(memos)
+    if not moved and not left:
+        return
+    parts = []
+    if moved:
+        parts.append(f"moved back to the inbox: {', '.join(f'{m} (inbox/{t}/)' for m, t in moved[:6])}")
+    if left:
+        parts.append(f"still only in processed/: {', '.join(m for m, _t, _n in left[:6])} (mv -n by hand, or close the row)")
+    _finding(f, "needs-david-orphan", "low", "a question waiting on David had its memo filed to processed/",
+             "; ".join(parts) + ". A needs-david row keeps its memo in the inbox (LEDGER protocol) so the owning "
+             "lead sees the answer when it comes; whoever moved it closed the file but not the question.",
+             project="maintenance", key="ledger", fix="auto" if moved and not left else "human")
+
+
 def _run_pass(dry=False):
     if not dry:
         ledger_order_repair()
+        needs_david_orphan_repair()
     c = census()
     fresh = audit(c)
     # rule 43 (memo wa-cost-attribution slice 3/4): true the weights up once a day, file weight-drift
@@ -7627,6 +7711,40 @@ def selftest():
               len(flo) == 1 and flo[0]["sev"] == "low" and flo[0]["kind"] in QUIET_KINDS
               and flo[0]["key"] == "ledger-order:maintenance:ledger" and "2 row(s)" in flo[0]["detail"]
               and "line 7 (2026-10-05 c, under a 2026-10-01 row)" in flo[0]["detail"], flo)
+        # rule 47: needs-david-orphan, one fixture each way (2026-11-26)
+        mo = f"{t7}/bus"
+        for sub in ("inbox/hbs", "inbox/maintenance", "processed"):
+            os.makedirs(f"{mo}/{sub}", exist_ok=True)
+        with open(f"{mo}/LEDGER.md", "w") as fh:
+            fh.write(hdr + "| 2026-11-20 | hbs_lead-needs-you-orphan | hbs | hbs | needs-david [only-you] — sign in? (1) yes |  |\n"
+                     "| 2026-11-20 | hbs_lead-needs-you-inbox | hbs | hbs | needs-david [money] — pay? (1) no |  |\n"
+                     "| 2026-11-20 | hbs_lead-needs-you-closed | hbs | hbs | decided — default taken |  |\n"
+                     "| 2026-11-19 | stocks-needs-you-held | maintenance | stocks | needs-david [stocks] — x? |  |\n"
+                     "| 2026-11-18 | hbs_lead-needs-you-closed | hbs | hbs | needs-david [only-you] — older row |  |\n")
+        for n in ("2026-11-20_hbs_lead-needs-you-orphan_maintenance.md", "2026-11-20_hbs_lead-needs-you-closed.md",
+                  "2026-11-19_stocks-needs-you-held.md"):
+            open(f"{mo}/processed/{n}", "w").write("x")
+        open(f"{mo}/inbox/hbs/2026-11-20_hbs_lead-needs-you-inbox.md", "w").write("x")
+        check("needs-david-orphan: only the waiting row whose memo is in processed/ (not a closed row, not one in the "
+              "inbox, not a held Stocks row)", _needs_david_orphans(mo)
+              == [("hbs_lead-needs-you-orphan", "hbs", "2026-11-20_hbs_lead-needs-you-orphan_maintenance.md")],
+              _needs_david_orphans(mo))
+        fo0 = []
+        _needs_david_orphan_finding(fo0, mo, moved=[])
+        _ORPHAN_MOVED.clear()
+        rep47 = needs_david_orphan_repair(mo)
+        fo1 = []
+        _needs_david_orphan_finding(fo1, mo)
+        check("needs-david-orphan: before the repair one low human finding; the repair mv -n's it back as "
+              "<date>_<memo>.md and the finding says moved (fix auto); then nothing is orphaned",
+              len(fo0) == 1 and fo0[0]["fix"] == "human" and fo0[0]["kind"] in QUIET_KINDS and len(rep47) == 1
+              and os.path.exists(f"{mo}/inbox/hbs/2026-11-20_hbs_lead-needs-you-orphan.md")
+              and len(fo1) == 1 and fo1[0]["fix"] == "auto" and "moved back" in fo1[0]["detail"]
+              and _needs_david_orphans(mo) == [], (fo0, rep47, fo1))
+        _ORPHAN_MOVED.clear()
+        fo2 = []
+        _needs_david_orphan_finding(fo2, mo)
+        check("needs-david-orphan: a clean bus is quiet", fo2 == [], fo2)
         rep = ledger_order_repair(lg)
         flo2 = []
         _ledger_order_finding(flo2, lg)

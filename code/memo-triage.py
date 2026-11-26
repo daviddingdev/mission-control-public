@@ -79,7 +79,10 @@ try:
             target, status = m.group(3).strip().lower(), re.sub(r"[*_`]", "", m.group(4)).strip().lower()
             if target in PAUSED_TARGETS:
                 continue
-            if ("proposed" in status or status.startswith("accepted")) and "implemented" not in status:
+            # the LEADING word is the row's state: "decided — ... was: proposed" and "withdrawn ... Was:
+            # proposed" are closed, and matching "proposed" anywhere paged them daily (22 pushes in 30 days
+            # to 2026-11-25 for two closed rows)
+            if status.startswith(("proposed", "accepted")) and "implemented" not in status:
                 age_d = (now - time.mktime(time.strptime(date, "%Y-%m-%d"))) / 86400
                 if age_d > LEDGER_STUCK_D:
                     stale.append(f"ledger: '{memo}' still {status.split()[0]} after {int(age_d)}d")

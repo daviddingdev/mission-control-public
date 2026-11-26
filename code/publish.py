@@ -456,6 +456,25 @@ def _resync(dry=False):
     return done
 
 
+def _stuck(d):
+    """A clean clone whose commits never reached origin (memo maintenance_lead-work-refresh-stuck-push, 2026-11-26).
+
+    publish() commits before it pushes, so a refused push leaves the tree clean and every later refresh used to skip
+    the repo as "nothing moved" and print 0 failed (poker-appstore-public, 11-24..26). Local refs only, no fetch:
+    origin/main is as of the last push or fetch. Returns None, or a line naming it stuck (and diverged when origin is
+    ahead too)."""
+    if "origin" not in _git(d, "remote", check=False):
+        return None
+    if not _git(d, "rev-parse", "-q", "--verify", "refs/remotes/origin/main", check=False):
+        return None
+    ahead = int(_git(d, "rev-list", "--count", "origin/main..HEAD", check=False) or 0)
+    if not ahead:
+        return None
+    behind = int(_git(d, "rev-list", "--count", "HEAD..origin/main", check=False) or 0)
+    return (f"{ahead} commit(s) ahead of origin/main, never pushed"
+            + (f"; diverged: origin is {behind} ahead (a resync is David's, state/publish_resync.json)" if behind else ""))
+
+
 def refresh(dry=False):
     """Re-sync the allowlisted code, then publish what is still clean.
 
@@ -484,6 +503,10 @@ def refresh(dry=False):
                 print(f"  {repo}: still leaking after quarantine — NOT published")
                 continue
         if os.path.isdir(os.path.join(d, ".git")) and not _git(d, "status", "--porcelain"):
+            why = _stuck(d)                     # clean, but an earlier push never landed
+            if why:
+                failed.append({"repo": repo, "error": why})
+                print(f"  {repo}: STUCK — {why}")
             continue                            # nothing moved in this project today
         changed.append(repo)
         if not dry:
@@ -573,6 +596,26 @@ def selftest():
     check("resync: a policy default is not enough", _resync_ok({"decision": "bb22"}, _dl), False)
     check("resync: unknown id", _resync_ok({"decision": "zz99"}, _dl), False)
     check("resync: no id", _resync_ok({}, _dl), False)
+
+    # a clean clone stuck ahead of origin counts as failed, not "nothing moved" (2026-11-26)
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        o, c = os.path.join(t, "o.git"), os.path.join(t, "c")
+        g = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", o], check=True)
+        subprocess.run(["git", "clone", "-q", o, c], check=True, capture_output=True)
+        open(os.path.join(c, "f"), "w").write("0"); subprocess.run(["git", "-C", c, "add", "f"], check=True)
+        subprocess.run(["git", "-C", c] + g + ["commit", "-qm", "0"], check=True)
+        subprocess.run(["git", "-C", c, "push", "-q", "origin", "main"], check=True, capture_output=True)
+        check("stuck: in step with origin", _stuck(c), None)
+        subprocess.run(["git", "-C", c] + g + ["commit", "-q", "--allow-empty", "-m", "1"], check=True)
+        check("stuck: a clone ahead of origin/main after refresh counts as failed", (_stuck(c) or "").startswith("1 commit(s) ahead"), True)
+        o2 = os.path.join(t, "o2")
+        subprocess.run(["git", "clone", "-q", o, o2], check=True, capture_output=True)
+        subprocess.run(["git", "-C", o2] + g + ["commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        subprocess.run(["git", "-C", o2, "push", "-q", "origin", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", c, "fetch", "-q", "origin"], check=True)
+        check("stuck: diverged is named", "diverged: origin is 1 ahead" in (_stuck(c) or ""), True)
 
     for src, want in fx.MASK_CASES:
         check(f"mask: {src[:34]}", pseudonymize(src)[0], want)

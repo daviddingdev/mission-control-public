@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Log-anomaly sentinel — hourly, zero Claude tokens.
 The local model reads every job's status + last log line and flags anything that looks
-broken. Alerts (ntfy `alerts`) only on NEW issues, with a 24h per-issue cooldown — the
+broken. NEW issues only, with a 24h per-issue cooldown, held on `alerts` (never
+pushed since 2026-11-25: the Duet status page and the rollup carry them) — the
 layer that would have caught the clientco silent failure within an hour.
 
-    sentinel.py              the hourly pass (local model; may page `alerts`)
+    sentinel.py              the hourly pass (local model; records held `alerts` rows, never pushes)
     sentinel.py --dry        print the prompt the model would get; no model call, no push
                              (--dry-run is the same thing)
     sentinel.py selftest     the 09-23 replay and the 10-04 dedupe cases, with the model, job
@@ -66,7 +67,16 @@ _LAB_SKIP = re.compile(r"lab mode \w+: .*does not run \(mode\.py\)", re.I)
 _WORSE = re.compile(r'"worse"\s*:\s*\[([^\]]*)\]')
 
 
+_DEFERRED = re.compile(r'"status"\s*:\s*"deferred"')
+
+
 def _probe_note(head):
+    # clientco's cycle_state says "Deferred = intentional, not an issue" in its `note`, past the 300
+    # characters the model sees, so the model flagged it every day (2026-11-25). David 2026-09-08: "if
+    # clientco does not work by day 5 just stop pinging and try again next month"; on hold to end-2027.
+    if _DEFERRED.search(head or ""):
+        return ("  <- deferred by design: the owner stopped retrying until next month's cycle (David 09-08: "
+                "'stop pinging'): NOT an issue")
     m = _WORSE.search(head or "")
     items = re.findall(r'"([^"]+)"', m.group(1)) if m else []
     if items and all(i.endswith(":retrying") for i in items):
@@ -402,8 +412,12 @@ def main():
                         "Sentinel recovered", rmsg], timeout=30)
         print(f"{time.strftime('%F %T')} RECOVERED before paging: {rmsg}")
     if fresh:
+        # Never the phone (2026-11-25, David: "Yes, collapse to that"): the sentinel restates what an owner
+        # or a known state already said (162 critical pushes in 30 days, 11-25), and David reads Duet, not
+        # pushes. Held on the alerts channel: the hourly `Spark — status` page lists each cause by name and the
+        # 23:00 rollup carries it. The phone keeps only box-dead, power, disk and a service still down.
         msg = "; ".join(i["summary"][:120] for i in fresh[:4])
-        subprocess.run([f"{HOME}/maintenance/bin/notify.sh", "alerts",
+        subprocess.run([f"{HOME}/maintenance/bin/notify.sh", "--tier", "digest", "alerts",
                         "Sentinel (local model)", msg], timeout=30)
         print(f"{time.strftime('%F %T')} ALERT: {msg}")
     if fresh or back:
@@ -465,7 +479,11 @@ def _selftest(target=None):
     for label, h, want in (("health head: retrying only", head, True),
                            ("health head: retrying + degraded",
                             head.replace('"embed:retrying"', '"embed:retrying", "fedreg:degraded"'), False),
-                           ("health head: failing", head.replace("retrying", "failing"), False)):
+                           ("health head: failing", head.replace("retrying", "failing"), False),
+                           ("clientco cycle: deferred is by design",
+                            '{"cycle": "2026-11", "status": "deferred", "attempts": 4}', True),
+                           ("clientco cycle: failed is an issue",
+                            '{"cycle": "2026-11", "status": "failed", "attempts": 2}', False)):
         good = bool(_probe_note(h)) == want
         print(f"{'PASS' if good else 'FAIL'}  {label}: NOT-an-issue note={bool(_probe_note(h))} (want {want})")
         bad += [] if good else [label]
@@ -489,13 +507,15 @@ def _selftest(target=None):
                 sys.argv = argv
                 for k, v in saved.items():
                     setattr(t, k, v)
-            paged = any("alerts" in c for c in calls)
-            held = any("--tier" in c and "digest" in c for c in calls)
+            paged = any("Sentinel (local model)" in c for c in calls)
+            held = any("Sentinel recovered" in c for c in calls)
+            # a page is held on the alerts channel, never pushed (2026-11-25)
+            quiet = all("--tier" in c and "digest" in c for c in calls if "Sentinel (local model)" in c)
             stamped = key in json.load(open(os.path.join(tmp, f"sentinel{n}.json")))
             # the log's last line is the run's own verdict, never a relayed ALERT (decision:03bc420d)
             last = ([l for l in out.getvalue().splitlines() if l.strip()] or [""])[-1]
             own = bool(re.match(r"^\S+ \S+ (done: \d+ paged|clear \()", last))
-            good = paged == want_page and stamped == want_page and held == want_held and own
+            good = paged == want_page and stamped == want_page and held == want_held and own and quiet
             print(f"{'PASS' if good else 'FAIL'}  {name}: paged={paged} held={held} "
                   f"cooldown={stamped} last-line-own-verdict={own} (want paged={want_page})")
             bad += [] if good else [name]
@@ -593,7 +613,7 @@ def _selftest_dedupe(t, tmp, saved):
             sys.argv = argv
             for k, v in saved.items():
                 setattr(t, k, v)
-        paged = [c for c in calls if "alerts" in c]
+        paged = [c for c in calls if "Sentinel (local model)" in c]
         after = json.load(open(os.path.join(tmp, f"ddpaged{n}.json")))
         drops = after.get("dropped", [])
         reason_ok = (not want_reason or (drops and drops[-1]["reason"].startswith(want_reason)
