@@ -2882,12 +2882,25 @@ def _argv_findings(f, scan):
                  project=proj, key="scripts")
 
 
+def _ledger_files():
+    """LEDGER.md + every LEDGER-archive-<year>.md beside it: an ask-once check must still see a row that
+    `ledger_rows.py archive` moved out (memo maintenance_lead-work-messaging-stale-guards slice 5/5)."""
+    import ledger_rows
+    lp = os.path.join(MEMOS, "LEDGER.md")
+    return [lp] + ledger_rows.archive_paths(lp)
+
+
+def _ledger_lines():
+    for path in _ledger_files():
+        try:
+            with open(path, errors="replace") as fh:
+                yield from fh
+        except OSError:
+            continue
+
+
 def _ledger_row_for(name, target):
-    try:
-        with open(os.path.join(MEMOS, "LEDGER.md")) as fh:
-            return any(f"| {name} |" in ln and f"| {target} |" in ln for ln in fh)
-    except OSError:
-        return False
+    return any(f"| {name} |" in ln and f"| {target} |" in ln for ln in _ledger_lines())
 
 
 def argv_memos(scan, dry=False, now_ts=None):
@@ -5683,12 +5696,9 @@ def _blocker_for(key, blockers):
 
 
 def _ledger_has(name):
-    """True when MEMOS/LEDGER.md already carries a row for memo `name` (ask-once survives a lost state file)."""
-    try:
-        with open(os.path.join(MEMOS, "LEDGER.md")) as fh:
-            return any(f"| {name} |" in ln for ln in fh)
-    except OSError:
-        return False
+    """True when MEMOS/LEDGER.md (or its archive) already carries a row for memo `name` (ask-once survives a
+    lost state file)."""
+    return any(f"| {name} |" in ln for ln in _ledger_lines())
 
 
 def _repeat_slug(key):
@@ -5901,6 +5911,28 @@ def ledger_order_repair(path=None):
     return out
 
 
+def ledger_archive_repair(path=None, today=None):
+    """Move LEDGER.md rows closed more than 30 days ago into LEDGER-archive-<year>.md (`ledger_rows.py archive
+    --apply`; memo maintenance_lead-work-messaging-stale-guards slice 5/5, 2026-11-28: 759 KB -> 360 KB, read whole
+    by every render, note and packet). Runs after ledger_order_repair. History readers read the archive too
+    (tt_work, tt_system, _ledger_has / _ledger_row_for). -> printed lines."""
+    import ledger_rows
+    out = []
+    try:
+        r = ledger_rows.archive(days=30, apply=True, path=path or os.path.join(MEMOS, "LEDGER.md"), today=today)
+        if r.get("moved"):
+            import datetime as _dt
+            day = (today or _dt.datetime.now(_dt.timezone.utc).date()).isoformat()
+            out.append(f"ledger-archive {day}: moved {r['moved']} row(s) closed > 30 d to "
+                       + ", ".join(os.path.basename(k) for k in sorted(r.get("by_file") or {}))
+                       + f"; {r['bytes_before'] // 1024} KB -> {r['bytes_after'] // 1024} KB")
+    except Exception as e:
+        out.append(f"ledger-archive: skipped ({type(e).__name__}: {str(e)[:120]})")
+    for ln in out:
+        print(f"  {ln}")
+    return out
+
+
 # Rule 47 needs-david-orphan (memo maintenance_lead-work-messaging-stale-guards slice 1, 2026-11-26): a LEDGER row still
 # waiting on David (`needs-david [...]`, its current row) whose memo file sits only in processed/. The memo pass never
 # brings it back and the lead never sees it again (3 found in processed/ on 2026-11-25: answer-peer-guard,
@@ -5982,6 +6014,7 @@ def _needs_david_orphan_finding(f, memos=None, moved=None):
 def _run_pass(dry=False):
     if not dry:
         ledger_order_repair()
+        ledger_archive_repair()
         needs_david_orphan_repair()
     c = census()
     fresh = audit(c)
@@ -7168,6 +7201,12 @@ def selftest():
               rp.get("dashboard-broken::x", "").startswith("filed:") and len(inbox("maintenance")) == 1
               and inbox("maintenance")[0].endswith("_repeat-dashboard-broken-x.md")
               and led.count("| repeat-dashboard-broken-x |") == 1, (rp, inbox("maintenance")))
+        open(f"{tr}/memos/LEDGER-archive-2026.md", "w").write(
+            "| 2026-10-01 | repeat-archived-one | maintenance | clientco-db | verified 2026-10-02 | x |\n")
+        check("ask-once: _ledger_has and _ledger_row_for also read LEDGER-archive-<year>.md (a row `ledger_rows.py "
+              "archive` moved out still counts as asked)",
+              _ledger_has("repeat-archived-one") and _ledger_row_for("repeat-archived-one", "clientco-db")
+              and not _ledger_has("repeat-never-asked") and not _ledger_row_for("repeat-archived-one", "hbs"))
         check("repeat-failure: a Stocks key files nothing and its detail says held: Stocks is frozen",
               rp.get("unit-dead:Stocks:y") == "held-stocks" and inbox("stocks") == []
               and "held: Stocks is frozen" in recs[1]["detail"], recs[1]["detail"])
@@ -7745,6 +7784,19 @@ def selftest():
         fo2 = []
         _needs_david_orphan_finding(fo2, mo)
         check("needs-david-orphan: a clean bus is quiet", fo2 == [], fo2)
+        import datetime as _dtm
+        la = f"{os.path.dirname(lg)}/arch_t/LEDGER.md"
+        os.makedirs(os.path.dirname(la), exist_ok=True)
+        open(la, "w").write("| Date | Memo | Source | Target | Status | Evidence |\n|---|---|---|---|---|---|\n"
+                            "| 2026-11-20 | open-row | a | b | proposed | x |\n"
+                            "| 2026-09-01 | old-closed | a | b | verified 2026-09-02 | y |\n")
+        ra = ledger_archive_repair(la, today=_dtm.date(2026, 11, 28))
+        ra2 = ledger_archive_repair(la, today=_dtm.date(2026, 11, 28))
+        check("ledger-archive repair: a row closed > 30 d moves to LEDGER-archive-<year>.md, an open one stays; "
+              "a second pass moves nothing",
+              len(ra) == 1 and "moved 1 row" in ra[0] and ra2 == [] and "open-row" in open(la).read()
+              and "old-closed" not in open(la).read()
+              and "old-closed" in open(f"{os.path.dirname(la)}/LEDGER-archive-2026.md").read(), (ra, ra2))
         rep = ledger_order_repair(lg)
         flo2 = []
         _ledger_order_finding(flo2, lg)
